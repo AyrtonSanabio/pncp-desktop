@@ -7,6 +7,7 @@ from typing import Any
 
 from PySide6.QtCore import QThread, Signal
 
+from pncp_sync.application.catalog_sync import CatalogSync
 from pncp_sync.application.plan_details import plan_details
 from pncp_sync.application.plan_sync import plan_sync
 from pncp_sync.application.run_details import run_details
@@ -30,6 +31,7 @@ class SyncTaskThread(QThread):
     completed = Signal(object, object)
     paused = Signal(object, object)
     failed = Signal(str, str)
+    catalog_completed = Signal(object)
 
     def __init__(
         self,
@@ -42,6 +44,8 @@ class SyncTaskThread(QThread):
         run_ids: tuple[str, ...] | None = None,
         detail_run_id: str | None = None,
         include_details: bool = True,
+        include_contracts: bool = False,
+        include_atas: bool = False,
         replace_plan_id: str | None = None,
         parent: Any = None,
     ) -> None:
@@ -54,6 +58,8 @@ class SyncTaskThread(QThread):
         self.run_ids = run_ids or (() if run_id is None else (run_id,))
         self.detail_run_id = detail_run_id
         self.include_details = include_details
+        self.include_contracts = include_contracts
+        self.include_atas = include_atas
         self.replace_plan_id = replace_plan_id
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task[Any] | None = None
@@ -160,6 +166,7 @@ class SyncTaskThread(QThread):
             aggregate_details = (
                 self._aggregate_details(tuple(detail_summaries)) if detail_summaries else None
             )
+            await self._run_catalog_resources()
             self.completed.emit(self._aggregate_runs(tuple(summaries)), aggregate_details)
             return
         if self.action != "run" or not self.run_id:
@@ -194,7 +201,33 @@ class SyncTaskThread(QThread):
         ):
             self.paused.emit(main_summary, detail_summary)
         else:
+            await self._run_catalog_resources()
             self.completed.emit(main_summary, detail_summary)
+
+    async def _run_catalog_resources(self) -> None:
+        if not self.include_contracts and not self.include_atas:
+            return
+        windows = self.windows or (() if self.window is None else (self.window,))
+        if not windows:
+            return
+        start = min(window.data_inicial for window in windows)
+        end = max(window.data_final for window in windows)
+        service = CatalogSync(self.config)
+        reports = []
+        for resource, enabled, label in (
+            ("CONTRACTS", self.include_contracts, "contratos e empenhos"),
+            ("ATAS", self.include_atas, "atas de registro de preços"),
+        ):
+            if not enabled:
+                continue
+            self.activity.emit(f"Planejando {label}…")
+            plan = await service.plan(resource, start, end)
+            self.activity.emit(
+                f"Baixando {label}: {plan['total_pages']} página(s), "
+                f"{plan['total_records']} registro(s)…"
+            )
+            reports.append(await service.run(plan["run_id"]))
+        self.catalog_completed.emit(reports)
 
     @staticmethod
     def _aggregate_runs(summaries: tuple[RunSummary, ...]) -> RunSummary:

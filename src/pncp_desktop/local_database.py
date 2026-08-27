@@ -17,6 +17,8 @@ class DatabaseStats:
     items: int
     results: int
     bytes_used: int
+    linked_contracts: int = 0
+    atas: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,11 +223,17 @@ class LocalDatabase:
             contracts = int(connection.execute("SELECT COUNT(*) FROM contratacao").fetchone()[0])
             items = int(connection.execute("SELECT COUNT(*) FROM item_contratacao").fetchone()[0])
             results = int(connection.execute("SELECT COUNT(*) FROM resultado_item").fetchone()[0])
+            linked_contracts = int(
+                connection.execute("SELECT COUNT(*) FROM pncp_contract").fetchone()[0]
+            )
+            atas = int(connection.execute("SELECT COUNT(*) FROM pncp_ata").fetchone()[0])
         return DatabaseStats(
             contracts=contracts,
             items=items,
             results=results,
             bytes_used=self.db_path.stat().st_size if self.db_path.exists() else 0,
+            linked_contracts=linked_contracts,
+            atas=atas,
         )
 
     def snapshot(self, query: str = "", *, limit: int = 100) -> DatabaseSnapshot:

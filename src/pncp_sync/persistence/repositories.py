@@ -32,6 +32,7 @@ from pncp_sync.persistence.schema import (
     MIGRATION_V2,
     MIGRATION_V3,
     MIGRATION_V4,
+    MIGRATION_V5,
     SCHEMA_VERSION,
 )
 
@@ -165,6 +166,10 @@ class SyncRepository:
         if current < 4:
             self.connection.executescript(MIGRATION_V4)
             self.connection.execute("PRAGMA user_version = 4")
+            current = 4
+        if current < 5:
+            self.connection.executescript(MIGRATION_V5)
+            self.connection.execute("PRAGMA user_version = 5")
             self.connection.commit()
 
     def create_plan(

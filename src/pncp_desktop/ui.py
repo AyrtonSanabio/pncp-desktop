@@ -858,7 +858,17 @@ class MainWindow(QMainWindow):
         self.incluir_detalhes.setToolTip(
             "Depois das contratações, consulta itens e resultados publicados pelo PNCP."
         )
-        grid.addWidget(self.incluir_detalhes, 2, 3, 1, 2)
+        self.incluir_contratos = QCheckBox("Contratos e empenhos")
+        self.incluir_contratos.setToolTip(
+            "Sincroniza dados estruturados de contratos e empenhos publicados no período."
+        )
+        self.incluir_atas = QCheckBox("Atas de preços")
+        self.incluir_atas.setToolTip(
+            "Sincroniza dados estruturados de atas; documentos continuam apenas por link."
+        )
+        grid.addWidget(self.incluir_detalhes, 2, 3)
+        grid.addWidget(self.incluir_contratos, 2, 4)
+        grid.addWidget(self.incluir_atas, 2, 5)
         self.botao_atualizar_desde_ultima = QPushButton("Atualizar desde a última execução")
         self.botao_atualizar_desde_ultima.setObjectName("secundario")
         self.botao_atualizar_desde_ultima.setToolTip(
@@ -1731,6 +1741,8 @@ class MainWindow(QMainWindow):
             run_ids=self._sync_run_ids,
             detail_run_id=self._detail_run_id,
             include_details=self.incluir_detalhes.isChecked(),
+            include_contracts=self.incluir_contratos.isChecked(),
+            include_atas=self.incluir_atas.isChecked(),
             parent=self,
         )
         self._connect_sync_worker(worker)
@@ -1745,6 +1757,7 @@ class MainWindow(QMainWindow):
         worker.completed.connect(self._sync_concluido)
         worker.paused.connect(self._sync_pausado)
         worker.failed.connect(self._sync_falhou)
+        worker.catalog_completed.connect(self._catalogos_concluidos)
         worker.finished.connect(self._sync_finalizado)
 
     def pausar_sincronizacao(self) -> None:
@@ -1797,6 +1810,18 @@ class MainWindow(QMainWindow):
             self.sync_estimativa_detalhes.setText(
                 "Itens e fornecedores estão desmarcados e não entram nesta carga."
             )
+        supplementary = []
+        if self.incluir_contratos.isChecked():
+            supplementary.append("contratos/empenhos")
+        if self.incluir_atas.isChecked():
+            supplementary.append("atas")
+        if supplementary:
+            self.sync_estimativa_detalhes.setText(
+                self.sync_estimativa_detalhes.text()
+                + " Também serão planejados "
+                + " e ".join(supplementary)
+                + "; os totais desses recursos serão confirmados ao iniciar."
+            )
         extras = ", ".join(summary.unmodeled_fields[:5])
         remaining_extras = max(0, len(summary.unmodeled_fields) - 5)
         extra_count = f" e mais {remaining_extras}" if remaining_extras else ""
@@ -1836,6 +1861,16 @@ class MainWindow(QMainWindow):
 
     def _sync_atividade_alterada(self, description: str) -> None:
         self.sync_atividade.setText(description)
+
+    def _catalogos_concluidos(self, reports: object) -> None:
+        rows = reports if isinstance(reports, list) else []
+        inserted = sum(int(row.get("inserted", 0)) for row in rows)
+        updated = sum(int(row.get("updated", 0)) for row in rows)
+        failed = sum(int(row.get("failed_pages", 0)) for row in rows)
+        self.sync_atividade.setText(
+            f"Contratos/atas concluídos: {inserted} novos, {updated} alterados, "
+            f"{failed} página(s) com falha. PDFs não foram baixados."
+        )
 
     def _sync_progresso(self, resource: str, summary: RunSummary | DetailRunSummary) -> None:
         if resource != self._sync_last_resource:
@@ -1993,6 +2028,8 @@ class MainWindow(QMainWindow):
         self.sync_data_final.setEnabled(not busy)
         self.sync_modalidade.setEnabled(not busy)
         self.incluir_detalhes.setEnabled(not busy)
+        self.incluir_contratos.setEnabled(not busy)
+        self.incluir_atas.setEnabled(not busy)
         self.botao_atualizar_desde_ultima.setEnabled(not busy)
         self.sync_automatico.setEnabled(not busy)
         database_busy = self._database_worker is not None and self._database_worker.isRunning()
@@ -2055,7 +2092,9 @@ class MainWindow(QMainWindow):
                 self.tabela_local.setItem(row_index, column_index, cell)
         self.local_status.setText(
             f"{len(rows)} exibida(s) • banco: {stats.contracts} contratações, "
-            f"{stats.items} itens, {stats.results} resultados • {formatar_bytes(stats.bytes_used)}"
+            f"{stats.items} itens, {stats.results} resultados, "
+            f"{stats.linked_contracts} contratos/empenhos e {stats.atas} atas • "
+            f"{formatar_bytes(stats.bytes_used)}"
         )
         self._local_dirty = False
         self._local_loaded_path = self._db_path

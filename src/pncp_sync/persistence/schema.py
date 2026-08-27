@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 MIGRATION_V1 = """
 CREATE TABLE IF NOT EXISTS ingestion_run (
@@ -202,6 +202,99 @@ CREATE TABLE IF NOT EXISTS contract_insight (
     generated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_contract_insight_category ON contract_insight(category);
+"""
+
+MIGRATION_V5 = """
+CREATE TABLE IF NOT EXISTS catalog_run (
+    id TEXT PRIMARY KEY,
+    resource TEXT NOT NULL CHECK(resource IN ('CONTRACTS','ATAS')),
+    data_inicial TEXT NOT NULL,
+    data_final TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('PLANNED','RUNNING','PAUSED','COMPLETED','FAILED')),
+    total_pages INTEGER NOT NULL DEFAULT 0,
+    total_records INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS catalog_page (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES catalog_run(id) ON DELETE CASCADE,
+    page_number INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('PENDING','RUNNING','SUCCEEDED','FAILED')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    record_count INTEGER NOT NULL DEFAULT 0,
+    bytes_received INTEGER NOT NULL DEFAULT 0,
+    payload_gzip BLOB,
+    payload_sha256 TEXT,
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    finished_at TEXT,
+    UNIQUE(run_id,page_number)
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_page_claim ON catalog_page(run_id,status,page_number);
+
+CREATE TABLE IF NOT EXISTS pncp_contract (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    numero_controle_pncp TEXT NOT NULL UNIQUE,
+    numero_controle_pncp_compra TEXT,
+    numero_controle_pncp_ata TEXT,
+    ano_contrato INTEGER,
+    sequencial_contrato INTEGER,
+    numero_contrato_empenho TEXT,
+    processo TEXT,
+    objeto_contrato TEXT,
+    informacao_complementar TEXT,
+    fornecedor_cnpj TEXT,
+    fornecedor_nome TEXT,
+    valor_inicial TEXT,
+    valor_global TEXT,
+    valor_acumulado TEXT,
+    data_assinatura TEXT,
+    data_vigencia_inicio TEXT,
+    data_vigencia_fim TEXT,
+    data_publicacao_pncp TEXT,
+    data_atualizacao_global TEXT,
+    orgao_cnpj TEXT,
+    orgao_nome TEXT,
+    orgao_uf TEXT,
+    unidade_nome TEXT,
+    record_hash TEXT NOT NULL,
+    source_page_id INTEGER NOT NULL REFERENCES catalog_page(id),
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pncp_contract_purchase ON pncp_contract(numero_controle_pncp_compra);
+CREATE INDEX IF NOT EXISTS idx_pncp_contract_supplier ON pncp_contract(fornecedor_cnpj);
+CREATE INDEX IF NOT EXISTS idx_pncp_contract_validity ON pncp_contract(data_vigencia_fim);
+
+CREATE TABLE IF NOT EXISTS pncp_ata (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    numero_controle_pncp_ata TEXT NOT NULL UNIQUE,
+    numero_controle_pncp_compra TEXT,
+    numero_ata_registro_preco TEXT,
+    ano_ata INTEGER,
+    objeto_contratacao TEXT,
+    situacao TEXT,
+    cancelado INTEGER,
+    possibilidade_adesao INTEGER,
+    orgao_cnpj TEXT,
+    orgao_nome TEXT,
+    orgao_uf TEXT,
+    unidade_nome TEXT,
+    data_assinatura TEXT,
+    vigencia_inicio TEXT,
+    vigencia_fim TEXT,
+    data_publicacao_pncp TEXT,
+    data_atualizacao_global TEXT,
+    record_hash TEXT NOT NULL,
+    source_page_id INTEGER NOT NULL REFERENCES catalog_page(id),
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pncp_ata_purchase ON pncp_ata(numero_controle_pncp_compra);
+CREATE INDEX IF NOT EXISTS idx_pncp_ata_validity ON pncp_ata(vigencia_fim);
 """
 
 MIGRATION_V2 = """

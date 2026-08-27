@@ -16,6 +16,7 @@ Este documento registra o que entrou nesta etapa e os limites que continuam expl
 
 - Respostas completas continuam preservadas comprimidas; campos desconhecidos não são descartados.
 - Itens e resultados mantêm fornecedor, valores, categorias, códigos e datas disponíveis no retorno.
+- Contratos/empenhos e atas podem ser habilitados na sincronização. Cada recurso usa páginas retomáveis próprias, preserva o payload comprimido e normaliza identificadores, fornecedor, valores e vigência; PDFs continuam fora da carga.
 - A tabela de documentos guarda somente metadados e links HTTP(S); nenhum PDF é baixado.
 - O banco oferece filtros por órgão, CNPJ, município, modalidade, situação, fornecedor, valor e período, além de ordenação, paginação e CSV.
 - Consultas salvas, histórico de preços, frequência de compras por órgão e agrupamento de vencedores estão disponíveis na área local.

@@ -66,7 +66,7 @@ def test_migration_v3_is_additive(tmp_path: Path) -> None:
         connection.executescript(MIGRATION_V2)
         connection.execute("PRAGMA user_version=2")
     with SyncRepository(path) as repository:
-        assert repository.connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert repository.connection.execute("PRAGMA user_version").fetchone()[0] == 5
         tables = {
             row[0]
             for row in repository.connection.execute(
