@@ -167,6 +167,67 @@ class PlanSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class BatchPlanSummary:
+    plans: tuple[PlanSummary, ...]
+
+    @property
+    def run_id(self) -> str:
+        return self.plans[0].run_id if self.plans else ""
+
+    @property
+    def run_ids(self) -> tuple[str, ...]:
+        return tuple(plan.run_id for plan in self.plans)
+
+    @property
+    def total_pages(self) -> int:
+        return sum(plan.total_pages for plan in self.plans)
+
+    @property
+    def total_records(self) -> int:
+        return sum(plan.total_records for plan in self.plans)
+
+    @property
+    def first_page_records(self) -> int:
+        return sum(plan.first_page_records for plan in self.plans)
+
+    @property
+    def first_page_bytes(self) -> int:
+        return sum(plan.first_page_bytes for plan in self.plans)
+
+    @property
+    def estimated_download_bytes(self) -> int:
+        return sum(plan.estimated_download_bytes for plan in self.plans)
+
+    @property
+    def estimated_database_bytes(self) -> int:
+        return sum(plan.estimated_database_bytes for plan in self.plans)
+
+    @property
+    def free_disk_bytes(self) -> int:
+        return min((plan.free_disk_bytes for plan in self.plans), default=0)
+
+    @property
+    def unmodeled_fields(self) -> tuple[str, ...]:
+        return tuple(sorted({field for plan in self.plans for field in plan.unmodeled_fields}))
+
+    @property
+    def first_page_latency_ms(self) -> float:
+        return sum(plan.first_page_latency_ms for plan in self.plans)
+
+    @property
+    def remaining_main_requests(self) -> int:
+        return sum(plan.remaining_main_requests for plan in self.plans)
+
+    @property
+    def estimated_main_seconds(self) -> float:
+        return sum(plan.estimated_main_seconds for plan in self.plans)
+
+    @property
+    def minimum_detail_requests(self) -> int:
+        return sum(plan.minimum_detail_requests for plan in self.plans)
+
+
+@dataclass(frozen=True, slots=True)
 class RunSummary:
     run_id: str
     status: str

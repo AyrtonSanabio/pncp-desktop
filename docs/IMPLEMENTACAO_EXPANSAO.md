@@ -9,6 +9,7 @@ Este documento registra o que entrou nesta etapa e os limites que continuam expl
 - “Atualizar desde a última execução” usa sobreposição de um dia para reduzir lacunas.
 - A opção “Atualizar automaticamente ao abrir” é opt-in e prepara a atualização incremental.
 - Falhas de rede são repetidas com limite; cancelamento não confirma a unidade em andamento.
+- “Todas as modalidades” cria um plano independente para cada código do PNCP, soma as estimativas e executa os planos em sequência. Checkpoints e retomada permanecem separados por modalidade; uma falha não apaga as modalidades concluídas.
 - Ausência não é prova de exclusão jurídica. O sistema deve tratar o delta como indicação para conferência no portal oficial.
 
 ## Dados e pesquisa

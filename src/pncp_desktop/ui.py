@@ -55,7 +55,13 @@ from pncp_desktop.models import (
 from pncp_desktop.services import ErroConsulta, ServicoConsultaContratos
 from pncp_desktop.sync_worker import SyncTaskThread
 from pncp_sync.config import SyncConfig
-from pncp_sync.domain.models import DetailRunSummary, PlanSummary, RunSummary, SyncWindow
+from pncp_sync.domain.models import (
+    BatchPlanSummary,
+    DetailRunSummary,
+    PlanSummary,
+    RunSummary,
+    SyncWindow,
+)
 from pncp_sync.persistence.data_services import Page
 
 MODALIDADES = (
@@ -457,8 +463,9 @@ class MainWindow(QMainWindow):
         self._open_diagnostics_when_ready = False
         self._sync_worker: SyncTaskThread | None = None
         self._sync_run_id: str | None = None
+        self._sync_run_ids: tuple[str, ...] = ()
         self._detail_run_id: str | None = None
-        self._sync_plan: PlanSummary | None = None
+        self._sync_plan: PlanSummary | BatchPlanSummary | None = None
         self._sync_space_ok = True
         self._sync_can_continue = False
         self._auto_sync_pending = False
@@ -827,6 +834,7 @@ class MainWindow(QMainWindow):
         self.sync_data_final.setDate(QDate(today.year, today.month, today.day))
         self.sync_data_final.setToolTip("Data final de publicação usada para buscar contratações.")
         self.sync_modalidade = QComboBox()
+        self.sync_modalidade.addItem("Todas as modalidades", None)
         for code, name in MODALIDADES:
             self.sync_modalidade.addItem(f"{code} — {name}", code)
         self.sync_modalidade.setCurrentIndex(self.sync_modalidade.findData(12))
@@ -975,6 +983,7 @@ class MainWindow(QMainWindow):
         if self._sync_worker is not None and self._sync_worker.isRunning():
             return
         self._sync_plan = None
+        self._sync_run_ids = ()
         self._sync_can_continue = False
         self.botao_sincronizar.setEnabled(False)
         self.botao_continuar.setEnabled(False)
@@ -1289,7 +1298,7 @@ class MainWindow(QMainWindow):
             self._render_database_snapshot(result)
         elif action == "advanced_search":
             self._render_advanced_search(result)
-        elif action == "latest_completed_date":
+        elif action in {"latest_completed_date", "latest_completed_date_all"}:
             self._apply_latest_completed_date(result)
         elif action == "diagnostics":
             self._render_diagnostics(result)
@@ -1344,7 +1353,7 @@ class MainWindow(QMainWindow):
         if action == "snapshot":
             self.local_status.setText(f"{readable} {detail}")
             self.tabela_local.setRowCount(0)
-        elif action == "latest_completed_date":
+        elif action in {"latest_completed_date", "latest_completed_date_all"}:
             self.sync_status_label.setText(readable)
             QMessageBox.warning(self, "Atualização incremental", f"{readable}\n\n{detail}")
         elif action == "diagnostics":
@@ -1536,10 +1545,17 @@ class MainWindow(QMainWindow):
     def atualizar_desde_ultima_execucao(self) -> None:
         if self._sync_worker is not None and self._sync_worker.isRunning():
             return
-        self.sync_status_label.setText("Localizando a última execução concluída desta modalidade…")
-        self._queue_database_task(
-            "latest_completed_date", modalidade=int(self.sync_modalidade.currentData())
-        )
+        modalidade = self.sync_modalidade.currentData()
+        if modalidade is None:
+            self.sync_status_label.setText(
+                "Localizando a marca segura comum a todas as modalidades…"
+            )
+            self._queue_database_task("latest_completed_date_all")
+        else:
+            self.sync_status_label.setText(
+                "Localizando a última execução concluída desta modalidade…"
+            )
+            self._queue_database_task("latest_completed_date", modalidade=int(modalidade))
 
     def _apply_latest_completed_date(self, value: object) -> None:
         if value is None:
@@ -1627,22 +1643,35 @@ class MainWindow(QMainWindow):
         return SyncConfig(db_path=self._db_path)
 
     def _sync_window(self) -> SyncWindow:
+        modalidade = self.sync_modalidade.currentData()
+        if modalidade is None:
+            raise ValueError("Selecione uma modalidade específica ou use o planejamento em lote.")
         return SyncWindow(
             data_inicial=self.sync_data_inicial.date().toPython(),
             data_final=self.sync_data_final.date().toPython(),
-            modalidade=int(self.sync_modalidade.currentData()),
+            modalidade=int(modalidade),
         )
+
+    def _sync_windows(self) -> tuple[SyncWindow, ...]:
+        start = self.sync_data_inicial.date().toPython()
+        end = self.sync_data_final.date().toPython()
+        modalidade = self.sync_modalidade.currentData()
+        codes = (int(modalidade),) if modalidade is not None else tuple(code for code, _ in MODALIDADES)
+        return tuple(SyncWindow(start, end, code) for code in codes)
 
     def estimar_sincronizacao(self) -> None:
         if self._sync_worker is not None and self._sync_worker.isRunning():
             return
         try:
-            self._sync_window().validate(max_days=self._sync_config().max_window_days)
+            windows = self._sync_windows()
+            for window in windows:
+                window.validate(max_days=self._sync_config().max_window_days)
         except ValueError as exc:
             QMessageBox.warning(self, "Filtros inválidos", str(exc))
             return
         replace_plan_id = self._sync_run_id
         self._sync_run_id = None
+        self._sync_run_ids = ()
         self._detail_run_id = None
         self._sync_plan = None
         self._sync_can_continue = False
@@ -1657,8 +1686,9 @@ class MainWindow(QMainWindow):
         )
         worker = SyncTaskThread(
             self._sync_config(),
-            action="plan",
-            window=self._sync_window(),
+            action="plan_all" if len(windows) > 1 else "plan",
+            window=windows[0] if len(windows) == 1 else None,
+            windows=windows if len(windows) > 1 else None,
             replace_plan_id=replace_plan_id,
             parent=self,
         )
@@ -1675,9 +1705,13 @@ class MainWindow(QMainWindow):
 
     def continuar_sincronizacao(self) -> None:
         if not self._sync_run_id:
-            self._sync_run_id = self._local_database.latest_resumable_run(
-                int(self.sync_modalidade.currentData())
-            )
+            modalidade = self.sync_modalidade.currentData()
+            if modalidade is None:
+                self._sync_run_ids = self._local_database.latest_resumable_runs()
+                self._sync_run_id = self._sync_run_ids[0] if self._sync_run_ids else None
+            else:
+                self._sync_run_id = self._local_database.latest_resumable_run(int(modalidade))
+                self._sync_run_ids = (() if self._sync_run_id is None else (self._sync_run_id,))
         if self._sync_run_id and (self._sync_worker is None or not self._sync_worker.isRunning()):
             self._executar_sincronizacao()
         elif not self._sync_run_id:
@@ -1692,8 +1726,9 @@ class MainWindow(QMainWindow):
         self.sync_status_label.setText("Sincronização em andamento…")
         worker = SyncTaskThread(
             self._sync_config(),
-            action="run",
+            action="run_all" if len(self._sync_run_ids) > 1 else "run",
             run_id=self._sync_run_id,
+            run_ids=self._sync_run_ids,
             detail_run_id=self._detail_run_id,
             include_details=self.incluir_detalhes.isChecked(),
             parent=self,
@@ -1714,16 +1749,17 @@ class MainWindow(QMainWindow):
 
     def pausar_sincronizacao(self) -> None:
         if self._sync_worker is not None and self._sync_worker.isRunning():
-            if self._sync_worker.action == "plan":
+            if self._sync_worker.action in {"plan", "plan_all"}:
                 self.sync_status_label.setText("Cancelando a estimativa…")
             else:
                 self.sync_status_label.setText("Pausando após liberar a unidade atual…")
             self.botao_pausar.setEnabled(False)
             self._sync_worker.pause()
 
-    def _sync_planejado(self, summary: PlanSummary) -> None:
+    def _sync_planejado(self, summary: PlanSummary | BatchPlanSummary) -> None:
         self._sync_plan = summary
         self._sync_run_id = summary.run_id
+        self._sync_run_ids = getattr(summary, "run_ids", (summary.run_id,))
         self.sync_progresso.setRange(0, max(1, summary.total_pages))
         self.sync_progresso.setValue(0)
         self.sync_metricas.setText(
@@ -1741,6 +1777,11 @@ class MainWindow(QMainWindow):
         )
         self.sync_estimativa_registros.setText(
             f"{summary.total_records} contratação(ões) informadas pelo PNCP"
+            + (
+                f" em {len(self._sync_run_ids)} modalidades"
+                if len(self._sync_run_ids) > 1
+                else ""
+            )
         )
         self.sync_estimativa_armazenamento.setText(
             f"{formatar_bytes(summary.estimated_download_bytes)} de rede; "

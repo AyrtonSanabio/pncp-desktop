@@ -109,6 +109,22 @@ class LocalDatabase:
             ).fetchone()
             return str(row[0]) if row else None
 
+    def latest_resumable_runs(self) -> tuple[str, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT r.id FROM ingestion_run r
+                   JOIN (
+                       SELECT modalidade,MAX(created_at) created_at FROM ingestion_run
+                       WHERE status IN ('PLANNED','RUNNING','PAUSED','FAILED')
+                       GROUP BY modalidade
+                   ) latest ON latest.modalidade=r.modalidade AND latest.created_at=r.created_at
+                   WHERE EXISTS (
+                       SELECT 1 FROM work_unit w WHERE w.run_id=r.id
+                         AND w.status IN ('PENDING','RETRY_WAIT','RUNNING','FAILED')
+                   ) ORDER BY r.modalidade"""
+            ).fetchall()
+            return tuple(str(row[0]) for row in rows)
+
     def changes(self, run_id: str) -> list[dict[str, Any]]:
         with self._connect() as connection:
             return DataServices(connection).changes(run_id)
@@ -228,6 +244,19 @@ class LocalDatabase:
                   AND status IN ('COMPLETED', 'COMPLETED_WITH_REJECTIONS')
                 """,
                 (modalidade,),
+            ).fetchone()
+        return date.fromisoformat(row[0]) if row and row[0] else None
+
+    def latest_completed_date_all(self) -> date | None:
+        """Retorna a menor marca entre modalidades; evita deixar uma modalidade para trás."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT MIN(last_date) FROM (
+                       SELECT modalidade,MAX(data_final) last_date
+                       FROM ingestion_run
+                       WHERE status IN ('COMPLETED','COMPLETED_WITH_REJECTIONS')
+                       GROUP BY modalidade
+                   )"""
             ).fetchone()
         return date.fromisoformat(row[0]) if row and row[0] else None
 

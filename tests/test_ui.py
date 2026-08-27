@@ -11,7 +11,7 @@ from PySide6.QtWidgets import QApplication, QLabel
 
 from pncp_desktop.local_database import DatabaseSnapshot, DatabaseStats, DiagnosticsReport
 from pncp_desktop.ui import ContractDetailDialog, DiagnosticsDialog, MainWindow, formatar_duracao
-from pncp_sync.domain.models import PlanSummary, RunSummary
+from pncp_sync.domain.models import BatchPlanSummary, PlanSummary, RunSummary
 
 
 def _app() -> QApplication:
@@ -191,5 +191,39 @@ def test_disabled_sync_buttons_explain_why_and_failure_can_resume(tmp_path) -> N
 
     assert window.botao_continuar.isEnabled()
     assert "unidades pendentes" in window.botao_continuar.toolTip()
+    window.close()
+    app.processEvents()
+
+
+def test_all_modalities_plan_is_aggregated_and_can_start(tmp_path) -> None:
+    app = _app()
+    window = MainWindow(tmp_path / "all-modalities.sqlite3")
+    assert window.sync_modalidade.itemData(0) is None
+    assert window.sync_modalidade.itemText(0) == "Todas as modalidades"
+    plans = tuple(
+        PlanSummary(
+            run_id=f"run-{code}",
+            total_pages=code,
+            total_records=code * 10,
+            first_page_records=10,
+            first_page_bytes=100,
+            estimated_download_bytes=1000,
+            estimated_database_bytes=2000,
+            free_disk_bytes=1_000_000,
+            unmodeled_fields=(),
+            first_page_latency_ms=100,
+            remaining_main_requests=max(0, code - 1),
+            estimated_main_seconds=code,
+            minimum_detail_requests=code * 10,
+        )
+        for code in (1, 2, 3)
+    )
+    summary = BatchPlanSummary(plans)
+
+    window._sync_planejado(summary)
+
+    assert window._sync_run_ids == ("run-1", "run-2", "run-3")
+    assert "3 modalidades" in window.sync_estimativa_registros.text()
+    assert window.botao_sincronizar.isEnabled()
     window.close()
     app.processEvents()

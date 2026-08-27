@@ -41,6 +41,7 @@ class DatabaseTaskThread(QThread):
                 "saved_queries": "saved_queries",
                 "save_query": "save_query",
                 "latest_completed_date": "latest_completed_date",
+                "latest_completed_date_all": "latest_completed_date_all",
                 "diagnostics": "diagnostics",
                 "quick_check": "quick_check",
                 "create_backup": "create_backup",
