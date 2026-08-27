@@ -1795,10 +1795,11 @@ class MainWindow(QMainWindow):
         return f"restam {formatar_duracao(remaining_seconds)} • previsão {finish:%H:%M}"
 
     def _sync_concluido(self, main: RunSummary, details: DetailRunSummary | None) -> None:
-        self._sync_can_continue = False
         has_failure = main.status == "FAILED" or (
             details is not None and details.status == "FAILED"
         )
+        # Uma falha recuperável deixa unidades pendentes; preserve a retomada.
+        self._sync_can_continue = has_failure
         has_rejection = main.records_rejected > 0 or (
             details is not None and details.rejected_records > 0
         )
