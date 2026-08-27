@@ -41,6 +41,12 @@ O `run.bat` abre a interface integrada, com as áreas Consulta online, Sincroniz
 Banco local. A interface mostra estimativa, progresso, pausa/continuação, detalhes de
 contratações, itens e fornecedores, além de pesquisa textual local.
 
+A aba **Comece aqui** explica para que os dados servem, a diferença entre contrato e
+contratação, o papel de cada área, um primeiro teste seguro e um glossário. A estimativa
+mostra tempo aproximado da carga principal, páginas/respostas compactadas, registros,
+rede e banco. Itens e resultados são apresentados como chamadas adicionais mínimas,
+pois sua quantidade só é descoberta durante a coleta.
+
 ## Executável para Windows
 
 Com Python instalado apenas na máquina de desenvolvimento, gere o pacote portátil:

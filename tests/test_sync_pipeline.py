@@ -82,6 +82,9 @@ async def test_pipeline_pausa_retoma_e_eh_idempotente(tmp_path: Path) -> None:
     assert source.calls == [1]
     assert plan.total_pages == 2
     assert plan.estimated_database_bytes > 0
+    assert plan.remaining_main_requests == 1
+    assert plan.estimated_main_seconds >= 1
+    assert plan.minimum_detail_requests == 2
 
     paused = await run_sync(config, plan.run_id, source=source, max_pages=1)
     assert paused.status == "PAUSED"
@@ -137,6 +140,48 @@ def test_adaptador_nao_contem_operacoes_de_manutencao() -> None:
     forbidden = ("/login", "Authorization", ".post(", ".put(", ".delete(")
 
     assert all(term not in source for term in forbidden)
+
+
+@pytest.mark.asyncio
+async def test_nova_estimativa_pode_descartar_plano_nunca_iniciado(tmp_path: Path) -> None:
+    config = config_for(tmp_path / "unused-plan.sqlite3")
+    window = SyncWindow(date(2026, 8, 26), date(2026, 8, 26), 6)
+    page = make_page([sample_record(1)], page_number=1, total_pages=1, total_records=1)
+    plan = await plan_sync(config, window, source=FakeSource({1: page}))
+
+    with SyncRepository(config.db_path) as repository:
+        assert repository.discard_unused_plan(plan.run_id) is True
+        assert (
+            repository.connection.execute(
+                "SELECT COUNT(*) FROM ingestion_run WHERE id = ?", (plan.run_id,)
+            ).fetchone()[0]
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_estimativa_sem_registros_ainda_representa_a_pagina_consultada(
+    tmp_path: Path,
+) -> None:
+    config = config_for(tmp_path / "empty-plan.sqlite3")
+    window = SyncWindow(date(2026, 8, 26), date(2026, 8, 26), 6)
+    page = make_page([], page_number=1, total_pages=0, total_records=0)
+
+    plan = await plan_sync(config, window, source=FakeSource({1: page}))
+
+    assert plan.total_pages == 1
+    assert plan.remaining_main_requests == 0
+    assert plan.minimum_detail_requests == 0
+
+
+@pytest.mark.asyncio
+async def test_estimativa_rejeita_totais_incoerentes_do_pncp(tmp_path: Path) -> None:
+    config = config_for(tmp_path / "invalid-totals.sqlite3")
+    window = SyncWindow(date(2026, 8, 26), date(2026, 8, 26), 6)
+    page = make_page([sample_record(1)], page_number=1, total_pages=0, total_records=0)
+
+    with pytest.raises(RuntimeError, match="mais registros"):
+        await plan_sync(config, window, source=FakeSource({1: page}))
 
 
 @pytest.mark.asyncio

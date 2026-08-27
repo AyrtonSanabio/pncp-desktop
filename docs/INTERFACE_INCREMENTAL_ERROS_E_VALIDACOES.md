@@ -1,5 +1,34 @@
 # Interface, atualização incremental, erros e validações
 
+## Orientação para iniciantes
+
+A primeira aba é **Comece aqui**. Ela explica a finalidade do PNCP, exemplos de uso para
+fornecedores, assessorias, pesquisadores e desenvolvedores, a diferença entre consulta
+online de contratos e sincronização de contratações, um roteiro inicial e um glossário.
+
+A modalidade deixou de exigir que o usuário memorize um número: a interface apresenta
+código e nome conforme a [tabela de domínio oficial do PNCP](https://pncp.gov.br/manual/pt-br/latest/tabelas_de_dominio/consultar_modalidade_de_Contratacao.html),
+consultada em 27 de agosto de 2026.
+
+## Estimativa compreensível
+
+O planejamento faz uma consulta real à primeira página e apresenta:
+
+- tempo restante da carga principal, calculado pela latência observada com margem;
+- número de payloads compactados no SQLite e chamadas de página ainda necessárias;
+- total de contratações informado pelo PNCP;
+- estimativa de rede e tamanho do banco;
+- mínimo de chamadas de itens quando os detalhes estiverem marcados.
+
+Payload não é um arquivo solto: é a resposta original comprimida dentro do SQLite. O
+tempo de itens e resultados não pode ser fechado antes da carga porque cada contratação
+pode ter quantidade diferente de itens, páginas e resultados.
+
+A estimativa usa uma tentativa de até 20 segundos e pode ser cancelada. A carga efetiva
+mantém timeout e retentativas maiores. Alterar datas ou modalidade invalida o plano para
+impedir que o botão Sincronizar execute filtros antigos. Uma nova estimativa remove o
+plano anterior somente se ele nunca tiver iniciado.
+
 ## Carregamento do banco sem travar a interface
 
 Consultas SQLite, contagens, detalhes e verificações de integridade são executados numa

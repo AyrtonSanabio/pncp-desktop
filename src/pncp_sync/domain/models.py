@@ -160,6 +160,10 @@ class PlanSummary:
     estimated_database_bytes: int
     free_disk_bytes: int
     unmodeled_fields: tuple[str, ...]
+    first_page_latency_ms: float
+    remaining_main_requests: int
+    estimated_main_seconds: float
+    minimum_detail_requests: int
 
 
 @dataclass(frozen=True, slots=True)

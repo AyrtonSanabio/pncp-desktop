@@ -236,6 +236,22 @@ class SyncRepository:
             )
         return run_id
 
+    def discard_unused_plan(self, run_id: str) -> bool:
+        """Remove somente uma estimativa que nunca iniciou qualquer unidade."""
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM ingestion_run
+                WHERE id = ? AND status = 'PLANNED'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM work_unit
+                      WHERE run_id = ? AND status != 'PENDING'
+                  )
+                """,
+                (run_id, run_id),
+            )
+            return cursor.rowcount == 1
+
     def _insert_payload(
         self,
         cursor: sqlite3.Cursor,

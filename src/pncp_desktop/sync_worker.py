@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import traceback
 from typing import Any
 
 from PySide6.QtCore import QThread, Signal
@@ -33,6 +34,7 @@ class SyncTaskThread(QThread):
         run_id: str | None = None,
         detail_run_id: str | None = None,
         include_details: bool = True,
+        replace_plan_id: str | None = None,
         parent: Any = None,
     ) -> None:
         super().__init__(parent)
@@ -42,6 +44,7 @@ class SyncTaskThread(QThread):
         self.run_id = run_id
         self.detail_run_id = detail_run_id
         self.include_details = include_details
+        self.replace_plan_id = replace_plan_id
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task[Any] | None = None
 
@@ -56,8 +59,16 @@ class SyncTaskThread(QThread):
             main, details = self._summaries()
             self.paused.emit(main, details)
         except Exception as exc:
+            if self.action == "plan":
+                user_message = (
+                    "O PNCP não respondeu à estimativa dentro do tempo esperado. "
+                    "Nenhum download foi iniciado; tente novamente mais tarde."
+                )
+            else:
+                user_message = "Não foi possível concluir a sincronização."
             self.failed.emit(
-                "Não foi possível concluir a sincronização.", f"{type(exc).__name__}: {exc}"
+                user_message,
+                f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}",
             )
         finally:
             pending = asyncio.all_tasks(loop)
@@ -73,6 +84,9 @@ class SyncTaskThread(QThread):
         if self.action == "plan":
             if self.window is None:
                 raise ValueError("A janela de sincronização não foi informada.")
+            if self.replace_plan_id:
+                with SyncRepository(self.config.db_path) as repository:
+                    repository.discard_unused_plan(self.replace_plan_id)
             summary = await plan_sync(self.config, self.window)
             self.run_id = summary.run_id
             self.planned.emit(summary)

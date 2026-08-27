@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
+    QComboBox,
     QDateEdit,
     QDialog,
     QDialogButtonBox,
@@ -52,6 +53,24 @@ from pncp_desktop.services import ErroConsulta, ServicoConsultaContratos
 from pncp_desktop.sync_worker import SyncTaskThread
 from pncp_sync.config import SyncConfig
 from pncp_sync.domain.models import DetailRunSummary, PlanSummary, RunSummary, SyncWindow
+
+MODALIDADES = (
+    (1, "Leilão - Eletrônico"),
+    (2, "Diálogo Competitivo"),
+    (3, "Concurso"),
+    (4, "Concorrência - Eletrônica"),
+    (5, "Concorrência - Presencial"),
+    (6, "Pregão - Eletrônico"),
+    (7, "Pregão - Presencial"),
+    (8, "Dispensa"),
+    (9, "Inexigibilidade"),
+    (10, "Manifestação de Interesse"),
+    (11, "Pré-qualificação"),
+    (12, "Credenciamento"),
+    (13, "Leilão - Presencial"),
+    (14, "Inaplicabilidade da Licitação"),
+    (15, "Chamada pública"),
+)
 
 
 class ConsultaThread(QThread):
@@ -108,6 +127,20 @@ def formatar_bytes(value: int) -> str:
             return f"{size:.1f} {suffix}" if suffix != "B" else f"{int(size)} B"
         size /= 1024
     return f"{size:.1f} TB"
+
+
+def formatar_duracao(seconds: float) -> str:
+    total = max(0, round(seconds))
+    if total < 60:
+        return f"{total} s"
+    minutes, remaining_seconds = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes} min {remaining_seconds:02d} s"
+    hours, remaining_minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours} h {remaining_minutes:02d} min"
+    days, remaining_hours = divmod(hours, 24)
+    return f"{days} d {remaining_hours:02d} h"
 
 
 def _display(value: Any) -> str:
@@ -423,6 +456,7 @@ class MainWindow(QMainWindow):
         self._detail_run_id: str | None = None
         self._sync_plan: PlanSummary | None = None
         self._sync_space_ok = True
+        self._sync_can_continue = False
 
         self.setWindowTitle("Consulta PNCP Desktop")
         self.setMinimumSize(1100, 700)
@@ -442,7 +476,9 @@ class MainWindow(QMainWindow):
         cabecalho_layout.setContentsMargins(32, 24, 32, 22)
         titulo = QLabel("Consulta PNCP")
         titulo.setObjectName("titulo")
-        subtitulo = QLabel("Contratos públicos em uma interface simples, somente para consulta.")
+        subtitulo = QLabel(
+            "Consulte contratos, sincronize contratações e pesquise seu banco local."
+        )
         subtitulo.setObjectName("subtitulo")
         cabecalho_layout.addWidget(titulo)
         cabecalho_layout.addWidget(subtitulo)
@@ -450,6 +486,7 @@ class MainWindow(QMainWindow):
 
         self.abas = QTabWidget()
         raiz.addWidget(self.abas, 1)
+        self.abas.addTab(self._criar_aba_tutorial(), "Comece aqui")
         conteudo = QWidget()
         conteudo_layout = QVBoxLayout(conteudo)
         conteudo_layout.setContentsMargins(28, 24, 28, 24)
@@ -612,6 +649,142 @@ class MainWindow(QMainWindow):
         self.abas.addTab(self._criar_aba_banco_local(), "Banco local")
         self.abas.currentChanged.connect(self._aba_trocada)
 
+    def _criar_aba_tutorial(self) -> QWidget:
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(16)
+
+        intro = QFrame(objectName="cartao")
+        intro_layout = QVBoxLayout(intro)
+        intro_layout.setContentsMargins(22, 18, 22, 20)
+        title = QLabel("Comece aqui: o que este programa faz por você")
+        title.setObjectName("tituloCartao")
+        text = QLabel(
+            "O PNCP reúne informações públicas sobre o que órgãos pretendem comprar, "
+            "quem venceu itens e quais contratos foram publicados. Este aplicativo serve "
+            "para consultar uma parte desses dados e criar um banco pesquisável no seu "
+            "computador — sem publicar, alterar ou excluir nada no governo."
+        )
+        text.setWordWrap(True)
+        intro_layout.addWidget(title)
+        intro_layout.addWidget(text)
+        layout.addWidget(intro)
+
+        uses = self._tutorial_card(
+            "Para que isso pode ser útil?",
+            "• Uma empresa fornecedora pode procurar compras relacionadas aos produtos que vende.\n"
+            "• Uma assessoria de licitações pode acompanhar oportunidades e resultados "
+            "de clientes.\n"
+            "• Um pesquisador pode comparar órgãos, objetos, regiões, valores e fornecedores.\n"
+            "• Um desenvolvedor pode testar e integrar dados públicos sem repetir toda "
+            "a coleta.\n\n"
+            "Exemplo: uma distribuidora de notebooks sincroniza alguns dias, pesquisa "
+            "“notebook”, abre os itens e observa órgãos compradores, valores e fornecedores.",
+        )
+        layout.addWidget(uses)
+
+        navigation = self._tutorial_card(
+            "O que significa cada aba?",
+            "1. Consulta online — pesquisa contratos já publicados diretamente no PNCP. "
+            "É uma consulta pontual e não alimenta automaticamente o banco local.\n\n"
+            "2. Sincronização — coleta contratações divulgadas, isto é, processos de compra, "
+            "e opcionalmente seus itens e resultados. Os dados ficam no SQLite.\n\n"
+            "3. Banco local — pesquisa rapidamente tudo que você já sincronizou, mesmo sem "
+            "refazer a mesma consulta na internet. Um duplo clique abre os detalhes.",
+        )
+        nav_layout = navigation.layout()
+        nav_buttons = QHBoxLayout()
+        for label, tab_name in (
+            ("Abrir Consulta online", "Consulta online"),
+            ("Abrir Sincronização", "Sincronização"),
+            ("Abrir Banco local", "Banco local"),
+        ):
+            button = QPushButton(label)
+            button.setObjectName("secundario")
+            button.clicked.connect(lambda _=False, name=tab_name: self._ir_para_aba(name))
+            nav_buttons.addWidget(button)
+        nav_buttons.addStretch(1)
+        nav_layout.addLayout(nav_buttons)
+        layout.addWidget(navigation)
+
+        workflow = self._tutorial_card(
+            "Primeiro teste recomendado",
+            "1. Abra Sincronização e escolha um período de apenas um dia.\n"
+            "2. Escolha uma modalidade pelo nome; Pregão eletrônico costuma ter exemplos "
+            "variados.\n"
+            "3. Desmarque “Baixar itens e fornecedores” no primeiro teste.\n"
+            "4. Clique Estimar e leia tempo, respostas da API, registros e espaço.\n"
+            "5. Clique Sincronizar somente se o volume estiver adequado.\n"
+            "6. Abra Banco local, pesquise uma palavra e dê duplo clique numa linha.\n"
+            "7. Depois repita uma carga pequena com itens e fornecedores marcados.",
+        )
+        layout.addWidget(workflow)
+
+        estimate = self._tutorial_card(
+            "Como interpretar a estimativa",
+            "Página é um lote da API. Cada página gera uma resposta, chamada de payload, "
+            "que é comprimida dentro do banco — não são centenas de arquivos soltos. "
+            "O tempo das páginas principais é calculado usando a latência realmente medida "
+            "na primeira resposta. Itens e resultados exigem chamadas adicionais cuja "
+            "quantidade só fica conhecida durante a coleta; por isso são mostrados como um "
+            "mínimo, não como uma promessa exata. Internet, lentidão do PNCP e novas tentativas "
+            "podem aumentar bastante o tempo.",
+        )
+        layout.addWidget(estimate)
+
+        glossary = self._tutorial_card(
+            "Glossário rápido",
+            "Órgão comprador — prefeitura, secretaria, universidade ou outra entidade que compra.\n"
+            "Contratação — processo pelo qual o governo pretende adquirir algo.\n"
+            "Contrato — vínculo já formalizado após uma compra ou contratação.\n"
+            "Modalidade — forma jurídica usada no processo, como pregão ou dispensa.\n"
+            "Item — produto ou serviço individual dentro da contratação.\n"
+            "Resultado — desfecho publicado para um item, geralmente com fornecedor e valor.\n"
+            "CNPJ do órgão — identifica o comprador público, não o fornecedor.\n"
+            "Cobertura — quais períodos, modalidades e páginas já foram processados.\n"
+            "Rejeição — dado recebido, mas não aceito pelo normalizador com segurança.",
+        )
+        layout.addWidget(glossary)
+
+        limits = self._tutorial_card(
+            "Limites importantes",
+            "Os dados podem estar incompletos, atrasados ou ser retificados pelo órgão. O banco "
+            "local é uma cópia para pesquisa, não uma certidão nem uma decisão jurídica. O "
+            "programa é somente leitura e ainda está em fase inicial: comece com períodos curtos "
+            "e acompanhe Erros e validações.",
+        )
+        layout.addWidget(limits)
+        layout.addStretch(1)
+        scroll.setWidget(content)
+        page_layout.addWidget(scroll)
+        return page
+
+    @staticmethod
+    def _tutorial_card(title: str, body: str) -> QFrame:
+        card = QFrame(objectName="cartao")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(22, 18, 22, 20)
+        heading = QLabel(title)
+        heading.setObjectName("tituloCartao")
+        text = QLabel(body)
+        text.setWordWrap(True)
+        text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(heading)
+        layout.addWidget(text)
+        return card
+
+    def _ir_para_aba(self, name: str) -> None:
+        for index in range(self.abas.count()):
+            if self.abas.tabText(index) == name:
+                self.abas.setCurrentIndex(index)
+                return
+
     def _criar_aba_sincronizacao(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -640,10 +813,13 @@ class MainWindow(QMainWindow):
         self.sync_data_final.setDisplayFormat("dd/MM/yyyy")
         self.sync_data_final.setDate(QDate(today.year, today.month, today.day))
         self.sync_data_final.setToolTip("Data final de publicação usada para buscar contratações.")
-        self.sync_modalidade = QSpinBox()
-        self.sync_modalidade.setRange(1, 999)
-        self.sync_modalidade.setValue(12)
-        self.sync_modalidade.setToolTip("Código da modalidade de contratação no PNCP.")
+        self.sync_modalidade = QComboBox()
+        for code, name in MODALIDADES:
+            self.sync_modalidade.addItem(f"{code} — {name}", code)
+        self.sync_modalidade.setCurrentIndex(self.sync_modalidade.findData(12))
+        self.sync_modalidade.setToolTip(
+            "Forma jurídica da contratação. A lista usa as modalidades ativas do PNCP."
+        )
         for column, (name, widget) in enumerate(
             (
                 ("Data inicial", self.sync_data_inicial),
@@ -709,6 +885,32 @@ class MainWindow(QMainWindow):
         self.sync_progresso.setRange(0, 1)
         self.sync_progresso.setValue(0)
         self.sync_progresso.setVisible(False)
+        estimate_grid = QGridLayout()
+        estimate_grid.setHorizontalSpacing(24)
+        estimate_grid.setVerticalSpacing(6)
+        self.sync_estimativa_tempo = QLabel("Ainda não calculado")
+        self.sync_estimativa_respostas = QLabel("Ainda não calculado")
+        self.sync_estimativa_registros = QLabel("Ainda não calculado")
+        self.sync_estimativa_armazenamento = QLabel("Ainda não calculado")
+        for row, (label, field) in enumerate(
+            (
+                ("Tempo estimado da carga principal", self.sync_estimativa_tempo),
+                ("Respostas e arquivos", self.sync_estimativa_respostas),
+                ("Registros encontrados", self.sync_estimativa_registros),
+                ("Download e banco", self.sync_estimativa_armazenamento),
+            )
+        ):
+            name = QLabel(label)
+            name.setStyleSheet("font-weight: 700; color: #244f70;")
+            field.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            estimate_grid.addWidget(name, row, 0)
+            estimate_grid.addWidget(field, row, 1)
+        estimate_grid.setColumnStretch(1, 1)
+        self.sync_estimativa_detalhes = QLabel(
+            "Itens e fornecedores ainda não foram incluídos numa estimativa."
+        )
+        self.sync_estimativa_detalhes.setWordWrap(True)
+        self.sync_estimativa_detalhes.setObjectName("muted")
         self.sync_metricas = QLabel("Nenhuma execução planejada.")
         self.sync_metricas.setObjectName("muted")
         alerts = QHBoxLayout()
@@ -721,6 +923,8 @@ class MainWindow(QMainWindow):
         alerts.addWidget(self.botao_diagnosticos)
         status_layout.addWidget(self.sync_status_label)
         status_layout.addWidget(self.sync_progresso)
+        status_layout.addLayout(estimate_grid)
+        status_layout.addWidget(self.sync_estimativa_detalhes)
         status_layout.addWidget(self.sync_metricas)
         status_layout.addLayout(alerts)
         layout.addWidget(status)
@@ -733,7 +937,23 @@ class MainWindow(QMainWindow):
         explanation.setObjectName("muted")
         layout.addWidget(explanation)
         layout.addStretch(1)
+        self.sync_data_inicial.dateChanged.connect(self._sync_filters_changed)
+        self.sync_data_final.dateChanged.connect(self._sync_filters_changed)
+        self.sync_modalidade.currentIndexChanged.connect(self._sync_filters_changed)
         return page
+
+    def _sync_filters_changed(self, *_: object) -> None:
+        if self._sync_plan is None:
+            return
+        if self._sync_worker is not None and self._sync_worker.isRunning():
+            return
+        self._sync_plan = None
+        self._sync_can_continue = False
+        self.botao_sincronizar.setEnabled(False)
+        self.botao_continuar.setEnabled(False)
+        self.sync_status_label.setText(
+            "Os filtros mudaram depois da estimativa. Clique Estimar novamente."
+        )
 
     def _criar_aba_banco_local(self) -> QWidget:
         page = QWidget()
@@ -885,7 +1105,9 @@ class MainWindow(QMainWindow):
         if self._sync_worker is not None and self._sync_worker.isRunning():
             return
         self.sync_status_label.setText("Localizando a última execução concluída desta modalidade…")
-        self._queue_database_task("latest_completed_date", modalidade=self.sync_modalidade.value())
+        self._queue_database_task(
+            "latest_completed_date", modalidade=int(self.sync_modalidade.currentData())
+        )
 
     def _apply_latest_completed_date(self, value: object) -> None:
         if value is None:
@@ -956,6 +1178,7 @@ class MainWindow(QMainWindow):
         self._detail_run_id = None
         self._sync_plan = None
         self._sync_space_ok = True
+        self._sync_can_continue = False
         self._local_dirty = True
         self._local_loaded_path = None
         self.local_path.setText(str(target))
@@ -975,7 +1198,7 @@ class MainWindow(QMainWindow):
         return SyncWindow(
             data_inicial=self.sync_data_inicial.date().toPython(),
             data_final=self.sync_data_final.date().toPython(),
-            modalidade=self.sync_modalidade.value(),
+            modalidade=int(self.sync_modalidade.currentData()),
         )
 
     def estimar_sincronizacao(self) -> None:
@@ -986,13 +1209,26 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "Filtros inválidos", str(exc))
             return
+        replace_plan_id = self._sync_run_id
         self._sync_run_id = None
         self._detail_run_id = None
         self._sync_plan = None
+        self._sync_can_continue = False
         self._set_sync_busy(True, planning=True)
         self.sync_status_label.setText("Consultando uma página para estimar a carga…")
+        self.sync_estimativa_tempo.setText("Calculando com a latência real do PNCP…")
+        self.sync_estimativa_respostas.setText("Calculando…")
+        self.sync_estimativa_registros.setText("Calculando…")
+        self.sync_estimativa_armazenamento.setText("Calculando…")
+        self.sync_estimativa_detalhes.setText(
+            "A primeira página está sendo consultada; você pode cancelar se o PNCP estiver lento."
+        )
         worker = SyncTaskThread(
-            self._sync_config(), action="plan", window=self._sync_window(), parent=self
+            self._sync_config(),
+            action="plan",
+            window=self._sync_window(),
+            replace_plan_id=replace_plan_id,
+            parent=self,
         )
         self._connect_sync_worker(worker)
         self._sync_worker = worker
@@ -1010,6 +1246,8 @@ class MainWindow(QMainWindow):
             self._executar_sincronizacao()
 
     def _executar_sincronizacao(self) -> None:
+        self._sync_plan = None
+        self._sync_can_continue = False
         self._set_sync_busy(True)
         self.sync_status_label.setText("Sincronização em andamento…")
         worker = SyncTaskThread(
@@ -1035,7 +1273,10 @@ class MainWindow(QMainWindow):
 
     def pausar_sincronizacao(self) -> None:
         if self._sync_worker is not None and self._sync_worker.isRunning():
-            self.sync_status_label.setText("Pausando após liberar a unidade atual…")
+            if self._sync_worker.action == "plan":
+                self.sync_status_label.setText("Cancelando a estimativa…")
+            else:
+                self.sync_status_label.setText("Pausando após liberar a unidade atual…")
             self.botao_pausar.setEnabled(False)
             self._sync_worker.pause()
 
@@ -1049,6 +1290,31 @@ class MainWindow(QMainWindow):
             f"download estimado {formatar_bytes(summary.estimated_download_bytes)} • "
             f"banco estimado {formatar_bytes(summary.estimated_database_bytes)}"
         )
+        self.sync_estimativa_tempo.setText(
+            f"aprox. {formatar_duracao(summary.estimated_main_seconds)} restantes "
+            f"(a 1ª página levou {summary.first_page_latency_ms / 1000:.1f} s)"
+        )
+        self.sync_estimativa_respostas.setText(
+            f"0 arquivos separados; {summary.total_pages} payload(s) compactado(s) no SQLite; "
+            f"{summary.remaining_main_requests} chamada(s) de página restantes"
+        )
+        self.sync_estimativa_registros.setText(
+            f"{summary.total_records} contratação(ões) informadas pelo PNCP"
+        )
+        self.sync_estimativa_armazenamento.setText(
+            f"{formatar_bytes(summary.estimated_download_bytes)} de rede; "
+            f"aprox. {formatar_bytes(summary.estimated_database_bytes)} no banco"
+        )
+        if self.incluir_detalhes.isChecked():
+            self.sync_estimativa_detalhes.setText(
+                f"Itens e fornecedores: no mínimo {summary.minimum_detail_requests} chamada(s) "
+                "adicionais, uma por contratação, além das páginas e resultados encontrados. "
+                "O tempo total dessa etapa só fica conhecido durante a coleta."
+            )
+        else:
+            self.sync_estimativa_detalhes.setText(
+                "Itens e fornecedores estão desmarcados e não entram nesta carga."
+            )
         extras = ", ".join(summary.unmodeled_fields[:5])
         remaining_extras = max(0, len(summary.unmodeled_fields) - 5)
         extra_count = f" e mais {remaining_extras}" if remaining_extras else ""
@@ -1102,6 +1368,7 @@ class MainWindow(QMainWindow):
             )
 
     def _sync_concluido(self, main: RunSummary, details: DetailRunSummary | None) -> None:
+        self._sync_can_continue = False
         has_failure = main.status == "FAILED" or (
             details is not None and details.status == "FAILED"
         )
@@ -1125,8 +1392,9 @@ class MainWindow(QMainWindow):
                 main, details, "Sincronização pausada. Use Continuar para retomar."
             )
         else:
-            self.sync_status_label.setText("Sincronização pausada.")
-        self.botao_continuar.setEnabled(self._sync_run_id is not None)
+            self.sync_status_label.setText("Estimativa cancelada.")
+        self._sync_can_continue = self._sync_run_id is not None
+        self.botao_continuar.setEnabled(self._sync_can_continue)
 
     def _render_sync_result(
         self,
@@ -1168,12 +1436,30 @@ class MainWindow(QMainWindow):
         )
 
     def _sync_falhou(self, mensagem: str, detalhe: str) -> None:
+        self._sync_can_continue = False
         self.sync_status_label.setText(mensagem)
         self.sync_status_label.setToolTip(detalhe)
+        if self._sync_run_id is None:
+            self.sync_estimativa_tempo.setText("Não calculado: o PNCP não respondeu corretamente")
+            self.sync_estimativa_respostas.setText("Nenhuma estimativa confirmada")
+            self.sync_estimativa_registros.setText("Nenhuma estimativa confirmada")
+            self.sync_estimativa_armazenamento.setText("Nenhuma estimativa confirmada")
+            self.sync_estimativa_detalhes.setText(
+                "Tente novamente mais tarde ou use um período de um dia. O erro não criou "
+                "uma sincronização parcial."
+            )
         self.sync_alertas.setText("Falha não tratada na execução; consulte o detalhe exibido.")
         self.sync_alertas.setObjectName("alertaErro")
-        QMessageBox.critical(self, "Falha na sincronização", f"{mensagem}\n\n{detalhe}")
-        self.botao_continuar.setEnabled(self._sync_run_id is not None)
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Critical)
+        dialog.setWindowTitle("Falha na sincronização")
+        dialog.setText(mensagem)
+        dialog.setInformativeText(
+            "O detalhe técnico está disponível abaixo e pode ser usado para relatar o problema."
+        )
+        dialog.setDetailedText(detalhe)
+        dialog.exec()
+        self.botao_continuar.setEnabled(False)
 
     def _sync_finalizado(self) -> None:
         worker = self._sync_worker
@@ -1186,10 +1472,11 @@ class MainWindow(QMainWindow):
         self.sync_progresso.setVisible(busy)
         self.botao_estimar.setEnabled(not busy)
         self.botao_sincronizar.setEnabled(
-            not busy and self._sync_run_id is not None and not planning and self._sync_space_ok
+            not busy and self._sync_plan is not None and not planning and self._sync_space_ok
         )
-        self.botao_pausar.setEnabled(busy and not planning)
-        self.botao_continuar.setEnabled(not busy and self._sync_run_id is not None and not planning)
+        self.botao_pausar.setText("Cancelar estimativa" if busy and planning else "Pausar")
+        self.botao_pausar.setEnabled(busy)
+        self.botao_continuar.setEnabled(not busy and self._sync_can_continue and not planning)
         self.sync_data_inicial.setEnabled(not busy)
         self.sync_data_final.setEnabled(not busy)
         self.sync_modalidade.setEnabled(not busy)
@@ -1297,11 +1584,13 @@ class MainWindow(QMainWindow):
             }
             QLabel#statusTexto { color: #244f70; }
             QLabel#alertaErro { color: #a33333; font-weight: 700; }
-            QLineEdit, QDateEdit, QSpinBox {
+            QLineEdit, QDateEdit, QSpinBox, QComboBox {
                 background: #ffffff; border: 1px solid #b9c9d8; border-radius: 6px;
                 padding: 7px 9px; min-height: 22px;
             }
-            QLineEdit:focus, QDateEdit:focus, QSpinBox:focus { border: 2px solid #1677a6; }
+            QLineEdit:focus, QDateEdit:focus, QSpinBox:focus, QComboBox:focus {
+                border: 2px solid #1677a6;
+            }
             QPushButton { border: 0; border-radius: 6px; padding: 9px 14px; font-weight: 600; }
             QPushButton#primario { background: #1677a6; color: white; }
             QPushButton#primario:hover { background: #0e658f; }
