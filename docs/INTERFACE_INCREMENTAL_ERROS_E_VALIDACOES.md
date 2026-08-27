@@ -67,7 +67,7 @@ campos adicionais normalizados são:
 
 - encerramento das propostas, situação da compra e modo de disputa;
 - tipo de instrumento convocatório e amparo legal completo;
-- datas de inclusão, atualização e atualização global;
+- datas de inclusão e atualização (`dataAtualizacaoGlobal` já era modelada);
 - poder, esfera, código da unidade, município, UF e código IBGE;
 - links do sistema de origem e do processo eletrônico;
 - justificativa de sessão presencial e usuário publicador;
