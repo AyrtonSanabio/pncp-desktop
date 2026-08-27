@@ -123,9 +123,11 @@ Referências técnicas iniciais:
 O protótipo gráfico existente ainda pode ser executado para estudo:
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 .\run.bat
 ```
+
+No Windows, também é possível abrir a pasta no Explorador de Arquivos e dar dois
+cliques em `run.bat`. Na primeira execução, o lançador cria o ambiente virtual e
+instala as dependências automaticamente. É necessário ter Python 3.12 ou mais recente.
 
 Sua arquitetura e prévia estão em [Melhorias futuras — interface desktop](docs/melhorias-futuras/INTERFACE_DESKTOP_ARQUITETURA_E_DESAFIOS.md).

@@ -24,6 +24,9 @@ def main() -> int:
         janela.carregar_demonstracao()
 
     janela.show()
+    janela.raise_()
+    janela.activateWindow()
+    QTimer.singleShot(0, janela.activateWindow)
 
     if argumentos.screenshot:
         destino = argumentos.screenshot
