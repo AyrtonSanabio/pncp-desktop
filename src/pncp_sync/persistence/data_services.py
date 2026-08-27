@@ -424,11 +424,15 @@ class DataServices:
         self.connection.commit()
         return {"indexed": indexed, "skipped": skipped, "dimensions": dimensions}
 
-    def semantic_search(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
+    def semantic_search(
+        self, query: str, limit: int = 20, min_score: float = 0.0
+    ) -> list[dict[str, Any]]:
         if not query.strip():
             raise ValueError("A busca por similaridade não pode ser vazia.")
         if not 1 <= limit <= 200:
             raise ValueError("O limite da busca por similaridade deve ficar entre 1 e 200.")
+        if not 0.0 <= min_score <= 1.0:
+            raise ValueError("A pontuação mínima deve ficar entre 0 e 1.")
         rows = self.connection.execute(
             """SELECT s.*,c.numero_controle_pncp,c.objeto_compra,c.orgao_razao_social
                FROM semantic_document s JOIN contratacao c ON c.id=s.contratacao_id"""
@@ -438,10 +442,15 @@ class DataServices:
             q = self._vector(" ".join(self.expand_query(query)), int(row["dimensions"]))
             vector = {int(k): float(v) for k, v in json.loads(bytes(row["vector_json"])).items()}
             score = sum(value * vector.get(slot, 0.0) for slot, value in q.items())
-            if score > 0:
+            if score >= min_score and score > 0:
                 item = dict(row)
                 item.pop("vector_json")
                 item["score"] = score
+                item["match_reason"] = "conceitos: " + ", ".join(
+                    concept
+                    for concept, terms in _CONCEPTS.items()
+                    if set(_tokens(query)).intersection(terms)
+                )
                 scored.append(item)
         return sorted(scored, key=lambda item: item["score"], reverse=True)[:limit]
 

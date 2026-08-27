@@ -1176,6 +1176,14 @@ class MainWindow(QMainWindow):
         self.semantic_busca = QLineEdit(
             placeholderText="Ex.: manutenção de computadores para escolas"
         )
+        self.semantic_min_score = QDoubleSpinBox()
+        self.semantic_min_score.setRange(0.0, 1.0)
+        self.semantic_min_score.setSingleStep(0.05)
+        self.semantic_min_score.setValue(0.30)
+        self.semantic_min_score.setPrefix("Mínimo: ")
+        self.semantic_min_score.setToolTip(
+            "Oculta resultados com pontuação relativa abaixo deste valor. Não é porcentagem."
+        )
         semantic_build = QPushButton("Criar/atualizar índice")
         semantic_build.clicked.connect(
             lambda: self._queue_database_task("rebuild_semantic_index", dimensions=512)
@@ -1183,10 +1191,14 @@ class MainWindow(QMainWindow):
         semantic_search = QPushButton("Busca semântica")
         semantic_search.clicked.connect(
             lambda: self._queue_database_task(
-                "semantic_search", query=self.semantic_busca.text(), limit=50
+                "semantic_search",
+                query=self.semantic_busca.text(),
+                limit=50,
+                min_score=self.semantic_min_score.value(),
             )
         )
         semantic_controls.addWidget(self.semantic_busca, 1)
+        semantic_controls.addWidget(self.semantic_min_score)
         semantic_controls.addWidget(semantic_build)
         semantic_controls.addWidget(semantic_search)
         self.manutencao_status = QLabel("Nenhuma verificação executada nesta sessão.")

@@ -112,9 +112,11 @@ class LocalDatabase:
         with self._connect() as connection:
             return DataServices(connection).rebuild_semantic_index(dimensions)
 
-    def semantic_search(self, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
+    def semantic_search(
+        self, query: str, *, limit: int = 20, min_score: float = 0.0
+    ) -> list[dict[str, Any]]:
         with self._connect() as connection:
-            return DataServices(connection).semantic_search(query, limit)
+            return DataServices(connection).semantic_search(query, limit, min_score)
 
     def analytics(self) -> dict[str, list[dict[str, Any]]]:
         with self._connect() as connection:

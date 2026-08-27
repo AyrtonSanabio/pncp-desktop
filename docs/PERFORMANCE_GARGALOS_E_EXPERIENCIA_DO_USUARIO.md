@@ -73,6 +73,8 @@ Não mostrar somente “50 resultados”. Mostrar:
 
 Isso evita que o usuário interprete similaridade como certeza jurídica ou comercial.
 
+A busca semântica agora oferece uma pontuação mínima ajustável. O valor é relativo ao conjunto indexado e não representa porcentagem ou probabilidade. Um limiar maior reduz ruído, mas pode esconder candidatos úteis; por isso o usuário deve comparar consultas e validar os primeiros resultados antes de escolher um valor.
+
 ### Padrões seguros
 
 - Busca textual funciona sem modelo semântico.
