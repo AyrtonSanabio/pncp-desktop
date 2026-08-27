@@ -1096,11 +1096,12 @@ class MainWindow(QMainWindow):
         search_layout.addWidget(self.local_status)
         self.local_sections.addTab(search_page, "Pesquisa")
 
-        self.historico_tabela = QTableWidget(0, 9)
+        self.historico_tabela = QTableWidget(0, 11)
         self.historico_tabela.setHorizontalHeaderLabels(
             (
                 "Data",
-                "Período",
+                "Início",
+                "Fim",
                 "Modalidade",
                 "Status",
                 "Registros",
@@ -1108,6 +1109,7 @@ class MainWindow(QMainWindow):
                 "Alterados",
                 "Ausentes",
                 "Recebido",
+                "Duração (s)",
             )
         )
         self.historico_tabela.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1424,6 +1426,8 @@ class MainWindow(QMainWindow):
                     "new_records",
                     "updated_records",
                     "missing_records",
+                    "bytes_received",
+                    "duration_seconds",
                 )
             ]
             for c, value in enumerate(values):

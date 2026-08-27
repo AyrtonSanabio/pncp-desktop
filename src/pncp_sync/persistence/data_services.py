@@ -172,6 +172,8 @@ class DataServices:
         rows = self.connection.execute(
             """SELECT r.id, r.data_inicial, r.data_final, r.modalidade, r.status,
                       r.created_at, r.started_at, r.finished_at,
+                      CASE WHEN r.started_at IS NOT NULL AND r.finished_at IS NOT NULL
+                           THEN ROUND((julianday(r.finished_at)-julianday(r.started_at))*86400,1) END duration_seconds,
                       COALESCE(SUM(w.bytes_received),0) bytes_received,
                       COALESCE(SUM(w.record_count),0) records,
                       COALESCE(SUM(w.inserted_count),0) new_records,
