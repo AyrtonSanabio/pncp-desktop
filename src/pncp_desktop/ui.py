@@ -1889,7 +1889,9 @@ class MainWindow(QMainWindow):
         )
         dialog.setDetailedText(detalhe)
         dialog.exec()
-        self.botao_continuar.setEnabled(False)
+        # Se já existe um plano, a falha pode ser retomada após a mensagem.
+        self._sync_can_continue = self._sync_run_id is not None
+        self.botao_continuar.setEnabled(self._sync_can_continue)
 
     def _sync_finalizado(self) -> None:
         worker = self._sync_worker
