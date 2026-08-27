@@ -11,7 +11,7 @@ from PySide6.QtWidgets import QApplication, QLabel
 
 from pncp_desktop.local_database import DatabaseSnapshot, DatabaseStats, DiagnosticsReport
 from pncp_desktop.ui import ContractDetailDialog, DiagnosticsDialog, MainWindow, formatar_duracao
-from pncp_sync.domain.models import PlanSummary
+from pncp_sync.domain.models import PlanSummary, RunSummary
 
 
 def _app() -> QApplication:
@@ -162,3 +162,34 @@ def test_duration_format_supports_hours() -> None:
     assert formatar_duracao(45) == "45 s"
     assert formatar_duracao(125) == "2 min 05 s"
     assert formatar_duracao(3_900) == "1 h 05 min"
+
+
+def test_disabled_sync_buttons_explain_why_and_failure_can_resume(tmp_path) -> None:
+    app = _app()
+    window = MainWindow(tmp_path / "buttons.sqlite3")
+    assert "clique em Estimar" in window.botao_sincronizar.toolTip()
+    assert "não há uma execução" in window.botao_continuar.toolTip()
+
+    window._sync_run_id = "recoverable-run"
+    failed = RunSummary(
+        run_id="recoverable-run",
+        status="FAILED",
+        planned_units=3,
+        succeeded_units=2,
+        partial_units=0,
+        pending_units=1,
+        failed_units=1,
+        records_received=20,
+        records_inserted=20,
+        records_updated=0,
+        records_unchanged=0,
+        records_rejected=0,
+        bytes_received=1000,
+    )
+    window._sync_concluido(failed, None)
+    window._set_sync_busy(False)
+
+    assert window.botao_continuar.isEnabled()
+    assert "unidades pendentes" in window.botao_continuar.toolTip()
+    window.close()
+    app.processEvents()

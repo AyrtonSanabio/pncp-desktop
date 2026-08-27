@@ -795,6 +795,28 @@ class SyncRepository:
                 (run_id,),
             )
 
+    def retry_recoverable_units(self, run_id: str) -> int:
+        """Reabre somente falhas cuja ocorrência mais recente foi marcada como recuperável."""
+        with self._transaction() as cursor:
+            cursor.execute(
+                """UPDATE work_unit
+                   SET status='PENDING', attempt_count=0, lease_until=NULL, finished_at=NULL
+                   WHERE run_id=? AND status='FAILED'
+                     AND COALESCE((
+                         SELECT e.recoverable FROM ingestion_error e
+                         WHERE e.work_unit_id=work_unit.id
+                         ORDER BY e.id DESC LIMIT 1
+                     ),0)=1""",
+                (run_id,),
+            )
+            reopened = cursor.rowcount
+            if reopened:
+                cursor.execute(
+                    "UPDATE ingestion_run SET status='PAUSED',finished_at=NULL WHERE id=?",
+                    (run_id,),
+                )
+            return reopened
+
     def finalize_run(self, run_id: str) -> str:
         summary = self.get_summary(run_id)
         if summary.failed_units:

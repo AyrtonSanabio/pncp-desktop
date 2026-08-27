@@ -236,3 +236,26 @@ async def test_falha_recuperavel_pausa_sem_avancar_checkpoint(tmp_path: Path) ->
     diagnostics = LocalDatabase(config.db_path).diagnostics()
     assert diagnostics.main_errors == 1
     assert diagnostics.errors[0]["recoverable"] == 1
+
+
+@pytest.mark.asyncio
+async def test_falha_recuperavel_esgotada_pode_ser_reaberta_e_concluida(tmp_path: Path) -> None:
+    config = config_for(tmp_path / "retry-exhausted.sqlite3")
+    window = SyncWindow(date(2026, 8, 26), date(2026, 8, 26), 6)
+    pages = {
+        1: make_page([sample_record(1)], page_number=1, total_pages=2, total_records=2),
+        2: make_page([sample_record(2)], page_number=2, total_pages=2, total_records=2),
+    }
+    plan = await plan_sync(config, window, source=FakeSource(pages))
+    await run_sync(config, plan.run_id, source=FakeSource(pages), max_pages=1)
+    await run_sync(config, plan.run_id, source=ErrorSource())
+    await run_sync(config, plan.run_id, source=ErrorSource())
+    failed = await run_sync(config, plan.run_id, source=ErrorSource())
+    assert failed.status == "FAILED"
+
+    with SyncRepository(config.db_path) as repository:
+        assert repository.retry_recoverable_units(plan.run_id) == 1
+
+    completed = await run_sync(config, plan.run_id, source=FakeSource(pages))
+    assert completed.status == "COMPLETED"
+    assert completed.records_inserted == 2

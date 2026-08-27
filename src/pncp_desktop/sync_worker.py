@@ -95,6 +95,12 @@ class SyncTaskThread(QThread):
         if self.action != "run" or not self.run_id:
             raise ValueError("A execução planejada não foi informada.")
 
+        with SyncRepository(self.config.db_path) as repository:
+            reopened = repository.retry_recoverable_units(self.run_id)
+        if reopened:
+            self.activity.emit(
+                f"Retomando {reopened} página(s) que tiveram falha temporária no PNCP."
+            )
         main_summary = await run_sync(
             self.config,
             self.run_id,

@@ -966,6 +966,7 @@ class MainWindow(QMainWindow):
         self.sync_data_inicial.dateChanged.connect(self._sync_filters_changed)
         self.sync_data_final.dateChanged.connect(self._sync_filters_changed)
         self.sync_modalidade.currentIndexChanged.connect(self._sync_filters_changed)
+        self._update_sync_action_feedback()
         return page
 
     def _sync_filters_changed(self, *_: object) -> None:
@@ -980,6 +981,7 @@ class MainWindow(QMainWindow):
         self.sync_status_label.setText(
             "Os filtros mudaram depois da estimativa. Clique Estimar novamente."
         )
+        self._update_sync_action_feedback()
 
     def _criar_aba_banco_local(self) -> QWidget:
         page = QWidget()
@@ -1781,6 +1783,7 @@ class MainWindow(QMainWindow):
             )
         self.botao_sincronizar.setEnabled(enough_space)
         self.botao_continuar.setEnabled(False)
+        self._update_sync_action_feedback()
         if self._auto_sync_pending:
             self._auto_sync_pending = False
             if enough_space:
@@ -1859,6 +1862,7 @@ class MainWindow(QMainWindow):
             self.sync_atividade.setText("Estimativa cancelada; nenhum download foi iniciado.")
         self._sync_can_continue = self._sync_run_id is not None
         self.botao_continuar.setEnabled(self._sync_can_continue)
+        self._update_sync_action_feedback()
 
     def _render_sync_result(
         self,
@@ -1926,6 +1930,7 @@ class MainWindow(QMainWindow):
         # Se já existe um plano, a falha pode ser retomada após a mensagem.
         self._sync_can_continue = self._sync_run_id is not None
         self.botao_continuar.setEnabled(self._sync_can_continue)
+        self._update_sync_action_feedback()
 
     def _sync_finalizado(self) -> None:
         worker = self._sync_worker
@@ -1951,6 +1956,34 @@ class MainWindow(QMainWindow):
         self.sync_automatico.setEnabled(not busy)
         database_busy = self._database_worker is not None and self._database_worker.isRunning()
         self.botao_escolher_banco.setEnabled(not busy and not database_busy)
+        self._update_sync_action_feedback()
+
+    def _update_sync_action_feedback(self) -> None:
+        busy = self._sync_worker is not None and self._sync_worker.isRunning()
+        if self.botao_sincronizar.isEnabled():
+            self.botao_sincronizar.setToolTip(
+                "Inicia a carga planejada e grava cada página confirmada no banco local."
+            )
+        elif busy:
+            self.botao_sincronizar.setToolTip("Aguarde a operação atual terminar ou use Pausar.")
+        elif self._sync_plan is None:
+            self.botao_sincronizar.setToolTip(
+                "Indisponível: clique em Estimar e aguarde a estimativa terminar."
+            )
+        elif not self._sync_space_ok:
+            self.botao_sincronizar.setToolTip(
+                "Indisponível: o local escolhido não possui a margem de espaço necessária."
+            )
+        if self.botao_continuar.isEnabled():
+            self.botao_continuar.setToolTip(
+                "Retoma somente as unidades pendentes ou que tiveram falha recuperável."
+            )
+        elif busy:
+            self.botao_continuar.setToolTip("Indisponível enquanto outra operação está rodando.")
+        else:
+            self.botao_continuar.setToolTip(
+                "Indisponível: não há uma execução pausada ou recuperável selecionada."
+            )
 
     def carregar_banco_local(self) -> None:
         self._queue_database_task("snapshot", query=self.local_busca.text())
