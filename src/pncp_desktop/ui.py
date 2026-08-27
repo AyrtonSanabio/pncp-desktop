@@ -1165,6 +1165,7 @@ class MainWindow(QMainWindow):
             ("Criar backup…", self.criar_backup),
             ("Manutenção segura…", self.executar_manutencao),
             ("Medir desempenho", lambda: self._queue_database_task("performance_report")),
+            ("Importar dados novos…", self.importar_banco_teste),
         ):
             button = QPushButton(label)
             button.setObjectName("secundario")
@@ -1320,6 +1321,15 @@ class MainWindow(QMainWindow):
             self.manutencao_status.setText(f"Integridade: {result}")
         elif action in {"create_backup", "safe_maintenance"}:
             self.manutencao_status.setText(f"Operação concluída: {result}")
+        elif action == "import_new_database":
+            self._local_dirty = True
+            self.manutencao_status.setText(
+                "Importação concluída: "
+                f"{result.get('contracts_inserted', 0)} contratações, "
+                f"{result.get('items_inserted', 0)} itens e "
+                f"{result.get('results_inserted', 0)} resultados novos; "
+                f"{result.get('conflicts', 0)} conflito(s) preservado(s)."
+            )
 
     def _database_task_failed(self, action: str, detail: str) -> None:
         readable = {
@@ -1488,6 +1498,28 @@ class MainWindow(QMainWindow):
         )
         if destino:
             self._queue_database_task("create_backup", destination=Path(destino))
+
+    def importar_banco_teste(self) -> None:
+        origem, _ = QFileDialog.getOpenFileName(
+            self,
+            "Escolher banco de testes",
+            str(self._db_path.parent),
+            "SQLite (*.sqlite3 *.db)",
+        )
+        if not origem:
+            self.manutencao_status.setText("Importação cancelada; nenhum dado foi alterado.")
+            return
+        if Path(origem).resolve() == self._db_path.resolve():
+            QMessageBox.warning(
+                self,
+                "Banco inválido",
+                "Escolha um banco de origem diferente do banco principal atualmente aberto.",
+            )
+            return
+        self.manutencao_status.setText(
+            "Validando bancos, criando backup e importando somente dados novos…"
+        )
+        self._queue_database_task("import_new_database", source_path=Path(origem))
 
     def executar_manutencao(self) -> None:
         destino, _ = QFileDialog.getSaveFileName(

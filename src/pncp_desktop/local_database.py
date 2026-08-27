@@ -6,6 +6,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
+from pncp_desktop.database_import import import_new_records
 from pncp_sync.persistence.data_services import DataServices, Page, backup_database
 from pncp_sync.persistence.repositories import SyncRepository
 
@@ -180,6 +181,24 @@ class LocalDatabase:
             connection.execute("PRAGMA optimize")
         after = self.quick_check()
         return {"backup": str(backup), "before": before, "after": after}
+
+    def import_new_database(self, source_path: Path) -> dict[str, Any]:
+        """Cria backup e importa somente entidades novas, preservando conflitos."""
+        self.ensure_ready()
+        source_database = LocalDatabase(source_path)
+        source_database.ensure_ready()
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        backup = self.create_backup(
+            self.db_path.with_name(f"{self.db_path.stem}-pre-import-{stamp}.sqlite3")
+        )
+        try:
+            report = import_new_records(self.db_path, source_database.db_path)
+        except Exception:
+            # O importador usa uma única transação; o backup permanece para auditoria.
+            raise
+        report["backup"] = str(backup)
+        report["source"] = str(source_database.db_path)
+        return report
 
     def stats(self) -> DatabaseStats:
         with self._connect() as connection:

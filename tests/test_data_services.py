@@ -120,3 +120,27 @@ def test_economic_semantic_index_and_backup(tmp_path: Path) -> None:
     assert database.quick_check()["ok"]
     with pytest.raises(FileExistsError):
         database.create_backup(backup)
+
+
+def test_import_new_database_is_idempotent_and_creates_backup(tmp_path: Path) -> None:
+    target = _database_with_contract(tmp_path / "main.sqlite3")
+    source = _database_with_contract(tmp_path / "source.sqlite3")
+    with source._connect() as connection:
+        connection.execute(
+            """UPDATE contratacao SET numero_controle_pncp='PNCP-2',record_hash='hash-2'
+               WHERE id=1"""
+        )
+        connection.execute(
+            "UPDATE contratacao_fts SET numero_controle_pncp='PNCP-2' WHERE rowid=1"
+        )
+        connection.commit()
+
+    first = target.import_new_database(source.db_path)
+    second = target.import_new_database(source.db_path)
+
+    assert first["contracts_inserted"] == 1
+    assert Path(first["backup"]).exists()
+    assert second["contracts_inserted"] == 0
+    assert second["existing_identical"] == 1
+    assert target.stats().contracts == 2
+    assert target.quick_check()["ok"]

@@ -45,6 +45,7 @@ class DatabaseTaskThread(QThread):
                 "quick_check": "quick_check",
                 "create_backup": "create_backup",
                 "safe_maintenance": "safe_maintenance",
+                "import_new_database": "import_new_database",
                 "detail": "contract_detail",
                 "detail_by_control": "contract_detail_by_control",
             }
