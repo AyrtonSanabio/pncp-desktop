@@ -5,6 +5,7 @@ import json
 import math
 import re
 import sqlite3
+import time
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass
@@ -402,6 +403,31 @@ class DataServices:
             (limit,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def performance_report(self) -> dict[str, Any]:
+        """Mede consultas representativas sem carregar todos os registros em memória."""
+        def timed(sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any]:
+            plan = [dict(row) for row in self.connection.execute("EXPLAIN QUERY PLAN " + sql, params)]
+            started = time.perf_counter()
+            count = int(self.connection.execute("SELECT COUNT(*) FROM (" + sql + ")", params).fetchone()[0])
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            return {"rows": count, "elapsed_ms": round(elapsed_ms, 2), "plan": plan}
+
+        counts = {
+            "contratacoes": int(self.connection.execute("SELECT COUNT(*) FROM contratacao").fetchone()[0]),
+            "itens": int(self.connection.execute("SELECT COUNT(*) FROM item_contratacao").fetchone()[0]),
+            "resultados": int(self.connection.execute("SELECT COUNT(*) FROM resultado_item").fetchone()[0]),
+            "vetores": int(self.connection.execute("SELECT COUNT(*) FROM semantic_document").fetchone()[0]),
+        }
+        return {
+            "counts": counts,
+            "database_page_count": int(self.connection.execute("PRAGMA page_count").fetchone()[0]),
+            "database_page_size": int(self.connection.execute("PRAGMA page_size").fetchone()[0]),
+            "queries": {
+                "recent": timed("SELECT id FROM contratacao ORDER BY COALESCE(data_publicacao_pncp,data_inclusao) DESC LIMIT 50"),
+                "text": timed("SELECT rowid FROM contratacao_fts WHERE contratacao_fts MATCH ?", ('contratacao',)),
+            },
+        }
 
     def save_query(self, name: str, filters: dict[str, Any]) -> int:
         if not name.strip():

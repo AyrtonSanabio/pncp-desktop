@@ -1162,6 +1162,7 @@ class MainWindow(QMainWindow):
             ("Verificar integridade", self.verificar_integridade),
             ("Criar backup…", self.criar_backup),
             ("Manutenção segura…", self.executar_manutencao),
+            ("Medir desempenho", lambda: self._queue_database_task("performance_report")),
         ):
             button = QPushButton(label)
             button.setObjectName("secundario")
@@ -1300,6 +1301,16 @@ class MainWindow(QMainWindow):
             self.manutencao_status.setText(f"Índice atualizado: {result}")
         elif action == "refresh_insights":
             self.manutencao_status.setText(f"Classificação atualizada: {result}")
+        elif action == "performance_report":
+            counts = result.get("counts", {}) if isinstance(result, dict) else {}
+            queries = result.get("queries", {}) if isinstance(result, dict) else {}
+            recent = queries.get("recent", {}).get("elapsed_ms", "?")
+            text = (
+                f"Desempenho: {counts.get('contratacoes', 0)} contratos, "
+                f"{counts.get('vetores', 0)} vetores; consulta recente em {recent} ms. "
+                "Use esta medição para comparar máquinas e bases maiores."
+            )
+            self.manutencao_status.setText(text)
         elif action == "semantic_search":
             self._render_semantic_results(result)
         elif action == "quick_check":

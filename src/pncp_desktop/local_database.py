@@ -90,6 +90,10 @@ class LocalDatabase:
         with self._connect() as connection:
             return DataServices(connection).duplicate_candidates(limit)
 
+    def performance_report(self) -> dict[str, Any]:
+        with self._connect() as connection:
+            return DataServices(connection).performance_report()
+
     def sync_history(self, *, limit: int = 100) -> list[dict[str, Any]]:
         with self._connect() as connection:
             return DataServices(connection).sync_history(limit)
