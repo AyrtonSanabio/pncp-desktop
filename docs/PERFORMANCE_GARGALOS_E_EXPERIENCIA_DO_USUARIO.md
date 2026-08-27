@@ -99,3 +99,7 @@ O marco automático atual também gera uma classificação local por categorias 
 A busca híbrida combina filtros estruturados com a lista de candidatos do banco e a pontuação de similaridade. O mesmo módulo também identifica candidatos a duplicidade por órgão e objeto. Esses recursos são auxiliares: não afirmam que duas contratações são juridicamente a mesma nem substituem a conferência do identificador PNCP.
 
 O objetivo é manter a complexidade interna alta quando necessário, mas expor ao usuário uma sequência curta, explicável e segura.
+
+## Medição no aplicativo
+
+A aba **Banco local → Segurança e manutenção → Medir desempenho** executa uma medição leve no banco já populado. Ela informa a quantidade de contratações, itens, resultados e vetores, o tamanho lógico do SQLite (páginas × tamanho da página), além do tempo e do plano de execução de uma consulta recente e de uma consulta textual FTS5. A medição não baixa dados, não cria vetores e não altera o banco; serve para comparar máquinas e detectar regressões.
