@@ -13,6 +13,7 @@ from pncp_sync.persistence.detail_repositories import DetailRepository
 from pncp_sync.persistence.repositories import PersistResult
 
 DetailProgressCallback = Callable[[DetailWorkUnit, PersistResult], Any]
+DetailActivityCallback = Callable[[DetailWorkUnit], Any]
 
 
 def _is_recoverable(exc: PNCPError) -> bool:
@@ -26,6 +27,7 @@ async def run_details(
     source: DetailsSourceProtocol | None = None,
     max_units: int | None = None,
     progress: DetailProgressCallback | None = None,
+    activity: DetailActivityCallback | None = None,
 ) -> DetailRunSummary:
     if max_units is not None and max_units < 1:
         raise ValueError("max_units deve ser positivo.")
@@ -39,6 +41,8 @@ async def run_details(
                 repository.finalize_detail_run(detail_run_id)
                 return repository.get_detail_summary(detail_run_id)
             try:
+                if activity is not None:
+                    activity(work_unit)
                 if work_unit.resource == "ITEMS":
                     page = await source.fetch_items(
                         work_unit.purchase,

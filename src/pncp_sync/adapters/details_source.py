@@ -185,5 +185,14 @@ class PncpDetailsSource:
                     raise NotFoundError("Detalhe não encontrado no PNCP.")
                 if response.status_code >= 400:
                     raise ValidationError(f"PNCP retornou HTTP {response.status_code}.")
+                declared = response.headers.get("content-length")
+                if (
+                    declared
+                    and declared.isdigit()
+                    and int(declared) > self._config.max_response_bytes
+                ):
+                    raise ValidationError("O detalhe anunciado ultrapassa o limite de segurança.")
+                if len(response.content) > self._config.max_response_bytes:
+                    raise ValidationError("O detalhe recebido ultrapassa o limite de segurança.")
                 return response
         raise PNCPError("A consulta de detalhe terminou sem resposta.")

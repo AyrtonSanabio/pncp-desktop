@@ -27,7 +27,7 @@ from pncp_sync.normalization.contratacoes import (
     canonical_json,
     normalize_contratacao,
 )
-from pncp_sync.persistence.schema import MIGRATION_V1, MIGRATION_V2, SCHEMA_VERSION
+from pncp_sync.persistence.schema import MIGRATION_V1, MIGRATION_V2, MIGRATION_V3, SCHEMA_VERSION
 
 _CONTRATACAO_COLUMNS = (
     "numero_controle_pncp",
@@ -149,6 +149,11 @@ class SyncRepository:
         if current < 2:
             self.connection.executescript(MIGRATION_V2)
             self.connection.execute("PRAGMA user_version = 2")
+            self.connection.commit()
+            current = 2
+        if current < 3:
+            self.connection.executescript(MIGRATION_V3)
+            self.connection.execute("PRAGMA user_version = 3")
             self.connection.commit()
 
     def create_plan(
@@ -477,11 +482,30 @@ class SyncRepository:
                 if existing is None:
                     row_id = self._insert_contratacao(cursor, normalized, now)
                     self._replace_fts(cursor, row_id, normalized)
+                    self._record_change(
+                        cursor,
+                        work_unit.run_id,
+                        row_id,
+                        "NEW",
+                        now,
+                        None,
+                        normalized["record_hash"],
+                    )
                     inserted += 1
                 elif existing["record_hash"] != normalized["record_hash"]:
                     row_id = int(existing["id"])
+                    previous_hash = str(existing["record_hash"])
                     self._update_contratacao(cursor, row_id, normalized, now)
                     self._replace_fts(cursor, row_id, normalized)
+                    self._record_change(
+                        cursor,
+                        work_unit.run_id,
+                        row_id,
+                        "UPDATED",
+                        now,
+                        previous_hash,
+                        normalized["record_hash"],
+                    )
                     updated += 1
                 else:
                     cursor.execute(
@@ -527,6 +551,23 @@ class SyncRepository:
             self._refresh_coverage(cursor, work_unit.run_id, max_source_update, now)
 
         return PersistResult(inserted, updated, unchanged, rejected, payload_id)
+
+    @staticmethod
+    def _record_change(
+        cursor: sqlite3.Cursor,
+        run_id: str,
+        contract_id: int,
+        change_type: str,
+        now: str,
+        previous_hash: str | None,
+        current_hash: str | None,
+    ) -> None:
+        cursor.execute(
+            """INSERT OR IGNORE INTO sync_change(
+                   run_id, contratacao_id, change_type, detected_at,
+                   previous_hash, current_hash) VALUES (?, ?, ?, ?, ?, ?)""",
+            (run_id, contract_id, change_type, now, previous_hash, current_hash),
+        )
 
     def _ensure_work_units(
         self, cursor: sqlite3.Cursor, work_unit: WorkUnit, total_pages: int
@@ -761,6 +802,40 @@ class SyncRepository:
                 "UPDATE ingestion_run SET status = ?, finished_at = ? WHERE id = ?",
                 (status, finished_at, run_id),
             )
+            # Ausência só é evidência após cobertura integral, sem páginas parciais.
+            if status == "COMPLETED":
+                run = cursor.execute(
+                    "SELECT data_inicial, data_final, modalidade, started_at FROM ingestion_run WHERE id = ?",
+                    (run_id,),
+                ).fetchone()
+                coverage = cursor.execute(
+                    "SELECT planned_pages, processed_pages, partial_pages FROM coverage WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                if (
+                    coverage
+                    and int(coverage["planned_pages"]) == int(coverage["processed_pages"])
+                    and int(coverage["partial_pages"]) == 0
+                    and run["started_at"]
+                ):
+                    cursor.execute(
+                        """INSERT OR IGNORE INTO sync_change(
+                               run_id, contratacao_id, change_type, detected_at,
+                               previous_hash, current_hash)
+                           SELECT ?, id, 'MISSING', ?, record_hash, NULL
+                           FROM contratacao
+                           WHERE modalidade_id = ?
+                             AND date(data_publicacao_pncp) BETWEEN date(?) AND date(?)
+                             AND last_seen_at < ?""",
+                        (
+                            run_id,
+                            finished_at,
+                            run["modalidade"],
+                            run["data_inicial"],
+                            run["data_final"],
+                            run["started_at"],
+                        ),
+                    )
         return status
 
     def get_summary(self, run_id: str) -> RunSummary:

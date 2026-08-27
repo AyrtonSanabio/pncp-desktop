@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 MIGRATION_V1 = """
 CREATE TABLE IF NOT EXISTS ingestion_run (
@@ -426,5 +426,67 @@ CREATE TABLE IF NOT EXISTS detail_coverage (
     items_with_results_confirmed INTEGER NOT NULL DEFAULT 0,
     result_records INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
+);
+"""
+
+MIGRATION_V3 = """
+CREATE TABLE IF NOT EXISTS sync_change (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES ingestion_run(id) ON DELETE CASCADE,
+    contratacao_id INTEGER NOT NULL REFERENCES contratacao(id) ON DELETE CASCADE,
+    change_type TEXT NOT NULL CHECK (change_type IN ('NEW', 'UPDATED', 'MISSING')),
+    detected_at TEXT NOT NULL,
+    previous_hash TEXT,
+    current_hash TEXT,
+    UNIQUE(run_id, contratacao_id, change_type)
+);
+CREATE INDEX IF NOT EXISTS idx_sync_change_run ON sync_change(run_id, change_type);
+
+CREATE TABLE IF NOT EXISTS document_link (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    contratacao_id INTEGER NOT NULL REFERENCES contratacao(id) ON DELETE CASCADE,
+    document_type TEXT NOT NULL DEFAULT 'OUTRO',
+    title TEXT,
+    url TEXT NOT NULL,
+    source_id TEXT,
+    mime_type TEXT,
+    published_at TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    UNIQUE(contratacao_id, url)
+);
+CREATE INDEX IF NOT EXISTS idx_document_contract ON document_link(contratacao_id);
+
+CREATE TABLE IF NOT EXISTS saved_query (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    filters_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS app_preference (
+    key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS synonym (
+    term TEXT NOT NULL,
+    synonym TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY(term, synonym)
+);
+
+CREATE TABLE IF NOT EXISTS semantic_document (
+    contratacao_id INTEGER PRIMARY KEY REFERENCES contratacao(id) ON DELETE CASCADE,
+    vector_json BLOB NOT NULL,
+    dimensions INTEGER NOT NULL,
+    nonzero INTEGER NOT NULL,
+    source_hash TEXT NOT NULL,
+    indexed_at TEXT NOT NULL,
+    method TEXT NOT NULL DEFAULT 'concept_hashing_sparse',
+    model_version TEXT NOT NULL DEFAULT 'pt-br-procurement-v1'
 );
 """

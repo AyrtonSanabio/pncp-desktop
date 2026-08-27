@@ -16,6 +16,7 @@ class SyncConfig:
     max_concurrent: int = 1
     max_window_days: int = 31
     lease_seconds: int = 300
+    max_response_bytes: int = 25 * 1024 * 1024
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "db_path", Path(self.db_path).expanduser().resolve())
@@ -33,6 +34,8 @@ class SyncConfig:
             raise ValueError("A janela máxima deve ser positiva.")
         if self.lease_seconds < 30:
             raise ValueError("A concessão de trabalho deve durar pelo menos 30 segundos.")
+        if self.max_response_bytes < 1024 or self.max_response_bytes > 100 * 1024 * 1024:
+            raise ValueError("O limite de resposta deve ficar entre 1 KB e 100 MB.")
 
     def ensure_storage_directory(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)

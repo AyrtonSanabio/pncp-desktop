@@ -4,7 +4,8 @@ import asyncio
 import contextlib
 import json
 import os
-from datetime import date, timedelta
+import time
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -18,12 +19,14 @@ from PySide6.QtWidgets import (
     QDateEdit,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -41,7 +44,7 @@ from PySide6.QtWidgets import (
 
 from pncp_desktop.app_paths import default_database_path
 from pncp_desktop.database_worker import DatabaseTaskThread
-from pncp_desktop.exportacao import exportar_contratos_csv
+from pncp_desktop.exportacao import exportar_contratos_csv, exportar_linhas_csv
 from pncp_desktop.local_database import DatabaseSnapshot, DiagnosticsReport, LocalDatabase
 from pncp_desktop.models import (
     ContratoLinha,
@@ -53,6 +56,7 @@ from pncp_desktop.services import ErroConsulta, ServicoConsultaContratos
 from pncp_desktop.sync_worker import SyncTaskThread
 from pncp_sync.config import SyncConfig
 from pncp_sync.domain.models import DetailRunSummary, PlanSummary, RunSummary, SyncWindow
+from pncp_sync.persistence.data_services import Page
 
 MODALIDADES = (
     (1, "Leilão - Eletrônico"),
@@ -457,12 +461,21 @@ class MainWindow(QMainWindow):
         self._sync_plan: PlanSummary | None = None
         self._sync_space_ok = True
         self._sync_can_continue = False
+        self._auto_sync_pending = False
+        self._sync_started_monotonic: float | None = None
+        self._sync_last_resource = ""
+        self._local_page = 1
+        self._local_result_rows: list[dict[str, Any]] = []
+        self._local_result_page: Page | None = None
 
         self.setWindowTitle("Consulta PNCP Desktop")
         self.setMinimumSize(1100, 700)
         self.resize(1280, 780)
         self._montar_interface()
         self._aplicar_estilo()
+        if self.sync_automatico.isChecked() and os.environ.get("QT_QPA_PLATFORM") != "offscreen":
+            self._auto_sync_pending = True
+            QTimer.singleShot(1200, self.atualizar_desde_ultima_execucao)
 
     def _montar_interface(self) -> None:
         central = QWidget()
@@ -845,6 +858,15 @@ class MainWindow(QMainWindow):
             "com um dia de sobreposição para capturar retificações."
         )
         self.botao_atualizar_desde_ultima.clicked.connect(self.atualizar_desde_ultima_execucao)
+        self.sync_automatico = QCheckBox("Atualizar automaticamente ao abrir")
+        self.sync_automatico.setChecked(self._settings.value("sync_on_startup", False, type=bool))
+        self.sync_automatico.setToolTip(
+            "Ao abrir o programa, prepara a atualização incremental da modalidade selecionada. "
+            "A sincronização só começa depois da estimativa e das validações."
+        )
+        self.sync_automatico.toggled.connect(
+            lambda enabled: self._settings.setValue("sync_on_startup", enabled)
+        )
         self.botao_estimar = QPushButton("Estimar")
         self.botao_estimar.setObjectName("secundario")
         self.botao_estimar.setToolTip("Consulta uma página e estima volume, espaço e páginas.")
@@ -872,6 +894,7 @@ class MainWindow(QMainWindow):
             botoes.addWidget(button)
         botoes.addStretch(1)
         grid.addLayout(botoes, 3, 0, 1, 6)
+        grid.addWidget(self.sync_automatico, 4, 0, 1, 3)
         grid.setColumnStretch(3, 1)
         grid.setColumnStretch(4, 1)
         layout.addWidget(filters)
@@ -881,6 +904,8 @@ class MainWindow(QMainWindow):
         status_layout.setContentsMargins(16, 12, 16, 12)
         self.sync_status_label = QLabel("Estime uma janela para preparar uma sincronização.")
         self.sync_status_label.setObjectName("statusTexto")
+        self.sync_atividade = QLabel("Nenhum download em andamento.")
+        self.sync_atividade.setObjectName("muted")
         self.sync_progresso = QProgressBar()
         self.sync_progresso.setRange(0, 1)
         self.sync_progresso.setValue(0)
@@ -922,6 +947,7 @@ class MainWindow(QMainWindow):
         alerts.addWidget(self.sync_alertas, 1)
         alerts.addWidget(self.botao_diagnosticos)
         status_layout.addWidget(self.sync_status_label)
+        status_layout.addWidget(self.sync_atividade)
         status_layout.addWidget(self.sync_progresso)
         status_layout.addLayout(estimate_grid)
         status_layout.addWidget(self.sync_estimativa_detalhes)
@@ -981,24 +1007,198 @@ class MainWindow(QMainWindow):
         storage.addWidget(self.local_path, 1)
         storage.addWidget(self.botao_escolher_banco)
         top_layout.addLayout(storage)
-        controls = QHBoxLayout()
+        self.local_sections = QTabWidget()
+        search_page = QWidget()
+        search_layout = QVBoxLayout(search_page)
+        search_layout.setContentsMargins(0, 8, 0, 0)
+        filters = QGridLayout()
         self.local_busca = QLineEdit()
-        self.local_busca.setPlaceholderText("Pesquise por objeto, órgão, item ou fornecedor")
-        self.local_busca.setToolTip("Busca textual no índice local FTS5.")
+        self.local_busca.setPlaceholderText("Objeto ou descrição (inclui sinônimos cadastrados)")
+        self.local_orgao = QLineEdit(placeholderText="Nome do órgão")
+        self.local_orgao_cnpj = QLineEdit(placeholderText="CNPJ do órgão")
+        self.local_municipio = QLineEdit(placeholderText="Município")
+        self.local_fornecedor = QLineEdit(placeholderText="Fornecedor ou CNPJ")
+        self.local_modalidade = QComboBox()
+        self.local_modalidade.addItem("Todas as modalidades", None)
+        for code, name in MODALIDADES:
+            self.local_modalidade.addItem(f"{code} — {name}", code)
+        self.local_situacao = QLineEdit(placeholderText="Código da situação")
+        self.local_valor_min = QDoubleSpinBox()
+        self.local_valor_min.setRange(0, 999_999_999_999.99)
+        self.local_valor_min.setPrefix("R$ ")
+        self.local_valor_min.setSpecialValueText("Valor mínimo")
+        self.local_valor_max = QDoubleSpinBox()
+        self.local_valor_max.setRange(0, 999_999_999_999.99)
+        self.local_valor_max.setPrefix("R$ ")
+        self.local_valor_max.setSpecialValueText("Valor máximo")
+        self.local_data_inicial = QDateEdit(calendarPopup=True)
+        self.local_data_inicial.setDisplayFormat("dd/MM/yyyy")
+        self.local_data_inicial.setSpecialValueText("Desde")
+        self.local_data_inicial.setMinimumDate(QDate(2000, 1, 1))
+        self.local_data_inicial.setDate(self.local_data_inicial.minimumDate())
+        self.local_data_final = QDateEdit(calendarPopup=True)
+        self.local_data_final.setDisplayFormat("dd/MM/yyyy")
+        self.local_data_final.setSpecialValueText("Até")
+        self.local_data_final.setMinimumDate(QDate(2000, 1, 1))
+        self.local_data_final.setDate(self.local_data_final.minimumDate())
+        self.local_ordenacao = QComboBox()
+        for label, value in (
+            ("Mais recentes", "recent"),
+            ("Mais antigas", "oldest"),
+            ("Maior valor", "value_desc"),
+            ("Menor valor", "value_asc"),
+            ("Órgão (A–Z)", "agency"),
+        ):
+            self.local_ordenacao.addItem(label, value)
+        for position, widget in enumerate(
+            (
+                self.local_busca,
+                self.local_orgao,
+                self.local_orgao_cnpj,
+                self.local_municipio,
+                self.local_fornecedor,
+                self.local_modalidade,
+                self.local_situacao,
+                self.local_valor_min,
+                self.local_valor_max,
+                self.local_data_inicial,
+                self.local_data_final,
+                self.local_ordenacao,
+            )
+        ):
+            filters.addWidget(widget, position // 4, position % 4)
         self.local_busca.returnPressed.connect(self.pesquisar_banco_local)
+        search_layout.addLayout(filters)
+        controls = QHBoxLayout()
         self.botao_buscar_local = QPushButton("Pesquisar")
         self.botao_buscar_local.setObjectName("primario")
         self.botao_buscar_local.clicked.connect(self.pesquisar_banco_local)
         self.botao_atualizar_local = QPushButton("Atualizar")
         self.botao_atualizar_local.setObjectName("secundario")
         self.botao_atualizar_local.clicked.connect(self.carregar_banco_local)
-        controls.addWidget(self.local_busca, 1)
+        self.botao_salvar_consulta = QPushButton("Salvar consulta…")
+        self.botao_salvar_consulta.setObjectName("secundario")
+        self.botao_salvar_consulta.clicked.connect(self.salvar_consulta_local)
+        self.local_consultas = QComboBox()
+        self.local_consultas.addItem("Consultas salvas…", None)
+        self.local_consultas.currentIndexChanged.connect(self.aplicar_consulta_salva)
+        self.botao_exportar_local = QPushButton("Exportar página CSV")
+        self.botao_exportar_local.setObjectName("secundario")
+        self.botao_exportar_local.clicked.connect(self.exportar_resultado_local)
         controls.addWidget(self.botao_buscar_local)
         controls.addWidget(self.botao_atualizar_local)
-        top_layout.addLayout(controls)
+        controls.addWidget(self.botao_salvar_consulta)
+        controls.addWidget(self.local_consultas, 1)
+        controls.addWidget(self.botao_exportar_local)
+        search_layout.addLayout(controls)
         self.local_status = QLabel("Nenhuma base local carregada.")
         self.local_status.setObjectName("muted")
-        top_layout.addWidget(self.local_status)
+        search_layout.addWidget(self.local_status)
+        self.local_sections.addTab(search_page, "Pesquisa")
+
+        self.historico_tabela = QTableWidget(0, 9)
+        self.historico_tabela.setHorizontalHeaderLabels(
+            (
+                "Data",
+                "Período",
+                "Modalidade",
+                "Status",
+                "Registros",
+                "Novos",
+                "Alterados",
+                "Ausentes",
+                "Recebido",
+            )
+        )
+        self.historico_tabela.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.historico_tabela.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        history_page = QWidget()
+        history_layout = QVBoxLayout(history_page)
+        history_note = QLabel(
+            "Cada execução mostra seu resultado e o delta: novos, alterados e não reencontrados no recorte."
+        )
+        history_note.setWordWrap(True)
+        history_note.setObjectName("muted")
+        refresh_history = QPushButton("Atualizar histórico")
+        refresh_history.clicked.connect(
+            lambda: self._queue_database_task("sync_history", limit=200)
+        )
+        history_layout.addWidget(history_note)
+        history_layout.addWidget(refresh_history, 0, Qt.AlignmentFlag.AlignLeft)
+        history_layout.addWidget(self.historico_tabela)
+        self.local_sections.addTab(history_page, "Histórico e alterações")
+
+        analytics_page = QWidget()
+        analytics_layout = QVBoxLayout(analytics_page)
+        analytics_controls = QHBoxLayout()
+        refresh_analytics = QPushButton("Atualizar análises")
+        refresh_analytics.clicked.connect(lambda: self._queue_database_task("analytics"))
+        self.preco_busca = QLineEdit(placeholderText="Produto, serviço ou código de catálogo")
+        price_button = QPushButton("Histórico de preços")
+        price_button.clicked.connect(
+            lambda: self._queue_database_task("price_history", search=self.preco_busca.text())
+        )
+        analytics_controls.addWidget(refresh_analytics)
+        analytics_controls.addWidget(self.preco_busca, 1)
+        analytics_controls.addWidget(price_button)
+        self.analytics_tabela = QTableWidget()
+        self.analytics_tabela.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        analytics_layout.addLayout(analytics_controls)
+        analytics_layout.addWidget(self.analytics_tabela)
+        self.local_sections.addTab(analytics_page, "Análises")
+
+        maintenance_page = QWidget()
+        maintenance_layout = QVBoxLayout(maintenance_page)
+        legal = QLabel(
+            "Fonte: Portal Nacional de Contratações Públicas (PNCP). Esta aplicação somente consulta e organiza dados públicos; "
+            "não substitui o edital, o portal oficial, análise jurídica ou verificação cadastral. Dados de pessoas devem ser usados "
+            "somente para finalidade legítima; identificadores pessoais não são exibidos fora dos detalhes necessários. PDFs não são baixados."
+        )
+        legal.setWordWrap(True)
+        maintenance_buttons = QHBoxLayout()
+        for label, slot in (
+            ("Verificar integridade", self.verificar_integridade),
+            ("Criar backup…", self.criar_backup),
+            ("Manutenção segura…", self.executar_manutencao),
+        ):
+            button = QPushButton(label)
+            button.setObjectName("secundario")
+            button.clicked.connect(slot)
+            maintenance_buttons.addWidget(button)
+        semantic_note = QLabel(
+            "Busca semântica opcional: índice local de 512 dimensões, sem enviar seus dados a serviços externos. O custo e a quantidade indexada são mostrados após a criação."
+        )
+        semantic_note.setWordWrap(True)
+        semantic_note.setObjectName("muted")
+        semantic_controls = QHBoxLayout()
+        self.semantic_busca = QLineEdit(
+            placeholderText="Ex.: manutenção de computadores para escolas"
+        )
+        semantic_build = QPushButton("Criar/atualizar índice")
+        semantic_build.clicked.connect(
+            lambda: self._queue_database_task("rebuild_semantic_index", dimensions=512)
+        )
+        semantic_search = QPushButton("Busca semântica")
+        semantic_search.clicked.connect(
+            lambda: self._queue_database_task(
+                "semantic_search", query=self.semantic_busca.text(), limit=50
+            )
+        )
+        semantic_controls.addWidget(self.semantic_busca, 1)
+        semantic_controls.addWidget(semantic_build)
+        semantic_controls.addWidget(semantic_search)
+        self.manutencao_status = QLabel("Nenhuma verificação executada nesta sessão.")
+        self.manutencao_status.setObjectName("muted")
+        maintenance_layout.addWidget(legal)
+        maintenance_layout.addLayout(maintenance_buttons)
+        maintenance_layout.addWidget(semantic_note)
+        maintenance_layout.addLayout(semantic_controls)
+        maintenance_layout.addWidget(self.manutencao_status)
+        maintenance_layout.addStretch(1)
+        self.local_sections.addTab(maintenance_page, "Segurança e manutenção")
+        top_layout.addWidget(self.local_sections)
         layout.addWidget(top)
 
         self.tabela_local = QTableWidget(0, 7)
@@ -1023,6 +1223,18 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.tabela_local.cellDoubleClicked.connect(self.abrir_detalhe_local)
         layout.addWidget(self.tabela_local, 1)
+        paging = QHBoxLayout()
+        self.botao_pagina_anterior = QPushButton("← Anterior")
+        self.botao_pagina_anterior.clicked.connect(self.pagina_local_anterior)
+        self.local_pagina_label = QLabel("Página 1")
+        self.botao_proxima_pagina = QPushButton("Próxima →")
+        self.botao_proxima_pagina.clicked.connect(self.pagina_local_proxima)
+        paging.addStretch(1)
+        paging.addWidget(self.botao_pagina_anterior)
+        paging.addWidget(self.local_pagina_label)
+        paging.addWidget(self.botao_proxima_pagina)
+        paging.addStretch(1)
+        layout.addLayout(paging)
         return page
 
     def _aba_trocada(self, index: int) -> None:
@@ -1053,12 +1265,30 @@ class MainWindow(QMainWindow):
     def _database_task_completed(self, action: str, result: object) -> None:
         if action == "snapshot":
             self._render_database_snapshot(result)
+        elif action == "advanced_search":
+            self._render_advanced_search(result)
         elif action == "latest_completed_date":
             self._apply_latest_completed_date(result)
         elif action == "diagnostics":
             self._render_diagnostics(result)
         elif action in {"detail", "detail_by_control"}:
             ContractDetailDialog(result, self).exec()
+        elif action == "saved_queries":
+            self._render_saved_queries(result)
+        elif action == "save_query":
+            self._carregar_consultas_salvas()
+        elif action == "sync_history":
+            self._render_sync_history(result)
+        elif action in {"analytics", "price_history"}:
+            self._render_analytics(result)
+        elif action == "rebuild_semantic_index":
+            self.manutencao_status.setText(f"Índice atualizado: {result}")
+        elif action == "semantic_search":
+            self._render_semantic_results(result)
+        elif action == "quick_check":
+            self.manutencao_status.setText(f"Integridade: {result}")
+        elif action in {"create_backup", "safe_maintenance"}:
+            self.manutencao_status.setText(f"Operação concluída: {result}")
 
     def _database_task_failed(self, action: str, detail: str) -> None:
         readable = {
@@ -1100,6 +1330,119 @@ class MainWindow(QMainWindow):
         self.botao_escolher_banco.setEnabled(not busy and not sync_busy)
         if busy and action == "snapshot":
             self.local_status.setText("Carregando banco local em segundo plano…")
+
+    def _carregar_consultas_salvas(self) -> None:
+        self._queue_database_task("saved_queries")
+
+    def salvar_consulta_local(self) -> None:
+        name, accepted = QInputDialog.getText(self, "Salvar consulta", "Nome da consulta:")
+        if not accepted or not name.strip():
+            return
+        filters = {
+            "orgao": self.local_orgao.text().strip(),
+            "orgao_cnpj": self.local_orgao_cnpj.text().strip(),
+            "municipio": self.local_municipio.text().strip(),
+            "fornecedor": self.local_fornecedor.text().strip(),
+            "modalidade": self.local_modalidade.currentData(),
+            "situacao": self.local_situacao.text().strip(),
+            "valor_min": self.local_valor_min.value() or None,
+            "valor_max": self.local_valor_max.value() or None,
+            "data_inicial": self.local_data_inicial.date().toPython().isoformat(),
+            "data_final": self.local_data_final.date().toPython().isoformat(),
+        }
+        self._queue_database_task("save_query", name=name, filters=filters)
+
+    def aplicar_consulta_salva(self, index: int) -> None:
+        if index <= 0:
+            return
+        data = self.local_consultas.itemData(index)
+        if not isinstance(data, dict):
+            return
+        filters = data.get("filters", data)
+        for widget, key in (
+            (self.local_orgao, "orgao"),
+            (self.local_orgao_cnpj, "orgao_cnpj"),
+            (self.local_municipio, "municipio"),
+            (self.local_fornecedor, "fornecedor"),
+            (self.local_situacao, "situacao"),
+        ):
+            widget.setText(str(filters.get(key) or ""))
+        modality = filters.get("modalidade")
+        position = self.local_modalidade.findData(modality)
+        self.local_modalidade.setCurrentIndex(max(0, position))
+        self.pesquisar_banco_local()
+
+    def _render_saved_queries(self, result: object) -> None:
+        self.local_consultas.blockSignals(True)
+        self.local_consultas.clear()
+        self.local_consultas.addItem("Consultas salvas…", None)
+        for query in result if isinstance(result, list) else []:
+            self.local_consultas.addItem(str(query.get("name", "")), query)
+        self.local_consultas.blockSignals(False)
+
+    def _render_sync_history(self, result: object) -> None:
+        rows = result if isinstance(result, list) else []
+        self.historico_tabela.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            values = [
+                row.get(k, "")
+                for k in (
+                    "created_at",
+                    "data_inicial",
+                    "data_final",
+                    "modalidade",
+                    "status",
+                    "records",
+                    "new_records",
+                    "updated_records",
+                    "missing_records",
+                )
+            ]
+            for c, value in enumerate(values):
+                self.historico_tabela.setItem(r, c, QTableWidgetItem(_display(value)))
+
+    def _render_analytics(self, result: object) -> None:
+        rows = result if isinstance(result, list) else []
+        if isinstance(result, dict):
+            rows = result.get("frequency_by_agency", [])
+        self.analytics_tabela.setColumnCount(4)
+        self.analytics_tabela.setHorizontalHeaderLabels(
+            ("Órgão/categoria", "Fornecedor", "Ocorrências", "Valor")
+        )
+        self.analytics_tabela.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            values = (
+                row.get("orgao_razao_social", row.get("category", "")),
+                row.get("fornecedor_nome", ""),
+                row.get("purchases", row.get("wins", "")),
+                row.get("estimated_total", row.get("total_value", "")),
+            )
+            for c, value in enumerate(values):
+                self.analytics_tabela.setItem(r, c, QTableWidgetItem(_display(value)))
+
+    def _render_semantic_results(self, result: object) -> None:
+        rows = result if isinstance(result, list) else []
+        self.manutencao_status.setText(f"Busca por similaridade: {len(rows)} resultado(s).")
+
+    def verificar_integridade(self) -> None:
+        self._queue_database_task("quick_check")
+
+    def criar_backup(self) -> None:
+        destino, _ = QFileDialog.getSaveFileName(
+            self, "Criar backup", "pncp-backup.sqlite3", "SQLite (*.sqlite3)"
+        )
+        if destino:
+            self._queue_database_task("create_backup", destination=Path(destino))
+
+    def executar_manutencao(self) -> None:
+        destino, _ = QFileDialog.getSaveFileName(
+            self,
+            "Backup antes da manutenção",
+            "pncp-maintenance-backup.sqlite3",
+            "SQLite (*.sqlite3)",
+        )
+        if destino:
+            self._queue_database_task("safe_maintenance", backup_path=Path(destino))
 
     def atualizar_desde_ultima_execucao(self) -> None:
         if self._sync_worker is not None and self._sync_worker.isRunning():
@@ -1249,6 +1592,8 @@ class MainWindow(QMainWindow):
         self._sync_plan = None
         self._sync_can_continue = False
         self._set_sync_busy(True)
+        self._sync_started_monotonic = time.monotonic()
+        self._sync_last_resource = ""
         self.sync_status_label.setText("Sincronização em andamento…")
         worker = SyncTaskThread(
             self._sync_config(),
@@ -1266,6 +1611,7 @@ class MainWindow(QMainWindow):
         worker.planned.connect(self._sync_planejado)
         worker.detail_planned.connect(self._detalhes_planejados)
         worker.progress.connect(self._sync_progresso)
+        worker.activity.connect(self._sync_atividade_alterada)
         worker.completed.connect(self._sync_concluido)
         worker.paused.connect(self._sync_pausado)
         worker.failed.connect(self._sync_falhou)
@@ -1342,12 +1688,24 @@ class MainWindow(QMainWindow):
             )
         self.botao_sincronizar.setEnabled(enough_space)
         self.botao_continuar.setEnabled(False)
+        if self._auto_sync_pending:
+            self._auto_sync_pending = False
+            if enough_space:
+                QTimer.singleShot(0, self.iniciar_sincronizacao)
 
     def _detalhes_planejados(self, detail_run_id: str) -> None:
         self._detail_run_id = detail_run_id
         self.sync_status_label.setText("Contratações concluídas; baixando itens e fornecedores…")
 
+    def _sync_atividade_alterada(self, description: str) -> None:
+        self.sync_atividade.setText(description)
+
     def _sync_progresso(self, resource: str, summary: RunSummary | DetailRunSummary) -> None:
+        if resource != self._sync_last_resource:
+            self._sync_started_monotonic = time.monotonic()
+            self._sync_last_resource = resource
+        elapsed = max(0.001, time.monotonic() - (self._sync_started_monotonic or time.monotonic()))
+        speed = summary.bytes_received / elapsed
         if resource == "contratacoes":
             done = summary.succeeded_units + summary.partial_units
             total = max(1, summary.planned_units)
@@ -1355,7 +1713,8 @@ class MainWindow(QMainWindow):
             self.sync_progresso.setValue(min(done, total))
             self.sync_metricas.setText(
                 f"Contratações: {done}/{total} páginas • {summary.records_received} registros • "
-                f"{formatar_bytes(summary.bytes_received)} recebidos"
+                f"{formatar_bytes(summary.bytes_received)} recebidos • "
+                f"{formatar_bytes(int(speed))}/s • {self._remaining_time(done, total, elapsed)}"
             )
         else:
             done = summary.succeeded_units + summary.partial_units
@@ -1364,8 +1723,17 @@ class MainWindow(QMainWindow):
             self.sync_progresso.setValue(min(done, total))
             self.sync_metricas.setText(
                 f"Detalhes: {done}/{total} unidades • {summary.item_records} itens • "
-                f"{summary.result_records} resultados • {formatar_bytes(summary.bytes_received)}"
+                f"{summary.result_records} resultados • {formatar_bytes(summary.bytes_received)} • "
+                f"{formatar_bytes(int(speed))}/s • {self._remaining_time(done, total, elapsed)}"
             )
+
+    @staticmethod
+    def _remaining_time(done: int, total: int, elapsed: float) -> str:
+        if done <= 0 or total <= done:
+            return "calculando tempo restante" if done <= 0 else "concluindo"
+        remaining_seconds = elapsed / done * (total - done)
+        finish = datetime.now().astimezone() + timedelta(seconds=remaining_seconds)
+        return f"restam {formatar_duracao(remaining_seconds)} • previsão {finish:%H:%M}"
 
     def _sync_concluido(self, main: RunSummary, details: DetailRunSummary | None) -> None:
         self._sync_can_continue = False
@@ -1382,6 +1750,7 @@ class MainWindow(QMainWindow):
         else:
             prefix = "Sincronização concluída."
         self._render_sync_result(main, details, prefix)
+        self.sync_atividade.setText("Download concluído; dados confirmados no banco local.")
         self._local_dirty = True
         if self.abas.tabText(self.abas.currentIndex()) == "Banco local":
             self.carregar_banco_local()
@@ -1393,6 +1762,7 @@ class MainWindow(QMainWindow):
             )
         else:
             self.sync_status_label.setText("Estimativa cancelada.")
+            self.sync_atividade.setText("Estimativa cancelada; nenhum download foi iniciado.")
         self._sync_can_continue = self._sync_run_id is not None
         self.botao_continuar.setEnabled(self._sync_can_continue)
 
@@ -1482,6 +1852,7 @@ class MainWindow(QMainWindow):
         self.sync_modalidade.setEnabled(not busy)
         self.incluir_detalhes.setEnabled(not busy)
         self.botao_atualizar_desde_ultima.setEnabled(not busy)
+        self.sync_automatico.setEnabled(not busy)
         database_busy = self._database_worker is not None and self._database_worker.isRunning()
         self.botao_escolher_banco.setEnabled(not busy and not database_busy)
 
@@ -1492,6 +1863,7 @@ class MainWindow(QMainWindow):
         if not isinstance(result, DatabaseSnapshot):
             raise TypeError("A tarefa local retornou um resultado incompatível.")
         rows = result.rows
+        self._local_rows = rows
         stats = result.stats
         self.tabela_local.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
@@ -1518,7 +1890,90 @@ class MainWindow(QMainWindow):
         self._local_loaded_path = self._db_path
 
     def pesquisar_banco_local(self) -> None:
-        self.carregar_banco_local()
+        filters = {
+            "orgao": self.local_orgao.text().strip(),
+            "orgao_cnpj": self.local_orgao_cnpj.text().strip(),
+            "municipio": self.local_municipio.text().strip(),
+            "fornecedor": self.local_fornecedor.text().strip(),
+            "modalidade": self.local_modalidade.currentData(),
+            "situacao": self.local_situacao.text().strip(),
+            "valor_min": self.local_valor_min.value() or None,
+            "valor_max": self.local_valor_max.value() or None,
+            "data_inicial": None
+            if self.local_data_inicial.date() == self.local_data_inicial.minimumDate()
+            else self.local_data_inicial.date().toPython().isoformat(),
+            "data_final": None
+            if self.local_data_final.date() == self.local_data_final.minimumDate()
+            else self.local_data_final.date().toPython().isoformat(),
+        }
+        self._queue_database_task(
+            "advanced_search",
+            text=self.local_busca.text(),
+            filters=filters,
+            page=getattr(self, "_local_page", 1),
+            page_size=50,
+            sort=self.local_ordenacao.currentData(),
+        )
+
+    def _render_advanced_search(self, result: object) -> None:
+        if not isinstance(result, Page):
+            raise TypeError("A pesquisa avançada retornou um resultado incompatível.")
+        self._local_result_page = result
+        self._local_rows = result.rows
+        self._render_database_rows(result.rows)
+        self.local_pagina_label.setText(
+            f"Página {result.page} de {max(1, result.pages)} • {result.total} resultado(s)"
+        )
+        self.botao_pagina_anterior.setEnabled(result.page > 1)
+        self.botao_proxima_pagina.setEnabled(result.page < result.pages)
+
+    def _render_database_rows(self, rows: list[dict[str, Any]]) -> None:
+        self.tabela_local.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            values = (
+                row.get("numero_controle_pncp"),
+                row.get("orgao_razao_social"),
+                row.get("objeto_compra"),
+                row.get("modalidade_nome"),
+                row.get("situacao_compra_nome"),
+                row.get("data_encerramento_proposta"),
+                row.get("valor_total_estimado"),
+            )
+            for column_index, value in enumerate(values):
+                cell = QTableWidgetItem(_display(value))
+                cell.setToolTip(_display(value))
+                if column_index == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, row.get("id"))
+                self.tabela_local.setItem(row_index, column_index, cell)
+
+    def exportar_resultado_local(self) -> None:
+        caminho, _ = QFileDialog.getSaveFileName(
+            self, "Exportar resultados", "pncp-resultados.csv", "CSV (*.csv)"
+        )
+        if not caminho:
+            return
+        count = exportar_linhas_csv(
+            caminho,
+            getattr(self, "_local_rows", []),
+            (
+                ("Identificador PNCP", "numero_controle_pncp"),
+                ("Órgão", "orgao_razao_social"),
+                ("Município", "municipio_nome"),
+                ("Objeto", "objeto_compra"),
+                ("Modalidade", "modalidade_nome"),
+                ("Situação", "situacao_compra_nome"),
+                ("Valor", "valor_total_estimado"),
+            ),
+        )
+        self.local_status.setText(f"{count} linha(s) exportada(s) para {caminho}.")
+
+    def pagina_local_anterior(self) -> None:
+        self._local_page = max(1, getattr(self, "_local_page", 1) - 1)
+        self.pesquisar_banco_local()
+
+    def pagina_local_proxima(self) -> None:
+        self._local_page = getattr(self, "_local_page", 1) + 1
+        self.pesquisar_banco_local()
 
     def abrir_detalhe_local(self, row: int, _: int) -> None:
         cell = self.tabela_local.item(row, 0)

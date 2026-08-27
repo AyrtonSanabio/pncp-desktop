@@ -26,18 +26,33 @@ class DatabaseTaskThread(QThread):
 
     def run(self) -> None:
         try:
-            if self.action == "snapshot":
-                result = self.database.snapshot(**self.arguments)
-            elif self.action == "latest_completed_date":
-                result = self.database.latest_completed_date(**self.arguments)
-            elif self.action == "diagnostics":
-                result = self.database.diagnostics(**self.arguments)
-            elif self.action == "detail":
-                result = self.database.contract_detail(**self.arguments)
-            elif self.action == "detail_by_control":
-                result = self.database.contract_detail_by_control(**self.arguments)
-            else:
+            actions = {
+                "snapshot": "snapshot",
+                "advanced_search": "advanced_search",
+                "sync_history": "sync_history",
+                "analytics": "analytics",
+                "price_history": "price_history",
+                "semantic_search": "semantic_search",
+                "rebuild_semantic_index": "rebuild_semantic_index",
+                "saved_queries": "saved_queries",
+                "save_query": "save_query",
+                "latest_completed_date": "latest_completed_date",
+                "diagnostics": "diagnostics",
+                "quick_check": "quick_check",
+                "create_backup": "create_backup",
+                "safe_maintenance": "safe_maintenance",
+                "detail": "contract_detail",
+                "detail_by_control": "contract_detail_by_control",
+            }
+            method_name = actions.get(self.action)
+            if method_name is None:
                 raise ValueError(f"Tarefa de banco desconhecida: {self.action}")
+            method = getattr(self.database, method_name, None)
+            if method is None:
+                raise RuntimeError(
+                    f"O banco desta versão ainda não oferece a operação {self.action}."
+                )
+            result = method(**self.arguments)
         except Exception as exc:
             self.failed.emit(self.action, f"{type(exc).__name__}: {exc}")
             return

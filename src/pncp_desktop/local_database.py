@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
+from pncp_sync.persistence.data_services import DataServices, Page, backup_database
 from pncp_sync.persistence.repositories import SyncRepository
 
 
@@ -75,6 +76,82 @@ class LocalDatabase:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 5000")
         return connection
+
+    def advanced_search(self, **kwargs: Any) -> Page:
+        """Pesquisa paginada; o retorno pode ser exportado sem nova consulta."""
+        with self._connect() as connection:
+            return DataServices(connection).advanced_search(**kwargs)
+
+    def sync_history(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            return DataServices(connection).sync_history(limit)
+
+    def changes(self, run_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            return DataServices(connection).changes(run_id)
+
+    def save_query(self, name: str, filters: dict[str, Any]) -> int:
+        with self._connect() as connection:
+            return DataServices(connection).save_query(name, filters)
+
+    def saved_queries(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            return DataServices(connection).saved_queries()
+
+    def delete_saved_query(self, query_id: int) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute("DELETE FROM saved_query WHERE id=?", (query_id,))
+            connection.commit()
+            return cursor.rowcount == 1
+
+    def price_history(self, search: str = "", *, limit: int = 200) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            return DataServices(connection).price_history(search, limit)
+
+    def rebuild_semantic_index(self, *, dimensions: int = 512) -> dict[str, Any]:
+        with self._connect() as connection:
+            return DataServices(connection).rebuild_semantic_index(dimensions)
+
+    def semantic_search(self, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            return DataServices(connection).semantic_search(query, limit)
+
+    def analytics(self) -> dict[str, list[dict[str, Any]]]:
+        with self._connect() as connection:
+            service = DataServices(connection)
+            return {
+                "frequency_by_agency": service.agency_frequency(),
+                "winners_by_category": service.winners_by_category(),
+            }
+
+    def create_backup(self, destination: Path | None = None) -> Path:
+        self.ensure_ready()
+        if destination is None:
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            destination = self.db_path.with_name(f"{self.db_path.stem}-backup-{stamp}.sqlite3")
+        return backup_database(self.db_path, destination)
+
+    def quick_check(self) -> dict[str, Any]:
+        with self._connect() as connection:
+            quick = str(connection.execute("PRAGMA quick_check").fetchone()[0])
+            foreign_keys = len(connection.execute("PRAGMA foreign_key_check").fetchall())
+        return {
+            "ok": quick == "ok" and foreign_keys == 0,
+            "quick_check": quick,
+            "foreign_key_errors": foreign_keys,
+        }
+
+    def safe_maintenance(self, backup_path: Path) -> dict[str, Any]:
+        """Faz backup verificado antes de reconstruir índices; não mascara corrupção."""
+        before = self.quick_check()
+        if not before["ok"]:
+            raise RuntimeError("Banco inconsistente; preserve-o e restaure um backup válido.")
+        backup = self.create_backup(backup_path)
+        with self._connect() as connection:
+            connection.execute("REINDEX")
+            connection.execute("PRAGMA optimize")
+        after = self.quick_check()
+        return {"backup": str(backup), "before": before, "after": after}
 
     def stats(self) -> DatabaseStats:
         with self._connect() as connection:
@@ -306,7 +383,14 @@ class LocalDatabase:
                 ).fetchall()
                 item["resultados"] = [dict(row) for row in result_rows]
                 items.append(item)
-        return {"contratacao": dict(contract), "itens": items}
+            documents = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM document_link WHERE contratacao_id=? ORDER BY published_at DESC,id",
+                    (contract_id,),
+                )
+            ]
+        return {"contratacao": dict(contract), "itens": items, "documentos": documents}
 
     def contract_detail_by_control(self, numero_controle: str) -> dict[str, Any]:
         with self._connect() as connection:

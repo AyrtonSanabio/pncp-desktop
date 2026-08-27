@@ -13,6 +13,7 @@ from pncp_sync.domain.models import RunSummary, SyncWindow, WorkUnit
 from pncp_sync.persistence.repositories import PersistResult, SyncRepository
 
 ProgressCallback = Callable[[WorkUnit, PersistResult], Any]
+ActivityCallback = Callable[[WorkUnit], Any]
 
 
 def _is_recoverable(exc: PNCPError) -> bool:
@@ -26,6 +27,7 @@ async def run_sync(
     source: SourceProtocol | None = None,
     max_pages: int | None = None,
     progress: ProgressCallback | None = None,
+    activity: ActivityCallback | None = None,
 ) -> RunSummary:
     """Executa páginas sequencialmente; cada página é um checkpoint transacional."""
     if max_pages is not None and max_pages < 1:
@@ -51,6 +53,8 @@ async def run_sync(
                 return repository.get_summary(run_id)
 
             try:
+                if activity is not None:
+                    activity(work_unit)
                 probe = repository.load_probe(work_unit) if work_unit.page_number == 1 else None
                 if probe is None:
                     page = await source.fetch_publications(

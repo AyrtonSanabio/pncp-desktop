@@ -21,6 +21,7 @@ class SyncTaskThread(QThread):
     planned = Signal(object)
     detail_planned = Signal(str)
     progress = Signal(str, object)
+    activity = Signal(str)
     completed = Signal(object, object)
     paused = Signal(object, object)
     failed = Signal(str, str)
@@ -98,6 +99,7 @@ class SyncTaskThread(QThread):
             self.config,
             self.run_id,
             progress=self._main_progress,
+            activity=self._main_activity,
         )
         detail_summary = None
         if main_summary.status.startswith("COMPLETED") and self.include_details:
@@ -109,6 +111,7 @@ class SyncTaskThread(QThread):
                 self.config,
                 self.detail_run_id,
                 progress=self._detail_progress,
+                activity=self._detail_activity,
             )
         if main_summary.status == "PAUSED" or (
             detail_summary is not None and detail_summary.status == "PAUSED"
@@ -123,11 +126,24 @@ class SyncTaskThread(QThread):
         with SyncRepository(self.config.db_path) as repository:
             self.progress.emit("contratacoes", repository.get_summary(self.run_id))
 
+    def _main_activity(self, work_unit: Any) -> None:
+        self.activity.emit(
+            f"Baixando contratações — página {work_unit.page_number} "
+            f"({work_unit.data_inicial:%d/%m/%Y} a {work_unit.data_final:%d/%m/%Y})"
+        )
+
     def _detail_progress(self, *_: Any) -> None:
         if not self.detail_run_id:
             return
         with DetailRepository(self.config.db_path) as repository:
             self.progress.emit("detalhes", repository.get_detail_summary(self.detail_run_id))
+
+    def _detail_activity(self, work_unit: Any) -> None:
+        if work_unit.resource == "ITEMS":
+            description = f"itens, página {work_unit.page_number}"
+        else:
+            description = f"fornecedores/resultados do item {work_unit.item_number}"
+        self.activity.emit(f"Baixando {description} — {work_unit.purchase.numero_controle_pncp}")
 
     def _summaries(self) -> tuple[Any, Any]:
         main = None

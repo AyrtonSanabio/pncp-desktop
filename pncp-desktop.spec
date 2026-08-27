@@ -1,6 +1,8 @@
 from PyInstaller.utils.hooks import collect_submodules
 
 
+# O aplicativo oficial usa onedir. DLLs do Qt ficam ao lado do executavel,
+# evitando falhas de extracao/carregamento observadas em builds onefile.
 hiddenimports = collect_submodules("pncp_sync") + collect_submodules("pypncp")
 
 a = Analysis(
@@ -20,21 +22,21 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name="ConsultaPNCP",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    # UPX pode corromper DLLs do Qt em algumas combinações de Python/PySide6.
     upx=False,
-    upx_exclude=[],
-    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    name="ConsultaPNCP",
 )

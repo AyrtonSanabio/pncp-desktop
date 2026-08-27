@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import csv
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
 from pncp_desktop.models import ContratoLinha
@@ -39,4 +39,20 @@ def exportar_contratos_csv(caminho: str | Path, contratos: Iterable[ContratoLinh
                 )
             )
 
+    return len(registros)
+
+
+def exportar_linhas_csv(
+    caminho: str | Path,
+    linhas: Iterable[Mapping[str, object]],
+    colunas: Sequence[tuple[str, str]],
+) -> int:
+    """Exporta o resultado filtrado visível sem executar outra consulta."""
+    destino = Path(caminho)
+    registros = tuple(linhas)
+    with destino.open("w", encoding="utf-8-sig", newline="") as arquivo:
+        writer = csv.writer(arquivo, delimiter=";")
+        writer.writerow([titulo for titulo, _ in colunas])
+        for registro in registros:
+            writer.writerow([registro.get(chave, "") for _, chave in colunas])
     return len(registros)

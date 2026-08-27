@@ -70,7 +70,12 @@ class PypncpSource:
         captured: list[httpx.Response] = []
 
         async def capture_response(response: httpx.Response) -> None:
+            declared = response.headers.get("content-length")
+            if declared and declared.isdigit() and int(declared) > self._config.max_response_bytes:
+                raise SourceError("O PNCP anunciou uma resposta acima do limite de segurança.")
             await response.aread()
+            if len(response.content) > self._config.max_response_bytes:
+                raise SourceError("A resposta do PNCP ultrapassou o limite de segurança.")
             captured.append(response)
 
         requested_at = datetime.now(UTC).isoformat(timespec="milliseconds")
