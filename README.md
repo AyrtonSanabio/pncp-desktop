@@ -113,6 +113,7 @@ Antes de tentar baixar “o PNCP inteiro”, faremos uma fatia vertical pequena 
 - [Implementação da Fase 1 e prova real](docs/IMPLEMENTACAO_FASE_1.md)
 - [Implementação inicial da Fase 2: itens e resultados](docs/IMPLEMENTACAO_FASE_2.md)
 - [Interface, atualização incremental, erros e validações](docs/INTERFACE_INCREMENTAL_ERROS_E_VALIDACOES.md)
+- [Performance, gargalos e experiência do usuário](docs/PERFORMANCE_GARGALOS_E_EXPERIENCIA_DO_USUARIO.md)
 - [Glossário e trilha de pesquisa](docs/GLOSSARIO_E_TRILHA_DE_ESTUDO.md)
 - [Contexto completo para outra IA](docs/CONTEXTO_PARA_OUTRA_IA.md)
 - [Política de somente leitura e credenciamento](docs/POLITICA_SOMENTE_LEITURA_E_CREDENCIAMENTO.md)
