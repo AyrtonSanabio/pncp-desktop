@@ -362,7 +362,7 @@ class DataServices:
             ).fetchone()[0]
         )
         sql = (
-            "SELECT c.id,c.numero_controle_pncp,c.orgao_razao_social,c.municipio_nome,"
+            "SELECT c.id,c.numero_controle_pncp,c.orgao_razao_social,c.orgao_cnpj,c.municipio_nome,"
             "c.modalidade_nome,c.situacao_compra_nome,c.objeto_compra,c.data_publicacao_pncp,"
             "c.data_encerramento_proposta,c.valor_total_estimado FROM contratacao c"
             + clause

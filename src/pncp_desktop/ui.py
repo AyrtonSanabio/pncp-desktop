@@ -1219,11 +1219,12 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(self.local_sections)
         layout.addWidget(top)
 
-        self.tabela_local = QTableWidget(0, 7)
+        self.tabela_local = QTableWidget(0, 8)
         self.tabela_local.setHorizontalHeaderLabels(
             (
                 "Identificador PNCP",
                 "Órgão",
+                "CNPJ do órgão",
                 "Objeto",
                 "Modalidade",
                 "Situação",
@@ -1460,6 +1461,7 @@ class MainWindow(QMainWindow):
             values = (
                 row.get("numero_controle_pncp"),
                 row.get("orgao_razao_social"),
+                row.get("orgao_cnpj"),
                 row.get("objeto_compra"),
                 "similaridade",
                 row.get("score"),
@@ -1932,6 +1934,7 @@ class MainWindow(QMainWindow):
             values = (
                 row.get("numero_controle_pncp"),
                 row.get("orgao_razao_social"),
+                row.get("orgao_cnpj"),
                 row.get("objeto_compra"),
                 row.get("modalidade_nome"),
                 row.get("situacao_compra_nome"),

@@ -362,4 +362,8 @@ Enquanto houver falhas ou dependências não processadas, o software deve dizer 
 
 ## Próxima decisão prática
 
+## Feedback obrigatório de ações indisponíveis
+
+Quando uma ação não puder ser executada, o controle deve comunicar isso visualmente e textualmente: ficar desabilitado com aparência distinta, apresentar dica explicando o motivo e atualizar o status da tela. Nenhum botão importante deve parecer clicável e simplesmente não produzir efeito. Após falhas recuperáveis, a interface deve indicar explicitamente se **Continuar** está disponível; após falhas definitivas, deve explicar que uma nova estimativa ou correção é necessária.
+
 O melhor próximo passo é a Fase 0: criar o inventário executável e medir uma janela pequena de contratações. Ainda não devemos começar pela carga nacional nem pelo índice vetorial. Essa pequena prova revelará volume, chaves, formato, ritmo seguro e mudanças necessárias no `pypncp`.
