@@ -20,7 +20,37 @@ def _now() -> str:
 def _tokens(text: str) -> list[str]:
     normalized = unicodedata.normalize("NFKD", text.casefold())
     normalized = "".join(c for c in normalized if not unicodedata.combining(c))
-    return re.findall(r"[a-z0-9]{2,}", normalized)
+    return [token for token in re.findall(r"[a-z0-9]{2,}", normalized) if token not in _STOPWORDS]
+
+
+_STOPWORDS = {
+    "a",
+    "as",
+    "ao",
+    "aos",
+    "com",
+    "da",
+    "das",
+    "de",
+    "do",
+    "dos",
+    "e",
+    "em",
+    "para",
+    "por",
+    "que",
+    "servico",
+    "servicos",
+    "prestacao",
+    "contratacao",
+    "empresa",
+    "fornecimento",
+    "fornecedor",
+    "publico",
+    "publicos",
+    "pessoa",
+    "pessoas",
+}
 
 
 CONCEPT_MODEL_VERSION = "pt-br-procurement-v1"
@@ -388,17 +418,26 @@ class DataServices:
             raise ValueError("Dimensão deve ficar entre 64 e 4096.")
         indexed = skipped = 0
         for row in self.connection.execute(
-            "SELECT id,objeto_compra,informacao_complementar,record_hash FROM contratacao"
+            """SELECT c.id,c.objeto_compra,c.informacao_complementar,c.record_hash,
+                      COALESCE(GROUP_CONCAT(i.descricao || ' ' || COALESCE(i.categoria_nome,''), ' '), '') item_text,
+                      COALESCE(GROUP_CONCAT(i.record_hash, '|'), '') item_hash
+               FROM contratacao c LEFT JOIN item_contratacao i ON i.contratacao_id=c.id
+               GROUP BY c.id"""
         ):
             current = self.connection.execute(
                 "SELECT source_hash, dimensions FROM semantic_document WHERE contratacao_id=?",
                 (row["id"],),
             ).fetchone()
-            if current and current[0] == row["record_hash"] and int(current[1]) == dimensions:
+            source_hash = hashlib.sha256(
+                f"{row['record_hash']}|{row['item_hash']}".encode()
+            ).hexdigest()
+            if current and current[0] == source_hash and int(current[1]) == dimensions:
                 skipped += 1
                 continue
             vector = self._vector(
-                f"{row['objeto_compra'] or ''} {row['informacao_complementar'] or ''}", dimensions
+                f"{row['objeto_compra'] or ''} {row['informacao_complementar'] or ''} "
+                f"{row['item_text'] or ''}",
+                dimensions,
             )
             payload = json.dumps(vector, separators=(",", ":")).encode()
             self.connection.execute(
@@ -414,7 +453,7 @@ class DataServices:
                     payload,
                     dimensions,
                     len(vector),
-                    row["record_hash"],
+                    source_hash,
                     _now(),
                     "concept_hashing_sparse",
                     CONCEPT_MODEL_VERSION,
