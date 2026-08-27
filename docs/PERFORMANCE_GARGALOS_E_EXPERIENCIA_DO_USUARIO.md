@@ -96,4 +96,6 @@ A busca semântica agora oferece uma pontuação mínima ajustável. O valor é 
 
 O marco automático atual também gera uma classificação local por categorias (TI, saúde, limpeza/conservação, construção, transporte ou outros), extrai palavras-chave e identifica padrões de CATMAT, CATSER, NCM e NBS. Essas sugestões são heurísticas para organizar a pesquisa; não substituem a leitura do edital.
 
+A busca híbrida combina filtros estruturados com a lista de candidatos do banco e a pontuação de similaridade. O mesmo módulo também identifica candidatos a duplicidade por órgão e objeto. Esses recursos são auxiliares: não afirmam que duas contratações são juridicamente a mesma nem substituem a conferência do identificador PNCP.
+
 O objetivo é manter a complexidade interna alta quando necessário, mas expor ao usuário uma sequência curta, explicável e segura.

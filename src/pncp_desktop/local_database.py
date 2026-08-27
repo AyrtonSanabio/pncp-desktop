@@ -82,6 +82,14 @@ class LocalDatabase:
         with self._connect() as connection:
             return DataServices(connection).advanced_search(**kwargs)
 
+    def hybrid_search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            return DataServices(connection).hybrid_search(query, **kwargs)
+
+    def duplicate_candidates(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            return DataServices(connection).duplicate_candidates(limit)
+
     def sync_history(self, *, limit: int = 100) -> list[dict[str, Any]]:
         with self._connect() as connection:
             return DataServices(connection).sync_history(limit)

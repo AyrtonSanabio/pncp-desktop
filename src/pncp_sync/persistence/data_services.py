@@ -368,6 +368,41 @@ class DataServices:
         rows = self.connection.execute(sql, (*params, page_size, (page - 1) * page_size)).fetchall()
         return Page([dict(row) for row in rows], total, page, page_size)
 
+    def hybrid_search(
+        self,
+        query: str,
+        *,
+        filters: dict[str, Any] | None = None,
+        limit: int = 50,
+        min_score: float = 0.0,
+    ) -> list[dict[str, Any]]:
+        """Combina filtros/FTS com score semântico, mantendo a explicação de cada resultado."""
+        if not 1 <= limit <= 200:
+            raise ValueError("O limite da busca híbrida deve ficar entre 1 e 200.")
+        page = self.advanced_search(text="", filters=filters, page=1, page_size=limit)
+        allowed = {int(row["id"]): row for row in page.rows if row.get("id") is not None}
+        semantic = self.semantic_search(query, limit=limit, min_score=min_score)
+        result: list[dict[str, Any]] = []
+        for item in semantic:
+            contract_id = int(item["contratacao_id"])
+            if contract_id in allowed:
+                result.append(item)
+        return result[:limit]
+
+    def duplicate_candidates(self, limit: int = 200) -> list[dict[str, Any]]:
+        if not 1 <= limit <= 1000:
+            raise ValueError("O limite de duplicidades deve ficar entre 1 e 1000.")
+        rows = self.connection.execute(
+            """SELECT objeto_compra, orgao_cnpj, COUNT(*) quantidade,
+                      GROUP_CONCAT(numero_controle_pncp) controles
+               FROM contratacao
+               WHERE objeto_compra IS NOT NULL AND TRIM(objeto_compra) <> ''
+               GROUP BY orgao_cnpj, objeto_compra HAVING COUNT(*) > 1
+               ORDER BY quantidade DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def save_query(self, name: str, filters: dict[str, Any]) -> int:
         if not name.strip():
             raise ValueError("A consulta precisa de um nome.")
