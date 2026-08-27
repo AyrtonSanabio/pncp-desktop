@@ -1638,8 +1638,14 @@ class MainWindow(QMainWindow):
         self._executar_sincronizacao()
 
     def continuar_sincronizacao(self) -> None:
+        if not self._sync_run_id:
+            self._sync_run_id = self._local_database.latest_resumable_run(
+                int(self.sync_modalidade.currentData())
+            )
         if self._sync_run_id and (self._sync_worker is None or not self._sync_worker.isRunning()):
             self._executar_sincronizacao()
+        elif not self._sync_run_id:
+            self.sync_status_label.setText("Não há execução pendente para esta modalidade.")
 
     def _executar_sincronizacao(self) -> None:
         self._sync_plan = None

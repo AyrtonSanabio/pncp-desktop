@@ -98,6 +98,16 @@ class LocalDatabase:
         with self._connect() as connection:
             return DataServices(connection).sync_history(limit)
 
+    def latest_resumable_run(self, modalidade: int) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT r.id FROM ingestion_run r
+                   WHERE r.modalidade=? AND r.status IN ('PLANNED','RUNNING','PAUSED','FAILED')
+                     AND EXISTS (SELECT 1 FROM work_unit w WHERE w.run_id=r.id AND w.status IN ('PENDING','RETRY_WAIT','RUNNING'))
+                   ORDER BY r.created_at DESC LIMIT 1""", (modalidade,)
+            ).fetchone()
+            return str(row[0]) if row else None
+
     def changes(self, run_id: str) -> list[dict[str, Any]]:
         with self._connect() as connection:
             return DataServices(connection).changes(run_id)
