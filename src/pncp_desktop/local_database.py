@@ -126,6 +126,10 @@ class LocalDatabase:
                 "winners_by_category": service.winners_by_category(),
             }
 
+    def refresh_insights(self, *, limit: int = 100_000) -> dict[str, int]:
+        with self._connect() as connection:
+            return DataServices(connection).refresh_insights(limit=limit)
+
     def create_backup(self, destination: Path | None = None) -> Path:
         self.ensure_ready()
         if destination is None:

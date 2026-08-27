@@ -1197,10 +1197,13 @@ class MainWindow(QMainWindow):
                 min_score=self.semantic_min_score.value(),
             )
         )
+        insight_button = QPushButton("Classificar e extrair palavras")
+        insight_button.clicked.connect(lambda: self._queue_database_task("refresh_insights"))
         semantic_controls.addWidget(self.semantic_busca, 1)
         semantic_controls.addWidget(self.semantic_min_score)
         semantic_controls.addWidget(semantic_build)
         semantic_controls.addWidget(semantic_search)
+        semantic_controls.addWidget(insight_button)
         self.manutencao_status = QLabel("Nenhuma verificação executada nesta sessão.")
         self.manutencao_status.setObjectName("muted")
         maintenance_layout.addWidget(legal)
@@ -1295,6 +1298,8 @@ class MainWindow(QMainWindow):
             self._render_analytics(result)
         elif action == "rebuild_semantic_index":
             self.manutencao_status.setText(f"Índice atualizado: {result}")
+        elif action == "refresh_insights":
+            self.manutencao_status.setText(f"Classificação atualizada: {result}")
         elif action == "semantic_search":
             self._render_semantic_results(result)
         elif action == "quick_check":

@@ -94,4 +94,6 @@ A busca semântica agora oferece uma pontuação mínima ajustável. O valor é 
 6. só então comparar o índice econômico com um modelo neural multilíngue;
 7. usar índice vetorial especializado apenas quando a escala justificar.
 
+O marco automático atual também gera uma classificação local por categorias (TI, saúde, limpeza/conservação, construção, transporte ou outros), extrai palavras-chave e identifica padrões de CATMAT, CATSER, NCM e NBS. Essas sugestões são heurísticas para organizar a pesquisa; não substituem a leitura do edital.
+
 O objetivo é manter a complexidade interna alta quando necessário, mas expor ao usuário uma sequência curta, explicável e segura.

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 MIGRATION_V1 = """
 CREATE TABLE IF NOT EXISTS ingestion_run (
@@ -190,6 +190,18 @@ CREATE TABLE IF NOT EXISTS coverage (
     max_source_update TEXT,
     updated_at TEXT NOT NULL
 );
+"""
+
+MIGRATION_V4 = """
+CREATE TABLE IF NOT EXISTS contract_insight (
+    contratacao_id INTEGER PRIMARY KEY REFERENCES contratacao(id) ON DELETE CASCADE,
+    category TEXT NOT NULL,
+    keywords_json TEXT NOT NULL,
+    codes_json TEXT NOT NULL,
+    source_hash TEXT NOT NULL,
+    generated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_contract_insight_category ON contract_insight(category);
 """
 
 MIGRATION_V2 = """

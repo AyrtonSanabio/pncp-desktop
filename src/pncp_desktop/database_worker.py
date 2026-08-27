@@ -31,6 +31,7 @@ class DatabaseTaskThread(QThread):
                 "advanced_search": "advanced_search",
                 "sync_history": "sync_history",
                 "analytics": "analytics",
+                "refresh_insights": "refresh_insights",
                 "price_history": "price_history",
                 "semantic_search": "semantic_search",
                 "rebuild_semantic_index": "rebuild_semantic_index",

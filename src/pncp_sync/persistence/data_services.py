@@ -103,6 +103,68 @@ class DataServices:
         self.connection = connection
         self.connection.row_factory = sqlite3.Row
 
+    def refresh_insights(self, *, limit: int = 100_000) -> dict[str, int]:
+        """Gera classificações e palavras-chave determinísticas sem serviço externo."""
+        if not 1 <= limit <= 1_000_000:
+            raise ValueError("O limite de classificação deve ficar entre 1 e 1000000.")
+        rows = self.connection.execute(
+            "SELECT id, objeto_compra, informacao_complementar, record_hash "
+            "FROM contratacao ORDER BY id LIMIT ?",
+            (limit,),
+        ).fetchall()
+        generated = skipped = 0
+        for row in rows:
+            existing = self.connection.execute(
+                "SELECT source_hash FROM contract_insight WHERE contratacao_id=?", (row["id"],)
+            ).fetchone()
+            if existing and existing[0] == row["record_hash"]:
+                skipped += 1
+                continue
+            text = f"{row['objeto_compra'] or ''} {row['informacao_complementar'] or ''}"
+            tokens = _tokens(text)
+            concepts = [name for name, terms in _CONCEPTS.items() if set(tokens) & terms]
+            category = self._category_for(concepts, tokens)
+            keywords = list(dict.fromkeys(tokens))[:30]
+            codes = sorted(
+                set(re.findall(r"\b(?:CATMAT|CATSER|NCM|NBS)[ :/-]*[A-Z0-9.-]{2,}\b", text.upper()))
+            )
+            self.connection.execute(
+                """INSERT INTO contract_insight
+                   (contratacao_id,category,keywords_json,codes_json,source_hash,generated_at)
+                   VALUES(?,?,?,?,?,?) ON CONFLICT(contratacao_id) DO UPDATE SET
+                   category=excluded.category,keywords_json=excluded.keywords_json,
+                   codes_json=excluded.codes_json,source_hash=excluded.source_hash,
+                   generated_at=excluded.generated_at""",
+                (
+                    row["id"],
+                    category,
+                    json.dumps(keywords, ensure_ascii=False),
+                    json.dumps(codes, ensure_ascii=False),
+                    row["record_hash"],
+                    _now(),
+                ),
+            )
+            generated += 1
+        self.connection.commit()
+        return {"generated": generated, "skipped": skipped}
+
+    @staticmethod
+    def _category_for(concepts: list[str], tokens: list[str]) -> str:
+        if "equipamento_ti" in concepts or "acao_suporte_ti" in concepts:
+            return "Tecnologia da informação"
+        if "educacao" in concepts:
+            return "Educação"
+        groups = {
+            "Saúde": {"saude", "medicamento", "hospital", "exame"},
+            "Limpeza e conservação": {"limpeza", "conservacao", "higiene"},
+            "Construção e manutenção predial": {"obra", "construcao", "predial", "pintura"},
+            "Transporte": {"veiculo", "veiculos", "combustivel", "motorista"},
+        }
+        for name, terms in groups.items():
+            if set(tokens) & terms:
+                return name
+        return "Outros"
+
     def sync_history(self, limit: int = 100) -> list[dict[str, Any]]:
         if not 1 <= limit <= 1000:
             raise ValueError("O limite deve ficar entre 1 e 1000.")

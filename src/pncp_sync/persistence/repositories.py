@@ -27,7 +27,13 @@ from pncp_sync.normalization.contratacoes import (
     canonical_json,
     normalize_contratacao,
 )
-from pncp_sync.persistence.schema import MIGRATION_V1, MIGRATION_V2, MIGRATION_V3, SCHEMA_VERSION
+from pncp_sync.persistence.schema import (
+    MIGRATION_V1,
+    MIGRATION_V2,
+    MIGRATION_V3,
+    MIGRATION_V4,
+    SCHEMA_VERSION,
+)
 
 _CONTRATACAO_COLUMNS = (
     "numero_controle_pncp",
@@ -154,6 +160,11 @@ class SyncRepository:
         if current < 3:
             self.connection.executescript(MIGRATION_V3)
             self.connection.execute("PRAGMA user_version = 3")
+            self.connection.commit()
+            current = 3
+        if current < 4:
+            self.connection.executescript(MIGRATION_V4)
+            self.connection.execute("PRAGMA user_version = 4")
             self.connection.commit()
 
     def create_plan(
