@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QDate, Qt, QThread, Signal
+from PySide6.QtCore import QDate, QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontDatabase
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -38,8 +39,9 @@ from PySide6.QtWidgets import (
 )
 
 from pncp_desktop.app_paths import default_database_path
+from pncp_desktop.database_worker import DatabaseTaskThread
 from pncp_desktop.exportacao import exportar_contratos_csv
-from pncp_desktop.local_database import LocalDatabase
+from pncp_desktop.local_database import DatabaseSnapshot, DiagnosticsReport, LocalDatabase
 from pncp_desktop.models import (
     ContratoLinha,
     FiltrosConsulta,
@@ -269,6 +271,136 @@ class ContractDetailDialog(QDialog):
         return page
 
 
+class DiagnosticsDialog(QDialog):
+    def __init__(self, report: DiagnosticsReport, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Erros e validações do banco local")
+        self.resize(980, 620)
+        layout = QVBoxLayout(self)
+        tabs = QTabWidget()
+        tabs.addTab(self._summary_tab(report), "Resumo")
+        tabs.addTab(
+            self._table_tab(
+                report.errors,
+                (
+                    "Origem",
+                    "Execução",
+                    "Unidade",
+                    "Data",
+                    "Categoria",
+                    "Recuperável",
+                    "Mensagem",
+                    "Detalhe",
+                ),
+                (
+                    "source",
+                    "run_id",
+                    "work_unit_id",
+                    "created_at",
+                    "category",
+                    "recoverable",
+                    "message",
+                    "detail",
+                ),
+            ),
+            f"Erros ({len(report.errors)})",
+        )
+        tabs.addTab(
+            self._table_tab(
+                report.rejections,
+                ("Origem", "Execução", "Unidade", "Data", "Motivo"),
+                ("source", "run_id", "work_unit_id", "created_at", "reason"),
+            ),
+            f"Rejeições ({len(report.rejections)})",
+        )
+        tabs.addTab(
+            self._table_tab(
+                report.model_validations,
+                ("Execução", "Unidade", "Data", "Recurso", "Validação do modelo"),
+                ("run_id", "work_unit_id", "created_at", "resource", "errors"),
+            ),
+            f"Modelo pypncp ({len(report.model_validations)})",
+        )
+        layout.addWidget(tabs)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    @staticmethod
+    def _summary_tab(report: DiagnosticsReport) -> QWidget:
+        page = QWidget()
+        form = QFormLayout(page)
+        values = (
+            (
+                "Cobertura da última sincronização",
+                f"{report.coverage['processed_pages']}/{report.coverage['planned_pages']} "
+                f"páginas; {report.coverage['records_received']} registros",
+            ),
+            (
+                "Cobertura de itens da última sincronização",
+                f"{report.coverage['contracts_with_items']}/"
+                f"{report.coverage['planned_contracts']} contratações com itens; "
+                f"{report.coverage['items_seen']} itens",
+            ),
+            (
+                "Cobertura de resultados da última sincronização",
+                f"{report.coverage['items_with_results_confirmed']}/"
+                f"{report.coverage['items_expecting_results']} itens confirmados; "
+                f"{report.coverage['result_records']} resultados",
+            ),
+            ("Erros de contratações", report.main_errors),
+            ("Erros de itens/resultados", report.detail_errors),
+            ("Contratações rejeitadas", report.main_rejections),
+            ("Itens/resultados rejeitados", report.detail_rejections),
+            ("Validações incompatíveis com pypncp", len(report.model_validations)),
+            ("Integridade SQLite", report.quick_check),
+            ("Chaves estrangeiras inválidas", report.foreign_key_errors),
+            ("Identificadores PNCP duplicados", report.duplicate_contracts),
+        )
+        for label, value in values:
+            field = QLabel(_display(value))
+            field.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            field.setWordWrap(True)
+            form.addRow(label, field)
+        note = QLabel(
+            "Erros recuperáveis podem ser resolvidos com Continuar. Rejeições indicam que "
+            "um registro não foi aceito com segurança; o conteúdo bruto permanece auditável."
+        )
+        note.setWordWrap(True)
+        form.addRow("Interpretação", note)
+        return page
+
+    @staticmethod
+    def _table_tab(
+        rows: list[dict[str, Any]], headers: tuple[str, ...], keys: tuple[str, ...]
+    ) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        table = QTableWidget(len(rows), len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+        for row_index, row in enumerate(rows):
+            for column_index, key in enumerate(keys):
+                value = row.get(key)
+                if key == "recoverable":
+                    value = "Sim" if value else "Não"
+                elif key == "errors":
+                    with contextlib.suppress(TypeError, ValueError, json.JSONDecodeError):
+                        value = "\n".join(json.loads(value))
+                cell = QTableWidgetItem(_display(value))
+                cell.setToolTip(_display(value))
+                table.setItem(row_index, column_index, cell)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        if headers:
+            header.setSectionResizeMode(len(headers) - 1, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(table)
+        return page
+
+
 class MainWindow(QMainWindow):
     COLUNAS = ("Número", "Órgão", "Objeto", "Fornecedor", "Valor", "Vigência")
 
@@ -276,12 +408,21 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._worker: ConsultaThread | None = None
         self._contratos: tuple[ContratoLinha, ...] = ()
-        self._db_path = Path(db_path or default_database_path()).expanduser().resolve()
+        self._settings = QSettings("AyrtonSanabio", "PNCPDesktop")
+        saved_path = self._settings.value("database_path", "", type=str)
+        selected_path = db_path or saved_path or default_database_path()
+        self._db_path = Path(selected_path).expanduser().resolve()
         self._local_database = LocalDatabase(self._db_path)
+        self._database_worker: DatabaseTaskThread | None = None
+        self._pending_database_task: tuple[str, dict[str, Any]] | None = None
+        self._local_dirty = True
+        self._local_loaded_path: Path | None = None
+        self._open_diagnostics_when_ready = False
         self._sync_worker: SyncTaskThread | None = None
         self._sync_run_id: str | None = None
         self._detail_run_id: str | None = None
         self._sync_plan: PlanSummary | None = None
+        self._sync_space_ok = True
 
         self.setWindowTitle("Consulta PNCP Desktop")
         self.setMinimumSize(1100, 700)
@@ -521,6 +662,13 @@ class MainWindow(QMainWindow):
             "Depois das contratações, consulta itens e resultados publicados pelo PNCP."
         )
         grid.addWidget(self.incluir_detalhes, 2, 3, 1, 2)
+        self.botao_atualizar_desde_ultima = QPushButton("Atualizar desde a última execução")
+        self.botao_atualizar_desde_ultima.setObjectName("secundario")
+        self.botao_atualizar_desde_ultima.setToolTip(
+            "Usa a data final da última sincronização concluída desta modalidade, "
+            "com um dia de sobreposição para capturar retificações."
+        )
+        self.botao_atualizar_desde_ultima.clicked.connect(self.atualizar_desde_ultima_execucao)
         self.botao_estimar = QPushButton("Estimar")
         self.botao_estimar.setObjectName("secundario")
         self.botao_estimar.setToolTip("Consulta uma página e estima volume, espaço e páginas.")
@@ -539,13 +687,15 @@ class MainWindow(QMainWindow):
         self.botao_continuar.clicked.connect(self.continuar_sincronizacao)
         botoes = QHBoxLayout()
         for button in (
+            self.botao_atualizar_desde_ultima,
             self.botao_estimar,
             self.botao_sincronizar,
             self.botao_pausar,
             self.botao_continuar,
         ):
             botoes.addWidget(button)
-        grid.addLayout(botoes, 2, 5)
+        botoes.addStretch(1)
+        grid.addLayout(botoes, 3, 0, 1, 6)
         grid.setColumnStretch(3, 1)
         grid.setColumnStretch(4, 1)
         layout.addWidget(filters)
@@ -561,9 +711,18 @@ class MainWindow(QMainWindow):
         self.sync_progresso.setVisible(False)
         self.sync_metricas = QLabel("Nenhuma execução planejada.")
         self.sync_metricas.setObjectName("muted")
+        alerts = QHBoxLayout()
+        self.sync_alertas = QLabel("Erros e validações ainda não verificados.")
+        self.sync_alertas.setObjectName("muted")
+        self.botao_diagnosticos = QPushButton("Ver erros e validações")
+        self.botao_diagnosticos.setObjectName("secundario")
+        self.botao_diagnosticos.clicked.connect(self.ver_diagnosticos)
+        alerts.addWidget(self.sync_alertas, 1)
+        alerts.addWidget(self.botao_diagnosticos)
         status_layout.addWidget(self.sync_status_label)
         status_layout.addWidget(self.sync_progresso)
         status_layout.addWidget(self.sync_metricas)
+        status_layout.addLayout(alerts)
         layout.addWidget(status)
 
         explanation = QLabel(
@@ -587,6 +746,21 @@ class MainWindow(QMainWindow):
         title = QLabel("Banco local")
         title.setObjectName("tituloCartao")
         top_layout.addWidget(title)
+        storage = QHBoxLayout()
+        self.local_path = QLabel(str(self._db_path))
+        self.local_path.setObjectName("muted")
+        self.local_path.setToolTip(str(self._db_path))
+        self.local_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.botao_escolher_banco = QPushButton("Escolher local dos dados…")
+        self.botao_escolher_banco.setObjectName("secundario")
+        self.botao_escolher_banco.setToolTip(
+            "Escolhe o arquivo SQLite onde contratações, itens e auditoria serão armazenados."
+        )
+        self.botao_escolher_banco.clicked.connect(self.escolher_local_banco)
+        storage.addWidget(QLabel("Arquivo:"))
+        storage.addWidget(self.local_path, 1)
+        storage.addWidget(self.botao_escolher_banco)
+        top_layout.addLayout(storage)
         controls = QHBoxLayout()
         self.local_busca = QLineEdit()
         self.local_busca.setPlaceholderText("Pesquise por objeto, órgão, item ou fornecedor")
@@ -632,8 +806,167 @@ class MainWindow(QMainWindow):
         return page
 
     def _aba_trocada(self, index: int) -> None:
-        if self.abas.tabText(index) == "Banco local":
+        if self.abas.tabText(index) == "Banco local" and (
+            self._local_dirty or self._local_loaded_path != self._db_path
+        ):
             self.carregar_banco_local()
+
+    def _queue_database_task(self, action: str, **arguments: Any) -> None:
+        if self._database_worker is not None and self._database_worker.isRunning():
+            self._pending_database_task = (action, arguments)
+            if action == "snapshot":
+                self.local_status.setText("Atualização aguardando a consulta atual terminar…")
+            return
+        worker = DatabaseTaskThread(
+            self._local_database,
+            action=action,
+            arguments=arguments,
+            parent=self,
+        )
+        worker.completed.connect(self._database_task_completed)
+        worker.failed.connect(self._database_task_failed)
+        worker.finished.connect(self._database_task_finished)
+        self._database_worker = worker
+        self._set_database_busy(True, action)
+        worker.start()
+
+    def _database_task_completed(self, action: str, result: object) -> None:
+        if action == "snapshot":
+            self._render_database_snapshot(result)
+        elif action == "latest_completed_date":
+            self._apply_latest_completed_date(result)
+        elif action == "diagnostics":
+            self._render_diagnostics(result)
+        elif action in {"detail", "detail_by_control"}:
+            ContractDetailDialog(result, self).exec()
+
+    def _database_task_failed(self, action: str, detail: str) -> None:
+        readable = {
+            "snapshot": "Não foi possível carregar o banco local.",
+            "latest_completed_date": "Não foi possível localizar a última execução.",
+            "diagnostics": "Não foi possível validar o banco local.",
+            "detail": "Não foi possível abrir os detalhes.",
+            "detail_by_control": "Não foi possível abrir os detalhes locais.",
+        }.get(action, "A tarefa do banco local falhou.")
+        if action == "snapshot":
+            self.local_status.setText(f"{readable} {detail}")
+            self.tabela_local.setRowCount(0)
+        elif action == "latest_completed_date":
+            self.sync_status_label.setText(readable)
+            QMessageBox.warning(self, "Atualização incremental", f"{readable}\n\n{detail}")
+        elif action == "diagnostics":
+            self.sync_alertas.setText(f"Falha ao validar: {detail}")
+            QMessageBox.critical(self, "Erros e validações", f"{readable}\n\n{detail}")
+        else:
+            QMessageBox.warning(self, "Detalhe indisponível", f"{readable}\n\n{detail}")
+
+    def _database_task_finished(self) -> None:
+        worker = self._database_worker
+        self._database_worker = None
+        self._set_database_busy(False, "")
+        if worker is not None:
+            worker.deleteLater()
+        pending = self._pending_database_task
+        self._pending_database_task = None
+        if pending is not None:
+            action, arguments = pending
+            QTimer.singleShot(0, lambda: self._queue_database_task(action, **arguments))
+
+    def _set_database_busy(self, busy: bool, action: str) -> None:
+        self.botao_buscar_local.setEnabled(not busy)
+        self.botao_atualizar_local.setEnabled(not busy)
+        self.botao_diagnosticos.setEnabled(not busy)
+        sync_busy = self._sync_worker is not None and self._sync_worker.isRunning()
+        self.botao_escolher_banco.setEnabled(not busy and not sync_busy)
+        if busy and action == "snapshot":
+            self.local_status.setText("Carregando banco local em segundo plano…")
+
+    def atualizar_desde_ultima_execucao(self) -> None:
+        if self._sync_worker is not None and self._sync_worker.isRunning():
+            return
+        self.sync_status_label.setText("Localizando a última execução concluída desta modalidade…")
+        self._queue_database_task("latest_completed_date", modalidade=self.sync_modalidade.value())
+
+    def _apply_latest_completed_date(self, value: object) -> None:
+        if value is None:
+            self.sync_status_label.setText(
+                "Nenhuma execução concluída foi encontrada para esta modalidade."
+            )
+            QMessageBox.information(
+                self,
+                "Atualização incremental",
+                "Ainda não existe uma sincronização concluída desta modalidade neste banco. "
+                "Faça primeiro uma estimativa informando as datas.",
+            )
+            return
+        if not isinstance(value, date):
+            raise TypeError("A última data retornada pelo banco é inválida.")
+        last_date = value
+        today = date.today()
+        start = min(last_date, today)
+        end = min(today, start + timedelta(days=self._sync_config().max_window_days - 1))
+        self.sync_data_inicial.setDate(QDate(start.year, start.month, start.day))
+        self.sync_data_final.setDate(QDate(end.year, end.month, end.day))
+        remaining = end < today
+        suffix = " Este é o próximo lote; ainda haverá datas posteriores." if remaining else ""
+        self.sync_status_label.setText(
+            f"Atualização preparada de {start:%d/%m/%Y} a {end:%d/%m/%Y}, "
+            f"repetindo o último dia para capturar retificações.{suffix}"
+        )
+        QTimer.singleShot(0, self.estimar_sincronizacao)
+
+    def escolher_local_banco(self) -> None:
+        if self._sync_worker is not None and self._sync_worker.isRunning():
+            QMessageBox.warning(
+                self,
+                "Sincronização em andamento",
+                "Pause ou conclua a sincronização antes de trocar o arquivo de dados.",
+            )
+            return
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "Escolher banco de dados local",
+            str(self._db_path),
+            "Banco SQLite (*.sqlite3 *.sqlite *.db)",
+        )
+        if not selected:
+            return
+        target = Path(selected).expanduser()
+        if not target.suffix:
+            target = target.with_suffix(".sqlite3")
+        target = target.resolve()
+        if target.exists() and target.is_dir():
+            QMessageBox.warning(self, "Local inválido", "Escolha um arquivo, não uma pasta.")
+            return
+        parent = target.parent
+        if not parent.exists() or not os.access(parent, os.W_OK):
+            QMessageBox.warning(
+                self,
+                "Local sem permissão",
+                "A pasta escolhida não existe ou não permite gravar dados.",
+            )
+            return
+        if target == self._db_path:
+            return
+        previous = self._db_path
+        self._db_path = target
+        self._local_database = LocalDatabase(target)
+        self._settings.setValue("database_path", str(target))
+        self._sync_run_id = None
+        self._detail_run_id = None
+        self._sync_plan = None
+        self._sync_space_ok = True
+        self._local_dirty = True
+        self._local_loaded_path = None
+        self.local_path.setText(str(target))
+        self.local_path.setToolTip(str(target))
+        self.tabela_local.setRowCount(0)
+        self.local_status.setText(
+            f"Novo arquivo selecionado. O banco anterior permanece em {previous}."
+        )
+        self.botao_sincronizar.setEnabled(False)
+        self.botao_continuar.setEnabled(False)
+        self.carregar_banco_local()
 
     def _sync_config(self) -> SyncConfig:
         return SyncConfig(db_path=self._db_path)
@@ -717,9 +1050,31 @@ class MainWindow(QMainWindow):
             f"banco estimado {formatar_bytes(summary.estimated_database_bytes)}"
         )
         extras = ", ".join(summary.unmodeled_fields[:5])
-        suffix = f" Campos extras: {extras}." if extras else ""
-        self.sync_status_label.setText(f"Estimativa pronta. Run ID: {summary.run_id}.{suffix}")
-        self.botao_sincronizar.setEnabled(True)
+        remaining_extras = max(0, len(summary.unmodeled_fields) - 5)
+        extra_count = f" e mais {remaining_extras}" if remaining_extras else ""
+        suffix = f" Campos fora do modelo: {extras}{extra_count}." if extras else ""
+        self.sync_status_label.setToolTip(", ".join(summary.unmodeled_fields))
+        required = int(summary.estimated_database_bytes * 1.25)
+        enough_space = summary.free_disk_bytes >= required
+        self._sync_space_ok = enough_space
+        if enough_space:
+            self.sync_status_label.setText(
+                f"Estimativa pronta. Espaço livre: {formatar_bytes(summary.free_disk_bytes)}."
+                f"{suffix}"
+            )
+        else:
+            self.sync_status_label.setText(
+                "Espaço insuficiente para iniciar com margem de segurança. "
+                f"Necessário: {formatar_bytes(required)}; livre: "
+                f"{formatar_bytes(summary.free_disk_bytes)}."
+            )
+            QMessageBox.critical(
+                self,
+                "Espaço insuficiente",
+                "A sincronização não será iniciada porque o local escolhido não possui "
+                "a margem de espaço estimada.",
+            )
+        self.botao_sincronizar.setEnabled(enough_space)
         self.botao_continuar.setEnabled(False)
 
     def _detalhes_planejados(self, detail_run_id: str) -> None:
@@ -747,8 +1102,22 @@ class MainWindow(QMainWindow):
             )
 
     def _sync_concluido(self, main: RunSummary, details: DetailRunSummary | None) -> None:
-        self._render_sync_result(main, details, "Sincronização concluída.")
-        self.carregar_banco_local()
+        has_failure = main.status == "FAILED" or (
+            details is not None and details.status == "FAILED"
+        )
+        has_rejection = main.records_rejected > 0 or (
+            details is not None and details.rejected_records > 0
+        )
+        if has_failure:
+            prefix = "Sincronização encerrada com falhas."
+        elif has_rejection:
+            prefix = "Sincronização concluída com rejeições."
+        else:
+            prefix = "Sincronização concluída."
+        self._render_sync_result(main, details, prefix)
+        self._local_dirty = True
+        if self.abas.tabText(self.abas.currentIndex()) == "Banco local":
+            self.carregar_banco_local()
 
     def _sync_pausado(self, main: RunSummary | None, details: DetailRunSummary | None) -> None:
         if main is not None:
@@ -767,13 +1136,32 @@ class MainWindow(QMainWindow):
     ) -> None:
         detail_text = ""
         if details is not None:
-            detail_text = f" • {details.item_records} itens • {details.result_records} resultados"
+            detail_text = (
+                f" • detalhes: {details.status} • {details.item_records} itens • "
+                f"{details.result_records} resultados"
+            )
         self.sync_status_label.setText(f"{prefix} Status: {main.status}{detail_text}")
         self.sync_metricas.setText(
             f"Contratações recebidas: {main.records_received} • novas: {main.records_inserted} • "
             f"alteradas: {main.records_updated} • inalteradas: {main.records_unchanged} • "
-            f"{formatar_bytes(main.bytes_received)}"
+            f"rejeitadas: {main.records_rejected} • {formatar_bytes(main.bytes_received)}"
         )
+        detail_rejections = details.rejected_records if details is not None else 0
+        failed_units = main.failed_units + (details.failed_units if details is not None else 0)
+        total_problems = main.records_rejected + detail_rejections + failed_units
+        if total_problems:
+            self.sync_alertas.setText(
+                f"Atenção: {main.records_rejected + detail_rejections} registro(s) rejeitado(s) "
+                f"e {failed_units} unidade(s) com falha. Abra Erros e validações."
+            )
+            self.sync_alertas.setObjectName("alertaErro")
+        else:
+            self.sync_alertas.setText(
+                "Esta execução não informou rejeições nem unidades com falha."
+            )
+            self.sync_alertas.setObjectName("muted")
+        self.sync_alertas.style().unpolish(self.sync_alertas)
+        self.sync_alertas.style().polish(self.sync_alertas)
         self.sync_progresso.setRange(0, max(1, main.planned_units))
         self.sync_progresso.setValue(
             min(main.succeeded_units + main.partial_units, main.planned_units)
@@ -782,6 +1170,9 @@ class MainWindow(QMainWindow):
     def _sync_falhou(self, mensagem: str, detalhe: str) -> None:
         self.sync_status_label.setText(mensagem)
         self.sync_status_label.setToolTip(detalhe)
+        self.sync_alertas.setText("Falha não tratada na execução; consulte o detalhe exibido.")
+        self.sync_alertas.setObjectName("alertaErro")
+        QMessageBox.critical(self, "Falha na sincronização", f"{mensagem}\n\n{detalhe}")
         self.botao_continuar.setEnabled(self._sync_run_id is not None)
 
     def _sync_finalizado(self) -> None:
@@ -795,7 +1186,7 @@ class MainWindow(QMainWindow):
         self.sync_progresso.setVisible(busy)
         self.botao_estimar.setEnabled(not busy)
         self.botao_sincronizar.setEnabled(
-            not busy and self._sync_run_id is not None and not planning
+            not busy and self._sync_run_id is not None and not planning and self._sync_space_ok
         )
         self.botao_pausar.setEnabled(busy and not planning)
         self.botao_continuar.setEnabled(not busy and self._sync_run_id is not None and not planning)
@@ -803,15 +1194,18 @@ class MainWindow(QMainWindow):
         self.sync_data_final.setEnabled(not busy)
         self.sync_modalidade.setEnabled(not busy)
         self.incluir_detalhes.setEnabled(not busy)
+        self.botao_atualizar_desde_ultima.setEnabled(not busy)
+        database_busy = self._database_worker is not None and self._database_worker.isRunning()
+        self.botao_escolher_banco.setEnabled(not busy and not database_busy)
 
     def carregar_banco_local(self) -> None:
-        try:
-            rows = self._local_database.search_contracts(self.local_busca.text())
-            stats = self._local_database.stats()
-        except Exception as exc:
-            self.local_status.setText(f"Banco local indisponível: {exc}")
-            self.tabela_local.setRowCount(0)
-            return
+        self._queue_database_task("snapshot", query=self.local_busca.text())
+
+    def _render_database_snapshot(self, result: object) -> None:
+        if not isinstance(result, DatabaseSnapshot):
+            raise TypeError("A tarefa local retornou um resultado incompatível.")
+        rows = result.rows
+        stats = result.stats
         self.tabela_local.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             values = (
@@ -833,6 +1227,8 @@ class MainWindow(QMainWindow):
             f"{len(rows)} exibida(s) • banco: {stats.contracts} contratações, "
             f"{stats.items} itens, {stats.results} resultados • {formatar_bytes(stats.bytes_used)}"
         )
+        self._local_dirty = False
+        self._local_loaded_path = self._db_path
 
     def pesquisar_banco_local(self) -> None:
         self.carregar_banco_local()
@@ -844,12 +1240,7 @@ class MainWindow(QMainWindow):
         contract_id = cell.data(Qt.ItemDataRole.UserRole)
         if contract_id is None:
             return
-        try:
-            detail = self._local_database.contract_detail(int(contract_id))
-        except Exception as exc:
-            QMessageBox.warning(self, "Detalhe indisponível", str(exc))
-            return
-        ContractDetailDialog(detail, self).exec()
+        self._queue_database_task("detail", contract_id=int(contract_id))
 
     def abrir_detalhe_online(self, row: int, _: int) -> None:
         cell = self.tabela.item(row, 0)
@@ -858,12 +1249,36 @@ class MainWindow(QMainWindow):
         numero_controle = cell.data(Qt.ItemDataRole.UserRole)
         if not numero_controle:
             return
-        try:
-            detail = self._local_database.contract_detail_by_control(numero_controle)
-        except ValueError as exc:
-            QMessageBox.information(self, "Detalhe local", str(exc))
-            return
-        ContractDetailDialog(detail, self).exec()
+        self._queue_database_task("detail_by_control", numero_controle=numero_controle)
+
+    def ver_diagnosticos(self) -> None:
+        self.sync_alertas.setText("Executando verificações de integridade em segundo plano…")
+        self._open_diagnostics_when_ready = True
+        self._queue_database_task("diagnostics")
+
+    def _render_diagnostics(self, result: object) -> None:
+        if not isinstance(result, DiagnosticsReport):
+            raise TypeError("O diagnóstico retornou um resultado incompatível.")
+        integrity_ok = (
+            result.quick_check == "ok"
+            and result.foreign_key_errors == 0
+            and result.duplicate_contracts == 0
+        )
+        if result.problem_count:
+            self.sync_alertas.setText(
+                f"Diagnóstico: {result.problem_count} erro(s), rejeição(ões) ou falha(s) "
+                f"de integridade registradas. Integridade SQLite: "
+                f"{'OK' if integrity_ok else 'COM PROBLEMAS'}."
+            )
+            self.sync_alertas.setObjectName("alertaErro")
+        else:
+            self.sync_alertas.setText("Diagnóstico concluído: nenhuma inconsistência encontrada.")
+            self.sync_alertas.setObjectName("muted")
+        self.sync_alertas.style().unpolish(self.sync_alertas)
+        self.sync_alertas.style().polish(self.sync_alertas)
+        if self._open_diagnostics_when_ready:
+            self._open_diagnostics_when_ready = False
+            DiagnosticsDialog(result, self).exec()
 
     def _aplicar_estilo(self) -> None:
         self.setFont(QFont("Segoe UI", 10))
@@ -881,6 +1296,7 @@ class MainWindow(QMainWindow):
                 background: #e9f3fb; border: 1px solid #c6deef; border-radius: 8px;
             }
             QLabel#statusTexto { color: #244f70; }
+            QLabel#alertaErro { color: #a33333; font-weight: 700; }
             QLineEdit, QDateEdit, QSpinBox {
                 background: #ffffff; border: 1px solid #b9c9d8; border-radius: 6px;
                 padding: 7px 9px; min-height: 22px;
@@ -1070,6 +1486,13 @@ class MainWindow(QMainWindow):
                 self.sync_status_label.setText("Aguardando o encerramento seguro da sincronização…")
                 event.ignore()
                 return
+        if (
+            self._database_worker is not None
+            and self._database_worker.isRunning()
+            and not self._database_worker.wait(5000)
+        ):
+            event.ignore()
+            return
         event.accept()
 
 

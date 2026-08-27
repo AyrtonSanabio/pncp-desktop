@@ -28,6 +28,9 @@ Embora a conversa use a palavra “scraper”, o caminho principal será consumi
 - SQLite com migração, FTS5, payload bruto comprimido, dados normalizados e auditoria;
 - carga por publicação, checkpoints por página, retomada e idempotência implementados;
 - campos úteis ainda ignorados pelo modelo do `pypncp` preservados e normalizados;
+- banco local carregado em segundo plano, sem bloquear a troca de abas;
+- escolha persistente do arquivo SQLite e atualização incremental pela última execução;
+- painel de cobertura, erros, rejeições, validações do `pypncp` e integridade do banco;
 - fatia real de 94 contratações concluída e reexecutada sem duplicação;
 - prova da Fase 2 com um item e seu resultado/fornecedor concluída e reexecutada;
 - protótipo anterior da interface mantido no código e em `docs/melhorias-futuras/`;
@@ -103,6 +106,7 @@ Antes de tentar baixar “o PNCP inteiro”, faremos uma fatia vertical pequena 
 - [Dimensionamento, memória, busca vetorial e segurança](docs/DIMENSIONAMENTO_MEMORIA_TEMPO_E_SEGURANCA.md)
 - [Implementação da Fase 1 e prova real](docs/IMPLEMENTACAO_FASE_1.md)
 - [Implementação inicial da Fase 2: itens e resultados](docs/IMPLEMENTACAO_FASE_2.md)
+- [Interface, atualização incremental, erros e validações](docs/INTERFACE_INCREMENTAL_ERROS_E_VALIDACOES.md)
 - [Glossário e trilha de pesquisa](docs/GLOSSARIO_E_TRILHA_DE_ESTUDO.md)
 - [Contexto completo para outra IA](docs/CONTEXTO_PARA_OUTRA_IA.md)
 - [Política de somente leitura e credenciamento](docs/POLITICA_SOMENTE_LEITURA_E_CREDENCIAMENTO.md)

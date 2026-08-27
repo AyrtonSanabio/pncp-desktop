@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from pypncp import PNCPError
 
+from pncp_desktop.local_database import LocalDatabase
 from pncp_sync.application.plan_sync import plan_sync
 from pncp_sync.application.run_sync import run_sync
 from pncp_sync.config import SyncConfig
@@ -159,6 +160,9 @@ async def test_registro_invalido_fica_auditavel_sem_abortar_pagina(tmp_path: Pat
         ).fetchone()
         assert "chave de negócio" in rejection["reason"]
         assert rejection["compressed_bytes"] > 0
+    diagnostics = LocalDatabase(config.db_path).diagnostics()
+    assert diagnostics.main_rejections == 1
+    assert diagnostics.rejections[0]["source"] == "Contratações"
 
 
 @pytest.mark.asyncio
@@ -184,3 +188,6 @@ async def test_falha_recuperavel_pausa_sem_avancar_checkpoint(tmp_path: Path) ->
         ).fetchone()
         assert error["category"] == "PNCP"
         assert error["recoverable"] == 1
+    diagnostics = LocalDatabase(config.db_path).diagnostics()
+    assert diagnostics.main_errors == 1
+    assert diagnostics.errors[0]["recoverable"] == 1

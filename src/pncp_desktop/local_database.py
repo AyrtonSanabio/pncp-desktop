@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,40 @@ class DatabaseStats:
     bytes_used: int
 
 
+@dataclass(frozen=True, slots=True)
+class DatabaseSnapshot:
+    rows: list[dict[str, Any]]
+    stats: DatabaseStats
+
+
+@dataclass(frozen=True, slots=True)
+class DiagnosticsReport:
+    errors: list[dict[str, Any]]
+    rejections: list[dict[str, Any]]
+    model_validations: list[dict[str, Any]]
+    main_errors: int
+    detail_errors: int
+    main_rejections: int
+    detail_rejections: int
+    quick_check: str
+    foreign_key_errors: int
+    duplicate_contracts: int
+    coverage: dict[str, int]
+
+    @property
+    def problem_count(self) -> int:
+        return (
+            self.main_errors
+            + self.detail_errors
+            + self.main_rejections
+            + self.detail_rejections
+            + len(self.model_validations)
+            + self.foreign_key_errors
+            + self.duplicate_contracts
+            + (0 if self.quick_check == "ok" else 1)
+        )
+
+
 def _fts_query(value: str) -> str:
     terms = [term.strip('"') for term in value.split() if term.strip('"')]
     return " AND ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms)
@@ -24,10 +59,14 @@ def _fts_query(value: str) -> str:
 class LocalDatabase:
     def __init__(self, db_path: Path) -> None:
         self.db_path = Path(db_path).expanduser().resolve()
+        self._ready = False
 
     def ensure_ready(self) -> None:
+        if self._ready:
+            return
         with SyncRepository(self.db_path):
             pass
+        self._ready = True
 
     def _connect(self) -> sqlite3.Connection:
         self.ensure_ready()
@@ -47,6 +86,148 @@ class LocalDatabase:
             items=items,
             results=results,
             bytes_used=self.db_path.stat().st_size if self.db_path.exists() else 0,
+        )
+
+    def snapshot(self, query: str = "", *, limit: int = 100) -> DatabaseSnapshot:
+        """Carrega tabela e métricas numa tarefa de banco fora da thread gráfica."""
+        return DatabaseSnapshot(rows=self.search_contracts(query, limit=limit), stats=self.stats())
+
+    def latest_completed_date(self, modalidade: int) -> date | None:
+        if modalidade < 1:
+            raise ValueError("O código da modalidade deve ser positivo.")
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT MAX(data_final)
+                FROM ingestion_run
+                WHERE modalidade = ?
+                  AND status IN ('COMPLETED', 'COMPLETED_WITH_REJECTIONS')
+                """,
+                (modalidade,),
+            ).fetchone()
+        return date.fromisoformat(row[0]) if row and row[0] else None
+
+    def diagnostics(self, *, limit: int = 200) -> DiagnosticsReport:
+        if limit < 1 or limit > 1000:
+            raise ValueError("O limite do diagnóstico deve ficar entre 1 e 1000.")
+        with self._connect() as connection:
+            counts = connection.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM ingestion_error) main_errors,
+                    (SELECT COUNT(*) FROM detail_error) detail_errors,
+                    (SELECT COUNT(*) FROM data_rejection) main_rejections,
+                    (SELECT COUNT(*) FROM detail_rejection) detail_rejections
+                """
+            ).fetchone()
+            errors = connection.execute(
+                """
+                SELECT 'Contratações' source, run_id, work_unit_id, created_at,
+                       category, recoverable, message, COALESCE(detail, '') detail
+                FROM ingestion_error
+                UNION ALL
+                SELECT 'Itens/resultados', detail_run_id, work_unit_id, created_at,
+                       category, recoverable, message, COALESCE(detail, '')
+                FROM detail_error
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            rejections = connection.execute(
+                """
+                SELECT 'Contratações' source, run_id, work_unit_id, created_at, reason
+                FROM data_rejection
+                UNION ALL
+                SELECT 'Itens/resultados', detail_run_id, work_unit_id, created_at, reason
+                FROM detail_rejection
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            model_validations = connection.execute(
+                """
+                SELECT detail_run_id run_id, work_unit_id, created_at, resource,
+                       model_validation_errors_json errors
+                FROM detail_payload
+                WHERE model_validation_errors_json NOT IN ('[]', '', 'null')
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            main_coverage = connection.execute(
+                """
+                SELECT c.planned_pages, c.processed_pages, c.partial_pages,
+                       c.records_received
+                FROM coverage c
+                JOIN ingestion_run r ON r.id = c.run_id
+                WHERE c.processed_pages > 0 OR c.partial_pages > 0
+                ORDER BY r.created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            detail_coverage = connection.execute(
+                """
+                SELECT c.planned_contracts, c.contracts_with_items, c.items_seen,
+                       c.items_expecting_results, c.items_with_results_confirmed,
+                       c.result_records
+                FROM detail_coverage c
+                JOIN detail_run r ON r.id = c.detail_run_id
+                ORDER BY r.created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            quick_check_rows = connection.execute("PRAGMA quick_check").fetchall()
+            foreign_key_errors = len(connection.execute("PRAGMA foreign_key_check").fetchall())
+            duplicate_contracts = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM (
+                        SELECT numero_controle_pncp
+                        FROM contratacao
+                        GROUP BY numero_controle_pncp
+                        HAVING COUNT(*) > 1
+                    )
+                    """
+                ).fetchone()[0]
+            )
+        quick_check = "; ".join(str(row[0]) for row in quick_check_rows) or "sem resultado"
+        coverage = {
+            "planned_pages": int(main_coverage["planned_pages"] or 0) if main_coverage else 0,
+            "processed_pages": int(main_coverage["processed_pages"] or 0) if main_coverage else 0,
+            "partial_pages": int(main_coverage["partial_pages"] or 0) if main_coverage else 0,
+            "records_received": int(main_coverage["records_received"] or 0) if main_coverage else 0,
+            "planned_contracts": int(detail_coverage["planned_contracts"] or 0)
+            if detail_coverage
+            else 0,
+            "contracts_with_items": int(detail_coverage["contracts_with_items"] or 0)
+            if detail_coverage
+            else 0,
+            "items_seen": int(detail_coverage["items_seen"] or 0) if detail_coverage else 0,
+            "items_expecting_results": int(detail_coverage["items_expecting_results"] or 0)
+            if detail_coverage
+            else 0,
+            "items_with_results_confirmed": int(
+                detail_coverage["items_with_results_confirmed"] or 0
+            )
+            if detail_coverage
+            else 0,
+            "result_records": int(detail_coverage["result_records"] or 0) if detail_coverage else 0,
+        }
+        return DiagnosticsReport(
+            errors=[dict(row) for row in errors],
+            rejections=[dict(row) for row in rejections],
+            model_validations=[dict(row) for row in model_validations],
+            main_errors=int(counts["main_errors"] or 0),
+            detail_errors=int(counts["detail_errors"] or 0),
+            main_rejections=int(counts["main_rejections"] or 0),
+            detail_rejections=int(counts["detail_rejections"] or 0),
+            quick_check=quick_check,
+            foreign_key_errors=foreign_key_errors,
+            duplicate_contracts=duplicate_contracts,
+            coverage=coverage,
         )
 
     def search_contracts(self, query: str = "", *, limit: int = 100) -> list[dict[str, Any]]:

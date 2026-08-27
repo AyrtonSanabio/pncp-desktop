@@ -158,7 +158,7 @@ duplicadas e zero referências estrangeiras quebradas.
 
 ## Testes e limites
 
-A suíte total possui **18 testes**. A parte de detalhes cobre:
+A suíte total possui **25 testes**. A parte de detalhes cobre:
 
 - pausa entre item e resultado;
 - idempotência de item e resultado;
