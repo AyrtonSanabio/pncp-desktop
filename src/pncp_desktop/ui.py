@@ -5,14 +5,19 @@ import contextlib
 import os
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Any
 
 from PySide6.QtCore import QDate, Qt, QThread, Signal
 from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontDatabase
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QDateEdit,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -23,14 +28,18 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from pncp_desktop.app_paths import default_database_path
 from pncp_desktop.exportacao import exportar_contratos_csv
+from pncp_desktop.local_database import LocalDatabase
 from pncp_desktop.models import (
     ContratoLinha,
     FiltrosConsulta,
@@ -38,6 +47,9 @@ from pncp_desktop.models import (
     formatar_valor,
 )
 from pncp_desktop.services import ErroConsulta, ServicoConsultaContratos
+from pncp_desktop.sync_worker import SyncTaskThread
+from pncp_sync.config import SyncConfig
+from pncp_sync.domain.models import DetailRunSummary, PlanSummary, RunSummary, SyncWindow
 
 
 class ConsultaThread(QThread):
@@ -87,13 +99,189 @@ class ConsultaThread(QThread):
                 loop.call_soon_threadsafe(task.cancel)
 
 
+def formatar_bytes(value: int) -> str:
+    size = float(max(value, 0))
+    for suffix in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or suffix == "TB":
+            return f"{size:.1f} {suffix}" if suffix != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def _display(value: Any) -> str:
+    if value is None or value == "":
+        return "Não informado"
+    if isinstance(value, bool):
+        return "Sim" if value else "Não"
+    return str(value)
+
+
+class ContractDetailDialog(QDialog):
+    def __init__(self, detail: dict[str, Any], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Detalhes da contratação")
+        self.resize(1050, 700)
+        layout = QVBoxLayout(self)
+        tabs = QTabWidget()
+        contract = detail["contratacao"]
+        tabs.addTab(self._form_tab(self._general_fields(contract)), "Dados gerais")
+        tabs.addTab(self._form_tab(self._extra_fields(contract)), "Campos adicionais")
+        tabs.addTab(self._items_tab(detail["itens"]), "Itens e fornecedores")
+        layout.addWidget(tabs, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    @staticmethod
+    def _form_tab(fields: tuple[tuple[str, Any], ...]) -> QWidget:
+        content = QWidget()
+        form = QFormLayout(content)
+        form.setContentsMargins(20, 20, 20, 20)
+        form.setHorizontalSpacing(24)
+        form.setVerticalSpacing(12)
+        for name, value in fields:
+            label = QLabel(_display(value))
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            if isinstance(value, str) and value.startswith(("https://", "http://")):
+                label.setText(f'<a href="{value}">{value}</a>')
+                label.setOpenExternalLinks(True)
+            form.addRow(f"{name}:", label)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(content)
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.addWidget(scroll)
+        return page
+
+    @staticmethod
+    def _general_fields(contract: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
+        return (
+            ("Identificador PNCP", contract.get("numero_controle_pncp")),
+            ("Número da compra", contract.get("numero_compra")),
+            ("Processo", contract.get("processo")),
+            ("Objeto", contract.get("objeto_compra")),
+            ("Informação complementar", contract.get("informacao_complementar")),
+            ("Órgão comprador", contract.get("orgao_razao_social")),
+            ("CNPJ do órgão", contract.get("orgao_cnpj")),
+            ("Unidade", contract.get("unidade_nome")),
+            ("Modalidade", contract.get("modalidade_nome")),
+            ("Valor estimado", contract.get("valor_total_estimado")),
+            ("Valor homologado", contract.get("valor_total_homologado")),
+            ("Publicação no PNCP", contract.get("data_publicacao_pncp")),
+        )
+
+    @staticmethod
+    def _extra_fields(contract: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
+        return (
+            ("Situação", contract.get("situacao_compra_nome")),
+            ("Modo de disputa", contract.get("modo_disputa_nome")),
+            ("Instrumento convocatório", contract.get("tipo_instrumento_nome")),
+            ("Amparo legal", contract.get("amparo_legal_nome")),
+            ("Descrição do amparo", contract.get("amparo_legal_descricao")),
+            ("Abertura das propostas", contract.get("data_abertura_proposta")),
+            ("Encerramento das propostas", contract.get("data_encerramento_proposta")),
+            ("Data de inclusão", contract.get("data_inclusao")),
+            ("Data de atualização", contract.get("data_atualizacao")),
+            ("Poder", contract.get("orgao_poder_id")),
+            ("Esfera", contract.get("orgao_esfera_id")),
+            ("Código da unidade", contract.get("unidade_codigo")),
+            ("Município", contract.get("municipio_nome")),
+            ("UF", contract.get("uf_nome") or contract.get("uf_sigla")),
+            ("Código IBGE", contract.get("codigo_ibge")),
+            ("Sistema de origem", contract.get("link_sistema_origem")),
+            ("Processo eletrônico", contract.get("link_processo_eletronico")),
+            ("Justificativa presencial", contract.get("justificativa_presencial")),
+            ("Fontes orçamentárias", contract.get("fontes_orcamentarias_json")),
+            ("Emenda parlamentar", contract.get("emenda_parlamentar_json")),
+            ("Órgão sub-rogado", contract.get("orgao_subrogado_json")),
+            ("Unidade sub-rogada", contract.get("unidade_subrogada_json")),
+            ("Usuário publicador", contract.get("usuario_nome")),
+        )
+
+    @staticmethod
+    def _items_tab(items: list[dict[str, Any]]) -> QWidget:
+        columns = (
+            "Item",
+            "Descrição",
+            "Quantidade",
+            "Unidade",
+            "Valor estimado",
+            "Fornecedor",
+            "CPF/CNPJ",
+            "Valor homologado",
+            "Município/UF",
+        )
+        rows: list[tuple[Any, ...]] = []
+        for item in items:
+            results = item.get("resultados") or [None]
+            for result in results:
+                result = result or {}
+                locality = "/".join(
+                    part
+                    for part in (
+                        result.get("fornecedor_municipio_nome"),
+                        result.get("fornecedor_uf_sigla"),
+                    )
+                    if part
+                )
+                rows.append(
+                    (
+                        item.get("numero_item"),
+                        item.get("descricao"),
+                        item.get("quantidade"),
+                        item.get("unidade_medida"),
+                        item.get("valor_unitario_estimado"),
+                        result.get("fornecedor_nome"),
+                        result.get("ni_fornecedor"),
+                        result.get("valor_unitario_homologado"),
+                        locality,
+                    )
+                )
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        info = QLabel(
+            f"{len(items)} item(ns). Fornecedores aparecem quando o PNCP já publicou resultados."
+        )
+        info.setObjectName("muted")
+        layout.addWidget(info)
+        table = QTableWidget(len(rows), len(columns))
+        table.setHorizontalHeaderLabels(columns)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+        for row_index, values in enumerate(rows):
+            for column_index, value in enumerate(values):
+                cell = QTableWidgetItem(_display(value))
+                cell.setToolTip(_display(value))
+                table.setItem(row_index, column_index, cell)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(table, 1)
+        if not rows:
+            empty = QLabel("Nenhum item foi sincronizado para esta contratação.")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(empty)
+        return page
+
+
 class MainWindow(QMainWindow):
     COLUNAS = ("Número", "Órgão", "Objeto", "Fornecedor", "Valor", "Vigência")
 
-    def __init__(self) -> None:
+    def __init__(self, db_path: Path | None = None) -> None:
         super().__init__()
         self._worker: ConsultaThread | None = None
         self._contratos: tuple[ContratoLinha, ...] = ()
+        self._db_path = Path(db_path or default_database_path()).expanduser().resolve()
+        self._local_database = LocalDatabase(self._db_path)
+        self._sync_worker: SyncTaskThread | None = None
+        self._sync_run_id: str | None = None
+        self._detail_run_id: str | None = None
+        self._sync_plan: PlanSummary | None = None
 
         self.setWindowTitle("Consulta PNCP Desktop")
         self.setMinimumSize(1100, 700)
@@ -119,11 +307,13 @@ class MainWindow(QMainWindow):
         cabecalho_layout.addWidget(subtitulo)
         raiz.addWidget(cabecalho)
 
+        self.abas = QTabWidget()
+        raiz.addWidget(self.abas, 1)
         conteudo = QWidget()
         conteudo_layout = QVBoxLayout(conteudo)
         conteudo_layout.setContentsMargins(28, 24, 28, 24)
         conteudo_layout.setSpacing(18)
-        raiz.addWidget(conteudo, 1)
+        self.abas.addTab(conteudo, "Consulta online")
 
         filtros = QFrame(objectName="cartao")
         filtros_layout = QGridLayout(filtros)
@@ -263,6 +453,7 @@ class MainWindow(QMainWindow):
         self.tabela.setAlternatingRowColors(True)
         self.tabela.verticalHeader().setVisible(False)
         self.tabela.setWordWrap(False)
+        self.tabela.cellDoubleClicked.connect(self.abrir_detalhe_online)
         header = self.tabela.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -276,6 +467,403 @@ class MainWindow(QMainWindow):
         rodape.setObjectName("rodape")
         rodape.setAlignment(Qt.AlignmentFlag.AlignCenter)
         conteudo_layout.addWidget(rodape)
+        self.abas.addTab(self._criar_aba_sincronizacao(), "Sincronização")
+        self.abas.addTab(self._criar_aba_banco_local(), "Banco local")
+        self.abas.currentChanged.connect(self._aba_trocada)
+
+    def _criar_aba_sincronizacao(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(16)
+
+        filters = QFrame(objectName="cartao")
+        grid = QGridLayout(filters)
+        grid.setContentsMargins(22, 18, 22, 20)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(9)
+        title = QLabel("Planejar e sincronizar dados do PNCP")
+        title.setObjectName("tituloCartao")
+        grid.addWidget(title, 0, 0, 1, 6)
+
+        today = date.today()
+        self.sync_data_inicial = QDateEdit()
+        self.sync_data_inicial.setCalendarPopup(True)
+        self.sync_data_inicial.setDisplayFormat("dd/MM/yyyy")
+        self.sync_data_inicial.setDate(QDate(today.year, today.month, today.day).addDays(-1))
+        self.sync_data_inicial.setToolTip(
+            "Data inicial de publicação usada para buscar contratações."
+        )
+        self.sync_data_final = QDateEdit()
+        self.sync_data_final.setCalendarPopup(True)
+        self.sync_data_final.setDisplayFormat("dd/MM/yyyy")
+        self.sync_data_final.setDate(QDate(today.year, today.month, today.day))
+        self.sync_data_final.setToolTip("Data final de publicação usada para buscar contratações.")
+        self.sync_modalidade = QSpinBox()
+        self.sync_modalidade.setRange(1, 999)
+        self.sync_modalidade.setValue(12)
+        self.sync_modalidade.setToolTip("Código da modalidade de contratação no PNCP.")
+        for column, (name, widget) in enumerate(
+            (
+                ("Data inicial", self.sync_data_inicial),
+                ("Data final", self.sync_data_final),
+                ("Modalidade", self.sync_modalidade),
+            )
+        ):
+            label = QLabel(name)
+            label.setToolTip(widget.toolTip())
+            grid.addWidget(label, 1, column)
+            grid.addWidget(widget, 2, column)
+
+        self.incluir_detalhes = QCheckBox("Baixar itens e fornecedores")
+        self.incluir_detalhes.setChecked(True)
+        self.incluir_detalhes.setToolTip(
+            "Depois das contratações, consulta itens e resultados publicados pelo PNCP."
+        )
+        grid.addWidget(self.incluir_detalhes, 2, 3, 1, 2)
+        self.botao_estimar = QPushButton("Estimar")
+        self.botao_estimar.setObjectName("secundario")
+        self.botao_estimar.setToolTip("Consulta uma página e estima volume, espaço e páginas.")
+        self.botao_estimar.clicked.connect(self.estimar_sincronizacao)
+        self.botao_sincronizar = QPushButton("Sincronizar")
+        self.botao_sincronizar.setObjectName("primario")
+        self.botao_sincronizar.setEnabled(False)
+        self.botao_sincronizar.clicked.connect(self.iniciar_sincronizacao)
+        self.botao_pausar = QPushButton("Pausar")
+        self.botao_pausar.setObjectName("perigo")
+        self.botao_pausar.setEnabled(False)
+        self.botao_pausar.clicked.connect(self.pausar_sincronizacao)
+        self.botao_continuar = QPushButton("Continuar")
+        self.botao_continuar.setObjectName("secundario")
+        self.botao_continuar.setEnabled(False)
+        self.botao_continuar.clicked.connect(self.continuar_sincronizacao)
+        botoes = QHBoxLayout()
+        for button in (
+            self.botao_estimar,
+            self.botao_sincronizar,
+            self.botao_pausar,
+            self.botao_continuar,
+        ):
+            botoes.addWidget(button)
+        grid.addLayout(botoes, 2, 5)
+        grid.setColumnStretch(3, 1)
+        grid.setColumnStretch(4, 1)
+        layout.addWidget(filters)
+
+        status = QFrame(objectName="statusFrame")
+        status_layout = QVBoxLayout(status)
+        status_layout.setContentsMargins(16, 12, 16, 12)
+        self.sync_status_label = QLabel("Estime uma janela para preparar uma sincronização.")
+        self.sync_status_label.setObjectName("statusTexto")
+        self.sync_progresso = QProgressBar()
+        self.sync_progresso.setRange(0, 1)
+        self.sync_progresso.setValue(0)
+        self.sync_progresso.setVisible(False)
+        self.sync_metricas = QLabel("Nenhuma execução planejada.")
+        self.sync_metricas.setObjectName("muted")
+        status_layout.addWidget(self.sync_status_label)
+        status_layout.addWidget(self.sync_progresso)
+        status_layout.addWidget(self.sync_metricas)
+        layout.addWidget(status)
+
+        explanation = QLabel(
+            "A sincronização é somente leitura. O payload original é preservado no banco local; "
+            "Ctrl+C não é necessário, use Pausar para liberar a unidade atual com segurança."
+        )
+        explanation.setWordWrap(True)
+        explanation.setObjectName("muted")
+        layout.addWidget(explanation)
+        layout.addStretch(1)
+        return page
+
+    def _criar_aba_banco_local(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(16)
+        top = QFrame(objectName="cartao")
+        top_layout = QVBoxLayout(top)
+        top_layout.setContentsMargins(18, 16, 18, 16)
+        title = QLabel("Banco local")
+        title.setObjectName("tituloCartao")
+        top_layout.addWidget(title)
+        controls = QHBoxLayout()
+        self.local_busca = QLineEdit()
+        self.local_busca.setPlaceholderText("Pesquise por objeto, órgão, item ou fornecedor")
+        self.local_busca.setToolTip("Busca textual no índice local FTS5.")
+        self.local_busca.returnPressed.connect(self.pesquisar_banco_local)
+        self.botao_buscar_local = QPushButton("Pesquisar")
+        self.botao_buscar_local.setObjectName("primario")
+        self.botao_buscar_local.clicked.connect(self.pesquisar_banco_local)
+        self.botao_atualizar_local = QPushButton("Atualizar")
+        self.botao_atualizar_local.setObjectName("secundario")
+        self.botao_atualizar_local.clicked.connect(self.carregar_banco_local)
+        controls.addWidget(self.local_busca, 1)
+        controls.addWidget(self.botao_buscar_local)
+        controls.addWidget(self.botao_atualizar_local)
+        top_layout.addLayout(controls)
+        self.local_status = QLabel("Nenhuma base local carregada.")
+        self.local_status.setObjectName("muted")
+        top_layout.addWidget(self.local_status)
+        layout.addWidget(top)
+
+        self.tabela_local = QTableWidget(0, 7)
+        self.tabela_local.setHorizontalHeaderLabels(
+            (
+                "Identificador PNCP",
+                "Órgão",
+                "Objeto",
+                "Modalidade",
+                "Situação",
+                "Encerramento",
+                "Valor estimado",
+            )
+        )
+        self.tabela_local.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tabela_local.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tabela_local.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tabela_local.setAlternatingRowColors(True)
+        self.tabela_local.verticalHeader().setVisible(False)
+        header = self.tabela_local.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.tabela_local.cellDoubleClicked.connect(self.abrir_detalhe_local)
+        layout.addWidget(self.tabela_local, 1)
+        return page
+
+    def _aba_trocada(self, index: int) -> None:
+        if self.abas.tabText(index) == "Banco local":
+            self.carregar_banco_local()
+
+    def _sync_config(self) -> SyncConfig:
+        return SyncConfig(db_path=self._db_path)
+
+    def _sync_window(self) -> SyncWindow:
+        return SyncWindow(
+            data_inicial=self.sync_data_inicial.date().toPython(),
+            data_final=self.sync_data_final.date().toPython(),
+            modalidade=self.sync_modalidade.value(),
+        )
+
+    def estimar_sincronizacao(self) -> None:
+        if self._sync_worker is not None and self._sync_worker.isRunning():
+            return
+        try:
+            self._sync_window().validate(max_days=self._sync_config().max_window_days)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Filtros inválidos", str(exc))
+            return
+        self._sync_run_id = None
+        self._detail_run_id = None
+        self._sync_plan = None
+        self._set_sync_busy(True, planning=True)
+        self.sync_status_label.setText("Consultando uma página para estimar a carga…")
+        worker = SyncTaskThread(
+            self._sync_config(), action="plan", window=self._sync_window(), parent=self
+        )
+        self._connect_sync_worker(worker)
+        self._sync_worker = worker
+        worker.start()
+
+    def iniciar_sincronizacao(self) -> None:
+        if not self._sync_run_id or (
+            self._sync_worker is not None and self._sync_worker.isRunning()
+        ):
+            return
+        self._executar_sincronizacao()
+
+    def continuar_sincronizacao(self) -> None:
+        if self._sync_run_id and (self._sync_worker is None or not self._sync_worker.isRunning()):
+            self._executar_sincronizacao()
+
+    def _executar_sincronizacao(self) -> None:
+        self._set_sync_busy(True)
+        self.sync_status_label.setText("Sincronização em andamento…")
+        worker = SyncTaskThread(
+            self._sync_config(),
+            action="run",
+            run_id=self._sync_run_id,
+            detail_run_id=self._detail_run_id,
+            include_details=self.incluir_detalhes.isChecked(),
+            parent=self,
+        )
+        self._connect_sync_worker(worker)
+        self._sync_worker = worker
+        worker.start()
+
+    def _connect_sync_worker(self, worker: SyncTaskThread) -> None:
+        worker.planned.connect(self._sync_planejado)
+        worker.detail_planned.connect(self._detalhes_planejados)
+        worker.progress.connect(self._sync_progresso)
+        worker.completed.connect(self._sync_concluido)
+        worker.paused.connect(self._sync_pausado)
+        worker.failed.connect(self._sync_falhou)
+        worker.finished.connect(self._sync_finalizado)
+
+    def pausar_sincronizacao(self) -> None:
+        if self._sync_worker is not None and self._sync_worker.isRunning():
+            self.sync_status_label.setText("Pausando após liberar a unidade atual…")
+            self.botao_pausar.setEnabled(False)
+            self._sync_worker.pause()
+
+    def _sync_planejado(self, summary: PlanSummary) -> None:
+        self._sync_plan = summary
+        self._sync_run_id = summary.run_id
+        self.sync_progresso.setRange(0, max(1, summary.total_pages))
+        self.sync_progresso.setValue(0)
+        self.sync_metricas.setText(
+            f"{summary.total_records} registros • {summary.total_pages} páginas • "
+            f"download estimado {formatar_bytes(summary.estimated_download_bytes)} • "
+            f"banco estimado {formatar_bytes(summary.estimated_database_bytes)}"
+        )
+        extras = ", ".join(summary.unmodeled_fields[:5])
+        suffix = f" Campos extras: {extras}." if extras else ""
+        self.sync_status_label.setText(f"Estimativa pronta. Run ID: {summary.run_id}.{suffix}")
+        self.botao_sincronizar.setEnabled(True)
+        self.botao_continuar.setEnabled(False)
+
+    def _detalhes_planejados(self, detail_run_id: str) -> None:
+        self._detail_run_id = detail_run_id
+        self.sync_status_label.setText("Contratações concluídas; baixando itens e fornecedores…")
+
+    def _sync_progresso(self, resource: str, summary: RunSummary | DetailRunSummary) -> None:
+        if resource == "contratacoes":
+            done = summary.succeeded_units + summary.partial_units
+            total = max(1, summary.planned_units)
+            self.sync_progresso.setRange(0, total)
+            self.sync_progresso.setValue(min(done, total))
+            self.sync_metricas.setText(
+                f"Contratações: {done}/{total} páginas • {summary.records_received} registros • "
+                f"{formatar_bytes(summary.bytes_received)} recebidos"
+            )
+        else:
+            done = summary.succeeded_units + summary.partial_units
+            total = max(1, summary.planned_units)
+            self.sync_progresso.setRange(0, total)
+            self.sync_progresso.setValue(min(done, total))
+            self.sync_metricas.setText(
+                f"Detalhes: {done}/{total} unidades • {summary.item_records} itens • "
+                f"{summary.result_records} resultados • {formatar_bytes(summary.bytes_received)}"
+            )
+
+    def _sync_concluido(self, main: RunSummary, details: DetailRunSummary | None) -> None:
+        self._render_sync_result(main, details, "Sincronização concluída.")
+        self.carregar_banco_local()
+
+    def _sync_pausado(self, main: RunSummary | None, details: DetailRunSummary | None) -> None:
+        if main is not None:
+            self._render_sync_result(
+                main, details, "Sincronização pausada. Use Continuar para retomar."
+            )
+        else:
+            self.sync_status_label.setText("Sincronização pausada.")
+        self.botao_continuar.setEnabled(self._sync_run_id is not None)
+
+    def _render_sync_result(
+        self,
+        main: RunSummary,
+        details: DetailRunSummary | None,
+        prefix: str,
+    ) -> None:
+        detail_text = ""
+        if details is not None:
+            detail_text = f" • {details.item_records} itens • {details.result_records} resultados"
+        self.sync_status_label.setText(f"{prefix} Status: {main.status}{detail_text}")
+        self.sync_metricas.setText(
+            f"Contratações recebidas: {main.records_received} • novas: {main.records_inserted} • "
+            f"alteradas: {main.records_updated} • inalteradas: {main.records_unchanged} • "
+            f"{formatar_bytes(main.bytes_received)}"
+        )
+        self.sync_progresso.setRange(0, max(1, main.planned_units))
+        self.sync_progresso.setValue(
+            min(main.succeeded_units + main.partial_units, main.planned_units)
+        )
+
+    def _sync_falhou(self, mensagem: str, detalhe: str) -> None:
+        self.sync_status_label.setText(mensagem)
+        self.sync_status_label.setToolTip(detalhe)
+        self.botao_continuar.setEnabled(self._sync_run_id is not None)
+
+    def _sync_finalizado(self) -> None:
+        worker = self._sync_worker
+        self._sync_worker = None
+        self._set_sync_busy(False)
+        if worker is not None:
+            worker.deleteLater()
+
+    def _set_sync_busy(self, busy: bool, *, planning: bool = False) -> None:
+        self.sync_progresso.setVisible(busy)
+        self.botao_estimar.setEnabled(not busy)
+        self.botao_sincronizar.setEnabled(
+            not busy and self._sync_run_id is not None and not planning
+        )
+        self.botao_pausar.setEnabled(busy and not planning)
+        self.botao_continuar.setEnabled(not busy and self._sync_run_id is not None and not planning)
+        self.sync_data_inicial.setEnabled(not busy)
+        self.sync_data_final.setEnabled(not busy)
+        self.sync_modalidade.setEnabled(not busy)
+        self.incluir_detalhes.setEnabled(not busy)
+
+    def carregar_banco_local(self) -> None:
+        try:
+            rows = self._local_database.search_contracts(self.local_busca.text())
+            stats = self._local_database.stats()
+        except Exception as exc:
+            self.local_status.setText(f"Banco local indisponível: {exc}")
+            self.tabela_local.setRowCount(0)
+            return
+        self.tabela_local.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            values = (
+                row.get("numero_controle_pncp"),
+                row.get("orgao_razao_social"),
+                row.get("objeto_compra"),
+                row.get("modalidade_nome"),
+                row.get("situacao_compra_nome"),
+                row.get("data_encerramento_proposta"),
+                row.get("valor_total_estimado"),
+            )
+            for column_index, value in enumerate(values):
+                cell = QTableWidgetItem(_display(value))
+                cell.setToolTip(_display(value))
+                if column_index == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, row.get("id"))
+                self.tabela_local.setItem(row_index, column_index, cell)
+        self.local_status.setText(
+            f"{len(rows)} exibida(s) • banco: {stats.contracts} contratações, "
+            f"{stats.items} itens, {stats.results} resultados • {formatar_bytes(stats.bytes_used)}"
+        )
+
+    def pesquisar_banco_local(self) -> None:
+        self.carregar_banco_local()
+
+    def abrir_detalhe_local(self, row: int, _: int) -> None:
+        cell = self.tabela_local.item(row, 0)
+        if cell is None:
+            return
+        contract_id = cell.data(Qt.ItemDataRole.UserRole)
+        if contract_id is None:
+            return
+        try:
+            detail = self._local_database.contract_detail(int(contract_id))
+        except Exception as exc:
+            QMessageBox.warning(self, "Detalhe indisponível", str(exc))
+            return
+        ContractDetailDialog(detail, self).exec()
+
+    def abrir_detalhe_online(self, row: int, _: int) -> None:
+        cell = self.tabela.item(row, 0)
+        if cell is None:
+            return
+        numero_controle = cell.data(Qt.ItemDataRole.UserRole)
+        if not numero_controle:
+            return
+        try:
+            detail = self._local_database.contract_detail_by_control(numero_controle)
+        except ValueError as exc:
+            QMessageBox.information(self, "Detalhe local", str(exc))
+            return
+        ContractDetailDialog(detail, self).exec()
 
     def _aplicar_estilo(self) -> None:
         self.setFont(QFont("Segoe UI", 10))
@@ -444,6 +1032,8 @@ class MainWindow(QMainWindow):
                     )
                 if linha % 2:
                     item.setBackground(QColor("#f8fbfd"))
+                if coluna == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, contrato.identificador_pncp)
                 item.setToolTip(valor)
                 self.tabela.setItem(linha, coluna, item)
         self.tabela.setSortingEnabled(True)
@@ -472,6 +1062,12 @@ class MainWindow(QMainWindow):
             self._worker.cancelar()
             if not self._worker.wait(5000):
                 self.status_label.setText("Aguardando o encerramento seguro da consulta…")
+                event.ignore()
+                return
+        if self._sync_worker is not None and self._sync_worker.isRunning():
+            self._sync_worker.pause()
+            if not self._sync_worker.wait(5000):
+                self.sync_status_label.setText("Aguardando o encerramento seguro da sincronização…")
                 event.ignore()
                 return
         event.accept()

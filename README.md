@@ -34,8 +34,21 @@ Embora a conversa use a palavra “scraper”, o caminho principal será consumi
 - cobertura ampla de itens/resultados, contratos, atas, atualização incremental e índice
   vetorial ainda pendentes.
 
-O `run.bat` continua abrindo apenas o protótipo anterior. A carga persistente é operada
-separadamente pelo comando `pncp-sync`.
+O `run.bat` abre a interface integrada, com as áreas Consulta online, Sincronização e
+Banco local. A interface mostra estimativa, progresso, pausa/continuação, detalhes de
+contratações, itens e fornecedores, além de pesquisa textual local.
+
+## Executável para Windows
+
+Com Python instalado apenas na máquina de desenvolvimento, gere o pacote portátil:
+
+```powershell
+.\build_exe.bat
+```
+
+O resultado é `dist\\ConsultaPNCP.exe`. Para distribuir, copie o executável para uma
+pasta com permissão de escrita; o banco será criado em `data\\pncp.sqlite3` ao lado dele.
+O usuário final não precisa instalar Python nem abrir um terminal.
 
 ## Executar a primeira fatia
 

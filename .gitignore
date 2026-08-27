@@ -8,8 +8,11 @@ __pycache__/
 htmlcov/
 build/
 dist/
+build-*/
+dist-*/
 *.egg-info/
 *.spec
+!pncp-desktop.spec
 *.log
 *.csv
 *.xlsx
