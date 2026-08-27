@@ -1422,7 +1422,28 @@ class MainWindow(QMainWindow):
 
     def _render_semantic_results(self, result: object) -> None:
         rows = result if isinstance(result, list) else []
-        self.manutencao_status.setText(f"Busca por similaridade: {len(rows)} resultado(s).")
+        self._local_rows = rows
+        self.tabela_local.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            values = (
+                row.get("numero_controle_pncp"),
+                row.get("orgao_razao_social"),
+                row.get("objeto_compra"),
+                "similaridade",
+                row.get("score"),
+                "",
+                "",
+            )
+            for column_index, value in enumerate(values):
+                cell = QTableWidgetItem(_display(value))
+                cell.setToolTip(_display(value))
+                if column_index == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, row.get("contratacao_id"))
+                self.tabela_local.setItem(row_index, column_index, cell)
+        self.local_status.setText(
+            f"Busca por similaridade: {len(rows)} resultado(s). "
+            "A pontuação é relativa; confirme o edital no portal oficial."
+        )
 
     def verificar_integridade(self) -> None:
         self._queue_database_task("quick_check")
