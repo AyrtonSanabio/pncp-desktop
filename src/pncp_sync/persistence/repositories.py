@@ -15,6 +15,7 @@ from uuid import uuid4
 from pncp_sync import __version__
 from pncp_sync.domain.models import (
     CapturedResponse,
+    PlanSummary,
     RunSummary,
     SourcePage,
     SyncWindow,
@@ -257,6 +258,114 @@ class SyncRepository:
             )
         return run_id
 
+    def find_reusable_plan(self, window: SyncWindow) -> PlanSummary | None:
+        """Reabre uma estimativa persistida sem consultar novamente o PNCP."""
+        row = self.connection.execute(
+            """SELECT r.*, c.planned_pages
+               FROM ingestion_run r
+               JOIN coverage c ON c.run_id=r.id
+               WHERE r.resource='contratacoes_publicacao'
+                 AND r.data_inicial=? AND r.data_final=? AND r.modalidade=?
+                 AND r.status='PLANNED' AND r.collector_version=?
+                 AND NOT EXISTS (
+                     SELECT 1 FROM work_unit w
+                     WHERE w.run_id=r.id AND w.status!='PENDING'
+                 )
+               ORDER BY r.created_at DESC LIMIT 1""",
+            (
+                window.data_inicial.isoformat(),
+                window.data_final.isoformat(),
+                window.modalidade,
+                __version__,
+            ),
+        ).fetchone()
+        if row is None:
+            return None
+        unit_row = self.connection.execute(
+            "SELECT * FROM work_unit WHERE run_id=? AND page_number=1 LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        if unit_row is None:
+            return None
+        work_unit = WorkUnit(
+            id=int(unit_row["id"]),
+            run_id=str(unit_row["run_id"]),
+            resource=str(unit_row["resource"]),
+            data_inicial=date.fromisoformat(unit_row["data_inicial"]),
+            data_final=date.fromisoformat(unit_row["data_final"]),
+            modalidade=int(unit_row["modalidade"]),
+            page_number=int(unit_row["page_number"]),
+            attempt_count=int(unit_row["attempt_count"]),
+        )
+        probe = self.load_probe(work_unit)
+        if probe is None:
+            return None
+        _, first_page = probe
+        planned_pages = max(1, int(row["planned_pages"]))
+        remaining = max(0, planned_pages - 1)
+        seconds_per_page = max(first_page.response.latency_ms / 1000, 0.25)
+        estimated_seconds = max(
+            1.0,
+            remaining * seconds_per_page * 1.35 + first_page.total_records * 0.002,
+        )
+        return PlanSummary(
+            run_id=str(row["id"]),
+            total_pages=planned_pages,
+            total_records=first_page.total_records,
+            first_page_records=first_page.record_count,
+            first_page_bytes=len(first_page.response.content),
+            estimated_download_bytes=int(row["estimated_download_bytes"]),
+            estimated_database_bytes=int(row["estimated_database_bytes"]),
+            free_disk_bytes=int(row["free_disk_bytes_at_plan"]),
+            unmodeled_fields=tuple(json.loads(row["unmodeled_fields_json"])),
+            first_page_latency_ms=first_page.response.latency_ms,
+            remaining_main_requests=remaining,
+            estimated_main_seconds=estimated_seconds,
+            minimum_detail_requests=first_page.total_records,
+            reused=True,
+        )
+
+    def find_completed_run(self, window: SyncWindow) -> str | None:
+        """Retorna cobertura integral já confirmada para o recorte exato."""
+        row = self.connection.execute(
+            """SELECT r.id
+               FROM ingestion_run r
+               JOIN coverage c ON c.run_id=r.id
+               WHERE r.resource='contratacoes_publicacao'
+                 AND r.data_inicial=? AND r.data_final=? AND r.modalidade=?
+                 AND r.status IN ('COMPLETED','COMPLETED_WITH_REJECTIONS')
+                 AND c.processed_pages=c.planned_pages
+               ORDER BY r.finished_at DESC LIMIT 1""",
+            (
+                window.data_inicial.isoformat(),
+                window.data_final.isoformat(),
+                window.modalidade,
+            ),
+        ).fetchone()
+        return str(row["id"]) if row else None
+
+    def find_resumable_run(self, window: SyncWindow) -> str | None:
+        """Localiza o checkpoint incompleto mais recente do recorte."""
+        row = self.connection.execute(
+            """SELECT r.id
+               FROM ingestion_run r
+               WHERE r.resource='contratacoes_publicacao'
+                 AND r.data_inicial=? AND r.data_final=? AND r.modalidade=?
+                 AND r.status IN ('PLANNED','RUNNING','PAUSED','FAILED')
+                 AND EXISTS (
+                     SELECT 1 FROM work_unit w
+                     WHERE w.run_id=r.id
+                       AND w.status IN ('PENDING','RUNNING','RETRY_WAIT','FAILED')
+                 )
+               ORDER BY r.created_at DESC LIMIT 1""",
+            (
+                window.data_inicial.isoformat(),
+                window.data_final.isoformat(),
+                window.modalidade,
+            ),
+        ).fetchone()
+        return str(row["id"]) if row else None
+
     def discard_unused_plan(self, run_id: str) -> bool:
         """Remove somente uma estimativa que nunca iniciou qualquer unidade."""
         with self._transaction() as cursor:
@@ -332,7 +441,16 @@ class SyncRepository:
         content = gzip.decompress(row["content_gzip"])
         if hashlib.sha256(content).hexdigest() != row["content_sha256"]:
             raise RuntimeError(f"Payload {row['id']} falhou na verificação SHA-256.")
-        payload = json.loads(content)
+        if int(row["status_code"]) == 204 and not content:
+            payload = {
+                "data": [],
+                "numeroPagina": work_unit.page_number,
+                "totalPaginas": 0,
+                "totalRegistros": 0,
+                "paginasRestantes": 0,
+            }
+        else:
+            payload = json.loads(content)
         records = tuple(item for item in payload.get("data", []) if isinstance(item, dict))
         page = SourcePage(
             page_number=int(payload.get("numeroPagina", work_unit.page_number)),
@@ -800,6 +918,29 @@ class SyncRepository:
                 (run_id,),
             )
 
+    def recover_interrupted_units(self) -> int:
+        """Recupera checkpoints deixados como RUNNING por encerramento abrupto.
+
+        A aplicação desktop usa um único processo gravador. Ao reabrir o banco,
+        nenhuma unidade daquele processo anterior pode continuar executando; logo,
+        devolver RUNNING para PENDING é seguro e evita esperar a expiração do lease.
+        """
+        with self._transaction() as cursor:
+            cursor.execute(
+                """UPDATE work_unit
+                   SET status='PENDING', lease_until=NULL, finished_at=NULL
+                   WHERE status='RUNNING'"""
+            )
+            recovered = cursor.rowcount
+            if recovered:
+                cursor.execute(
+                    """UPDATE ingestion_run SET status='PAUSED', finished_at=NULL
+                       WHERE id IN (
+                           SELECT DISTINCT run_id FROM work_unit WHERE status='PENDING'
+                       ) AND status='RUNNING'"""
+                )
+            return recovered
+
     def retry_recoverable_units(self, run_id: str) -> int:
         """Reabre somente falhas cuja ocorrência mais recente foi marcada como recuperável."""
         with self._transaction() as cursor:
@@ -821,6 +962,15 @@ class SyncRepository:
                     (run_id,),
                 )
             return reopened
+
+    def latest_error(self, run_id: str) -> dict[str, Any] | None:
+        """Retorna a ocorrência mais recente para explicar uma espera automática."""
+        row = self.connection.execute(
+            """SELECT category,recoverable,message,detail,created_at
+               FROM ingestion_error WHERE run_id=? ORDER BY id DESC LIMIT 1""",
+            (run_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
 
     def finalize_run(self, run_id: str) -> str:
         summary = self.get_summary(run_id)

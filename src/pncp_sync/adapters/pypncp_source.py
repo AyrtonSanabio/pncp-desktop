@@ -80,6 +80,12 @@ class PypncpSource:
 
         requested_at = datetime.now(UTC).isoformat(timespec="milliseconds")
         started = perf_counter()
+        params = {
+            "dataInicial": window.data_inicial.strftime("%Y%m%d"),
+            "dataFinal": window.data_final.strftime("%Y%m%d"),
+            "codigoModalidadeContratacao": window.modalidade,
+            "pagina": page_number,
+        }
         http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(self._config.timeout_seconds),
             event_hooks={"response": [capture_response]},
@@ -91,12 +97,48 @@ class PypncpSource:
             max_concurrent=self._config.max_concurrent,
             http_client=http_client,
         )
-        async with client:
-            modeled_page = await client.contratacoes.list_publicacao(
-                data_inicial=window.data_inicial,
-                data_final=window.data_final,
-                codigo_modalidade=window.modalidade,
-                pagina=page_number,
+        try:
+            async with client:
+                modeled_page = await client.contratacoes.list_publicacao(
+                    data_inicial=window.data_inicial,
+                    data_final=window.data_final,
+                    codigo_modalidade=window.modalidade,
+                    pagina=page_number,
+                )
+        except json.JSONDecodeError as exc:
+            # O endpoint oficial usa 204 com corpo vazio para recortes sem dados.
+            # O pypncp tenta decodificar esse corpo como JSON; convertemos somente
+            # esse caso documentável em uma página vazia, preservando o HTTP bruto.
+            if not captured or captured[-1].status_code != 204:
+                status = captured[-1].status_code if captured else "desconhecido"
+                raise SourceError(
+                    f"O PNCP retornou corpo não JSON (HTTP {status})."
+                ) from exc
+            response = captured[-1]
+            latency_ms = (perf_counter() - started) * 1000
+            responded_at = datetime.now(UTC).isoformat(timespec="milliseconds")
+            headers = {
+                name: response.headers[name]
+                for name in _SAFE_RESPONSE_HEADERS
+                if name in response.headers
+            }
+            return SourcePage(
+                page_number=page_number,
+                total_pages=0,
+                total_records=0,
+                remaining_pages=0,
+                records=(),
+                request_params=params,
+                response=CapturedResponse(
+                    requested_at=requested_at,
+                    responded_at=responded_at,
+                    status_code=204,
+                    url=str(response.request.url),
+                    headers=headers,
+                    content=response.content,
+                    latency_ms=latency_ms,
+                ),
+                unmodeled_fields=(),
             )
         latency_ms = (perf_counter() - started) * 1000
         responded_at = datetime.now(UTC).isoformat(timespec="milliseconds")
@@ -117,12 +159,6 @@ class PypncpSource:
         if len(records) != len(modeled_page.data):
             raise SourceError("O modelo do pypncp descartou um registro inteiro da página.")
 
-        params = {
-            "dataInicial": window.data_inicial.strftime("%Y%m%d"),
-            "dataFinal": window.data_final.strftime("%Y%m%d"),
-            "codigoModalidadeContratacao": window.modalidade,
-            "pagina": page_number,
-        }
         headers = {
             name: response.headers[name]
             for name in _SAFE_RESPONSE_HEADERS

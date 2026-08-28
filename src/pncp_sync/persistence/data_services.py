@@ -339,6 +339,9 @@ class DataServices:
         for key, sql in mapping.items():
             value = filters.get(key)
             if value not in (None, ""):
+                if key == "orgao_cnpj":
+                    digits = "".join(character for character in str(value) if character.isdigit())
+                    value = digits or value
                 where.append(sql)
                 params.append(f"%{value}%" if key in {"orgao", "municipio"} else value)
         for key, op in (("valor_min", ">="), ("valor_max", "<=")):

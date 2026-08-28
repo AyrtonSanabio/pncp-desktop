@@ -6,11 +6,12 @@ import json
 import os
 import time
 from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QDate, QSettings, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontDatabase
+from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontDatabase, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -58,6 +60,7 @@ from pncp_sync.config import SyncConfig
 from pncp_sync.domain.models import (
     BatchPlanSummary,
     DetailRunSummary,
+    FullSyncProgress,
     PlanSummary,
     RunSummary,
     SyncWindow,
@@ -81,6 +84,10 @@ MODALIDADES = (
     (14, "Inaplicabilidade da Licitação"),
     (15, "Chamada pública"),
 )
+
+# O domínio do PNCP e os modelos do projeto aceitam contratações a partir de 2021.
+# O modo de carga completa divide esse intervalo em lotes seguros de até 31 dias.
+PNCP_HISTORY_START = date(2021, 1, 1)
 
 
 class ConsultaThread(QThread):
@@ -161,6 +168,33 @@ def _display(value: Any) -> str:
     return str(value)
 
 
+def _format_cnpj(value: Any) -> str:
+    text = "" if value is None else str(value).strip()
+    digits = "".join(character for character in text if character.isdigit())
+    if len(digits) != 14:
+        return _display(value)
+    return (
+        f"{digits[:2]}.{digits[2:5]}.{digits[5:8]}/"
+        f"{digits[8:12]}-{digits[12:]}"
+    )
+
+
+def _formatar_valor_local(value: Any) -> str:
+    if value is None or value == "":
+        return "Não informado"
+    text = str(value).strip()
+    if "," in text and "." in text:
+        text = text.replace(".", "").replace(",", ".")
+    else:
+        text = text.replace(",", ".")
+    try:
+        number = Decimal(text)
+    except (InvalidOperation, ValueError):
+        return _display(value)
+    formatted = f"{number:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
+    return f"R$ {formatted}"
+
+
 class ContractDetailDialog(QDialog):
     def __init__(self, detail: dict[str, Any], parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -213,8 +247,8 @@ class ContractDetailDialog(QDialog):
             ("CNPJ do órgão", contract.get("orgao_cnpj")),
             ("Unidade", contract.get("unidade_nome")),
             ("Modalidade", contract.get("modalidade_nome")),
-            ("Valor estimado", contract.get("valor_total_estimado")),
-            ("Valor homologado", contract.get("valor_total_homologado")),
+            ("Valor estimado", _formatar_valor_local(contract.get("valor_total_estimado"))),
+            ("Valor homologado", _formatar_valor_local(contract.get("valor_total_homologado"))),
             ("Publicação no PNCP", contract.get("data_publicacao_pncp")),
         )
 
@@ -278,10 +312,10 @@ class ContractDetailDialog(QDialog):
                         item.get("descricao"),
                         item.get("quantidade"),
                         item.get("unidade_medida"),
-                        item.get("valor_unitario_estimado"),
+                        _formatar_valor_local(item.get("valor_unitario_estimado")),
                         result.get("fornecedor_nome"),
                         result.get("ni_fornecedor"),
-                        result.get("valor_unitario_homologado"),
+                        _formatar_valor_local(result.get("valor_unitario_homologado")),
                         locality,
                     )
                 )
@@ -453,7 +487,8 @@ class MainWindow(QMainWindow):
         self._contratos: tuple[ContratoLinha, ...] = ()
         self._settings = QSettings("AyrtonSanabio", "PNCPDesktop")
         saved_path = self._settings.value("database_path", "", type=str)
-        selected_path = db_path or saved_path or default_database_path()
+        forced_path = os.environ.get("PNCP_DESKTOP_DB_PATH", "")
+        selected_path = db_path or forced_path or saved_path or default_database_path()
         self._db_path = Path(selected_path).expanduser().resolve()
         self._local_database = LocalDatabase(self._db_path)
         self._database_worker: DatabaseTaskThread | None = None
@@ -471,6 +506,7 @@ class MainWindow(QMainWindow):
         self._auto_sync_pending = False
         self._sync_started_monotonic: float | None = None
         self._sync_last_resource = ""
+        self._full_sync_progress: FullSyncProgress | None = None
         self._local_page = 1
         self._local_result_rows: list[dict[str, Any]] = []
         self._local_result_page: Page | None = None
@@ -480,9 +516,25 @@ class MainWindow(QMainWindow):
         self.resize(1280, 780)
         self._montar_interface()
         self._aplicar_estilo()
+        self._restaurar_execucoes_interrompidas()
         if self.sync_automatico.isChecked() and os.environ.get("QT_QPA_PLATFORM") != "offscreen":
             self._auto_sync_pending = True
             QTimer.singleShot(1200, self.atualizar_desde_ultima_execucao)
+
+    def _restaurar_execucoes_interrompidas(self) -> None:
+        """Expõe checkpoints pendentes assim que o banco principal é reaberto."""
+        recovered = self._local_database.recover_interrupted_units()
+        self._sync_run_ids = self._local_database.latest_resumable_runs()
+        self._sync_run_id = self._sync_run_ids[0] if self._sync_run_ids else None
+        self._sync_can_continue = bool(self._sync_run_ids)
+        if self._sync_can_continue:
+            self.sync_status_label.setText(
+                f"Foram encontradas {len(self._sync_run_ids)} execução(ões) interrompida(s). "
+                f"{recovered} lote(s) em andamento foram recuperados. Use Continuar para "
+                "retomar somente os lotes pendentes."
+            )
+            self.botao_continuar.setEnabled(True)
+            self._update_sync_action_feedback()
 
     def _montar_interface(self) -> None:
         central = QWidget()
@@ -573,12 +625,6 @@ class MainWindow(QMainWindow):
         self.botao_consultar.setObjectName("primario")
         self.botao_consultar.setToolTip("Executa a consulta usando os filtros preenchidos.")
         self.botao_consultar.clicked.connect(self.iniciar_consulta)
-        self.botao_demo = QPushButton("Ver demonstração")
-        self.botao_demo.setObjectName("secundario")
-        self.botao_demo.setToolTip(
-            "Carrega dados fictícios para visualizar a interface sem consultar a internet."
-        )
-        self.botao_demo.clicked.connect(self.carregar_demonstracao)
         self.botao_cancelar = QPushButton("Cancelar")
         self.botao_cancelar.setObjectName("perigo")
         self.botao_cancelar.setEnabled(False)
@@ -587,7 +633,6 @@ class MainWindow(QMainWindow):
 
         botoes = QHBoxLayout()
         botoes.setSpacing(9)
-        botoes.addWidget(self.botao_demo)
         botoes.addWidget(self.botao_cancelar)
         botoes.addWidget(self.botao_consultar)
         filtros_layout.addLayout(botoes, 2, 4, 1, 2)
@@ -598,7 +643,7 @@ class MainWindow(QMainWindow):
         status_layout = QHBoxLayout(status_frame)
         status_layout.setContentsMargins(16, 10, 16, 10)
         self.status_label = QLabel(
-            "Use “Ver demonstração” para conhecer a interface sem consultar a internet."
+            "Escolha um período e clique em Consultar PNCP. A consulta online não grava no banco local."
         )
         self.status_label.setObjectName("statusTexto")
         self.progresso = QProgressBar()
@@ -733,6 +778,24 @@ class MainWindow(QMainWindow):
         nav_layout.addLayout(nav_buttons)
         layout.addWidget(navigation)
 
+        local_areas = self._tutorial_card(
+            "Como usar as áreas do Banco local",
+            "Pesquisa — encontre no que já foi sincronizado usando texto, órgão, CNPJ, "
+            "município, fornecedor, modalidade, situação, valores e datas. Também permite "
+            "salvar filtros, paginar, copiar células e exportar a página encontrada ou todos "
+            "os resultados.\n\n"
+            "Histórico e alterações — mostra cada sincronização e compara o recorte recebido "
+            "com o que já existia: registros novos, alterados e não reencontrados. Um registro "
+            "ausente no recorte não deve ser tratado sozinho como exclusão oficial.\n\n"
+            "Análises — resume os dados que você coletou, como frequência de compras por órgão, "
+            "fornecedores vencedores e histórico de preços. A qualidade depende da cobertura "
+            "do seu banco.\n\n"
+            "Segurança e manutenção — verifica a integridade do SQLite, cria backup, mede "
+            "desempenho e importa somente dados novos de outro banco. Essas ações cuidam da "
+            "cópia local e não alteram o PNCP.",
+        )
+        layout.addWidget(local_areas)
+
         workflow = self._tutorial_card(
             "Primeiro teste recomendado",
             "1. Abra Sincronização e escolha um período de apenas um dia.\n"
@@ -754,7 +817,8 @@ class MainWindow(QMainWindow):
             "na primeira resposta. Itens e resultados exigem chamadas adicionais cuja "
             "quantidade só fica conhecida durante a coleta; por isso são mostrados como um "
             "mínimo, não como uma promessa exata. Internet, lentidão do PNCP e novas tentativas "
-            "podem aumentar bastante o tempo.",
+            "podem aumentar bastante o tempo. Na carga completa, falhas temporárias entram em "
+            "espera progressiva e são tentadas novamente até você usar Pausar.",
         )
         layout.addWidget(estimate)
 
@@ -866,6 +930,15 @@ class MainWindow(QMainWindow):
         self.incluir_atas.setToolTip(
             "Sincroniza dados estruturados de atas; documentos continuam apenas por link."
         )
+        self.sync_carga_completa = QCheckBox(
+            "Preparar carga completa: todas as datas e modalidades"
+        )
+        self.sync_carga_completa.setToolTip(
+            "Planeja todo o período desde 01/01/2021 até hoje, dividido em janelas de "
+            "até 31 dias e em todas as modalidades. A preparação pode demorar porque "
+            "confirma o volume real com o PNCP."
+        )
+        self.sync_carga_completa.toggled.connect(self._alternar_carga_completa)
         grid.addWidget(self.incluir_detalhes, 2, 3)
         grid.addWidget(self.incluir_contratos, 2, 4)
         grid.addWidget(self.incluir_atas, 2, 5)
@@ -912,7 +985,8 @@ class MainWindow(QMainWindow):
             botoes.addWidget(button)
         botoes.addStretch(1)
         grid.addLayout(botoes, 3, 0, 1, 6)
-        grid.addWidget(self.sync_automatico, 4, 0, 1, 3)
+        grid.addWidget(self.sync_carga_completa, 4, 0, 1, 4)
+        grid.addWidget(self.sync_automatico, 5, 0, 1, 3)
         grid.setColumnStretch(3, 1)
         grid.setColumnStretch(4, 1)
         layout.addWidget(filters)
@@ -927,7 +1001,13 @@ class MainWindow(QMainWindow):
         self.sync_progresso = QProgressBar()
         self.sync_progresso.setRange(0, 1)
         self.sync_progresso.setValue(0)
+        self.sync_progresso.setTextVisible(True)
+        self.sync_progresso.setMinimumHeight(24)
         self.sync_progresso.setVisible(False)
+        self.sync_progresso_resumo = QLabel("Progresso da carga completa ainda não iniciado.")
+        self.sync_progresso_resumo.setObjectName("statusTexto")
+        self.sync_progresso_resumo.setWordWrap(True)
+        self.sync_progresso_resumo.setVisible(False)
         estimate_grid = QGridLayout()
         estimate_grid.setHorizontalSpacing(24)
         estimate_grid.setVerticalSpacing(6)
@@ -967,6 +1047,7 @@ class MainWindow(QMainWindow):
         status_layout.addWidget(self.sync_status_label)
         status_layout.addWidget(self.sync_atividade)
         status_layout.addWidget(self.sync_progresso)
+        status_layout.addWidget(self.sync_progresso_resumo)
         status_layout.addLayout(estimate_grid)
         status_layout.addWidget(self.sync_estimativa_detalhes)
         status_layout.addWidget(self.sync_metricas)
@@ -987,6 +1068,46 @@ class MainWindow(QMainWindow):
         self._update_sync_action_feedback()
         return page
 
+    def _alternar_carga_completa(self, enabled: bool) -> None:
+        """Aplica filtros explícitos e visíveis para o backfill integral."""
+        self.sync_data_inicial.setEnabled(not enabled)
+        self.sync_data_final.setEnabled(not enabled)
+        self.sync_modalidade.setEnabled(not enabled)
+        if enabled:
+            today = date.today()
+            self.sync_data_inicial.setDate(
+                QDate(PNCP_HISTORY_START.year, PNCP_HISTORY_START.month, PNCP_HISTORY_START.day)
+            )
+            self.sync_data_final.setDate(QDate(today.year, today.month, today.day))
+            self.sync_modalidade.setCurrentIndex(0)
+            self.incluir_detalhes.setChecked(False)
+            self.incluir_detalhes.setToolTip(
+                "Na carga completa, comece pelas contratações principais. Itens e fornecedores "
+                "podem ser habilitados, mas multiplicam muito as chamadas e o tempo total."
+            )
+            self.sync_status_label.setText(
+                "Carga completa selecionada. Estimar usa apenas uma amostra; Sincronizar "
+                "pode começar diretamente e retoma os checkpoints já salvos."
+            )
+            self.sync_progresso.setRange(0, 1000)
+            self.sync_progresso.setValue(0)
+            self.sync_progresso.setFormat("Carga completa — 0,0%")
+            self.sync_progresso.setVisible(True)
+            self.sync_progresso_resumo.setText(
+                "Ao iniciar, o programa lerá o banco e mostrará lotes concluídos, restantes "
+                "e as páginas que faltam no lote atual."
+            )
+            self.sync_progresso_resumo.setVisible(True)
+        else:
+            self._full_sync_progress = None
+            self.sync_progresso_resumo.setVisible(False)
+            if self._sync_worker is None or not self._sync_worker.isRunning():
+                self.sync_progresso.setVisible(False)
+        self._sync_filters_changed()
+        if enabled and (self._sync_worker is None or not self._sync_worker.isRunning()):
+            self.botao_sincronizar.setEnabled(True)
+            self._update_sync_action_feedback()
+
     def _sync_filters_changed(self, *_: object) -> None:
         if self._sync_plan is None:
             return
@@ -995,10 +1116,14 @@ class MainWindow(QMainWindow):
         self._sync_plan = None
         self._sync_run_ids = ()
         self._sync_can_continue = False
-        self.botao_sincronizar.setEnabled(False)
+        full_load = self.sync_carga_completa.isChecked()
+        self.botao_sincronizar.setEnabled(full_load)
         self.botao_continuar.setEnabled(False)
         self.sync_status_label.setText(
-            "Os filtros mudaram depois da estimativa. Clique Estimar novamente."
+            "Carga completa pronta para iniciar sem estimativa. A estimativa opcional usa "
+            "uma amostra."
+            if full_load
+            else "Os filtros mudaram depois da estimativa. Clique Estimar novamente."
         )
         self._update_sync_action_feedback()
 
@@ -1021,7 +1146,7 @@ class MainWindow(QMainWindow):
         self.botao_escolher_banco = QPushButton("Escolher local dos dados…")
         self.botao_escolher_banco.setObjectName("secundario")
         self.botao_escolher_banco.setToolTip(
-            "Escolhe o arquivo SQLite onde contratações, itens e auditoria serão armazenados."
+            "Escolhe onde ficará o único banco principal com contratações, itens e auditoria."
         )
         self.botao_escolher_banco.clicked.connect(self.escolher_local_banco)
         storage.addWidget(QLabel("Arquivo:"))
@@ -1032,6 +1157,12 @@ class MainWindow(QMainWindow):
         search_page = QWidget()
         search_layout = QVBoxLayout(search_page)
         search_layout.setContentsMargins(0, 8, 0, 0)
+        search_note = QLabel(
+            "Procure oportunidades e registros já salvos neste arquivo. Os filtros podem ser combinados; duplo clique abre os detalhes."
+        )
+        search_note.setWordWrap(True)
+        search_note.setObjectName("muted")
+        search_layout.addWidget(search_note)
         filters = QGridLayout()
         self.local_busca = QLineEdit()
         self.local_busca.setPlaceholderText("Objeto ou descrição (inclui sinônimos cadastrados)")
@@ -1106,16 +1237,26 @@ class MainWindow(QMainWindow):
         self.botao_exportar_local = QPushButton("Exportar página CSV")
         self.botao_exportar_local.setObjectName("secundario")
         self.botao_exportar_local.clicked.connect(self.exportar_resultado_local)
+        self.botao_exportar_todos_local = QPushButton("Exportar todos os resultados…")
+        self.botao_exportar_todos_local.setObjectName("secundario")
+        self.botao_exportar_todos_local.setToolTip(
+            "Executa novamente os filtros e exporta todas as páginas, não somente as 50 linhas visíveis."
+        )
+        self.botao_exportar_todos_local.clicked.connect(self.exportar_todos_resultado_local)
         controls.addWidget(self.botao_buscar_local)
         controls.addWidget(self.botao_atualizar_local)
         controls.addWidget(self.botao_salvar_consulta)
         controls.addWidget(self.local_consultas, 1)
         controls.addWidget(self.botao_exportar_local)
+        controls.addWidget(self.botao_exportar_todos_local)
         search_layout.addLayout(controls)
         self.local_status = QLabel("Nenhuma base local carregada.")
         self.local_status.setObjectName("muted")
         search_layout.addWidget(self.local_status)
         self.local_sections.addTab(search_page, "Pesquisa")
+        self.local_sections.setTabToolTip(
+            0, "Filtra, pesquisa, pagina, salva consultas e exporta dados já sincronizados."
+        )
 
         self.historico_tabela = QTableWidget(0, 11)
         self.historico_tabela.setHorizontalHeaderLabels(
@@ -1152,9 +1293,18 @@ class MainWindow(QMainWindow):
         history_layout.addWidget(refresh_history, 0, Qt.AlignmentFlag.AlignLeft)
         history_layout.addWidget(self.historico_tabela)
         self.local_sections.addTab(history_page, "Histórico e alterações")
+        self.local_sections.setTabToolTip(
+            1, "Mostra as execuções e o que entrou, mudou ou não foi reencontrado em cada recorte."
+        )
 
         analytics_page = QWidget()
         analytics_layout = QVBoxLayout(analytics_page)
+        analytics_note = QLabel(
+            "Gera resumos somente a partir da cobertura já armazenada no banco: órgãos compradores, vencedores e preços."
+        )
+        analytics_note.setWordWrap(True)
+        analytics_note.setObjectName("muted")
+        analytics_layout.addWidget(analytics_note)
         analytics_controls = QHBoxLayout()
         refresh_analytics = QPushButton("Atualizar análises")
         refresh_analytics.clicked.connect(lambda: self._queue_database_task("analytics"))
@@ -1171,6 +1321,9 @@ class MainWindow(QMainWindow):
         analytics_layout.addLayout(analytics_controls)
         analytics_layout.addWidget(self.analytics_tabela)
         self.local_sections.addTab(analytics_page, "Análises")
+        self.local_sections.setTabToolTip(
+            2, "Resume frequência de compras, vencedores e histórico de preços da base local."
+        )
 
         maintenance_page = QWidget()
         maintenance_layout = QVBoxLayout(maintenance_page)
@@ -1186,58 +1339,28 @@ class MainWindow(QMainWindow):
             ("Criar backup…", self.criar_backup),
             ("Manutenção segura…", self.executar_manutencao),
             ("Medir desempenho", lambda: self._queue_database_task("performance_report")),
-            ("Importar dados novos…", self.importar_banco_teste),
         ):
             button = QPushButton(label)
             button.setObjectName("secundario")
             button.clicked.connect(slot)
             maintenance_buttons.addWidget(button)
-        semantic_note = QLabel(
-            "Busca semântica opcional: índice local de 512 dimensões, sem enviar seus dados a serviços externos. O custo e a quantidade indexada são mostrados após a criação."
+        paused_note = QLabel(
+            "A busca vetorial está temporariamente fora da interface. Esta etapa do projeto "
+            "prioriza integridade, validação e população completa do banco principal."
         )
-        semantic_note.setWordWrap(True)
-        semantic_note.setObjectName("muted")
-        semantic_controls = QHBoxLayout()
-        self.semantic_busca = QLineEdit(
-            placeholderText="Ex.: manutenção de computadores para escolas"
-        )
-        self.semantic_min_score = QDoubleSpinBox()
-        self.semantic_min_score.setRange(0.0, 1.0)
-        self.semantic_min_score.setSingleStep(0.05)
-        self.semantic_min_score.setValue(0.30)
-        self.semantic_min_score.setPrefix("Mínimo: ")
-        self.semantic_min_score.setToolTip(
-            "Oculta resultados com pontuação relativa abaixo deste valor. Não é porcentagem."
-        )
-        semantic_build = QPushButton("Criar/atualizar índice")
-        semantic_build.clicked.connect(
-            lambda: self._queue_database_task("rebuild_semantic_index", dimensions=512)
-        )
-        semantic_search = QPushButton("Busca semântica")
-        semantic_search.clicked.connect(
-            lambda: self._queue_database_task(
-                "semantic_search",
-                query=self.semantic_busca.text(),
-                limit=50,
-                min_score=self.semantic_min_score.value(),
-            )
-        )
-        insight_button = QPushButton("Classificar e extrair palavras")
-        insight_button.clicked.connect(lambda: self._queue_database_task("refresh_insights"))
-        semantic_controls.addWidget(self.semantic_busca, 1)
-        semantic_controls.addWidget(self.semantic_min_score)
-        semantic_controls.addWidget(semantic_build)
-        semantic_controls.addWidget(semantic_search)
-        semantic_controls.addWidget(insight_button)
+        paused_note.setWordWrap(True)
+        paused_note.setObjectName("muted")
         self.manutencao_status = QLabel("Nenhuma verificação executada nesta sessão.")
         self.manutencao_status.setObjectName("muted")
         maintenance_layout.addWidget(legal)
         maintenance_layout.addLayout(maintenance_buttons)
-        maintenance_layout.addWidget(semantic_note)
-        maintenance_layout.addLayout(semantic_controls)
+        maintenance_layout.addWidget(paused_note)
         maintenance_layout.addWidget(self.manutencao_status)
         maintenance_layout.addStretch(1)
         self.local_sections.addTab(maintenance_page, "Segurança e manutenção")
+        self.local_sections.setTabToolTip(
+            3, "Cuida do banco principal: integridade, backup e desempenho."
+        )
         top_layout.addWidget(self.local_sections)
         layout.addWidget(top)
 
@@ -1261,8 +1384,14 @@ class MainWindow(QMainWindow):
         self.tabela_local.verticalHeader().setVisible(False)
         header = self.tabela_local.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.tabela_local.setColumnWidth(2, 145)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.tabela_local.cellDoubleClicked.connect(self.abrir_detalhe_local)
+        self.tabela_local.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tabela_local.customContextMenuRequested.connect(self._mostrar_menu_copia_local)
+        self._atalho_copiar_local = QShortcut(QKeySequence.StandardKey.Copy, self.tabela_local)
+        self._atalho_copiar_local.activated.connect(self._copiar_celula_local)
         layout.addWidget(self.tabela_local, 1)
         paging = QHBoxLayout()
         self.botao_pagina_anterior = QPushButton("← Anterior")
@@ -1308,6 +1437,32 @@ class MainWindow(QMainWindow):
             self._render_database_snapshot(result)
         elif action == "advanced_search":
             self._render_advanced_search(result)
+        elif action == "advanced_search_all":
+            caminho = getattr(self, "_exportacao_local_pendente", None)
+            if caminho is None:
+                raise RuntimeError("Destino do CSV não encontrado.")
+            try:
+                count = exportar_linhas_csv(
+                    caminho,
+                    result if isinstance(result, list) else [],
+                    (
+                        ("Identificador PNCP", "numero_controle_pncp"),
+                        ("Órgão", "orgao_razao_social"),
+                        ("CNPJ do órgão", "orgao_cnpj"),
+                        ("Município", "municipio_nome"),
+                        ("Objeto", "objeto_compra"),
+                        ("Modalidade", "modalidade_nome"),
+                        ("Situação", "situacao_compra_nome"),
+                        ("Valor", "valor_total_estimado"),
+                    ),
+                )
+            except OSError as exc:
+                self._exportacao_local_pendente = None
+                self.local_status.setText(f"Não foi possível gravar o CSV: {exc}")
+                QMessageBox.warning(self, "Exportação não concluída", str(exc))
+                return
+            self.local_status.setText(f"{count} linha(s) exportada(s) para {caminho}.")
+            self._exportacao_local_pendente = None
         elif action in {"latest_completed_date", "latest_completed_date_all"}:
             self._apply_latest_completed_date(result)
         elif action == "diagnostics":
@@ -1355,6 +1510,7 @@ class MainWindow(QMainWindow):
     def _database_task_failed(self, action: str, detail: str) -> None:
         readable = {
             "snapshot": "Não foi possível carregar o banco local.",
+            "advanced_search_all": "Não foi possível preparar a exportação completa.",
             "latest_completed_date": "Não foi possível localizar a última execução.",
             "diagnostics": "Não foi possível validar o banco local.",
             "detail": "Não foi possível abrir os detalhes.",
@@ -1401,6 +1557,7 @@ class MainWindow(QMainWindow):
         if not accepted or not name.strip():
             return
         filters = {
+            "text": self.local_busca.text().strip(),
             "orgao": self.local_orgao.text().strip(),
             "orgao_cnpj": self.local_orgao_cnpj.text().strip(),
             "municipio": self.local_municipio.text().strip(),
@@ -1411,6 +1568,7 @@ class MainWindow(QMainWindow):
             "valor_max": self.local_valor_max.value() or None,
             "data_inicial": self.local_data_inicial.date().toPython().isoformat(),
             "data_final": self.local_data_final.date().toPython().isoformat(),
+            "sort": self.local_ordenacao.currentData(),
         }
         self._queue_database_task("save_query", name=name, filters=filters)
 
@@ -1421,6 +1579,7 @@ class MainWindow(QMainWindow):
         if not isinstance(data, dict):
             return
         filters = data.get("filters", data)
+        self.local_busca.setText(str(filters.get("text") or ""))
         for widget, key in (
             (self.local_orgao, "orgao"),
             (self.local_orgao_cnpj, "orgao_cnpj"),
@@ -1429,6 +1588,24 @@ class MainWindow(QMainWindow):
             (self.local_situacao, "situacao"),
         ):
             widget.setText(str(filters.get(key) or ""))
+        for widget, key in (
+            (self.local_valor_min, "valor_min"),
+            (self.local_valor_max, "valor_max"),
+        ):
+            value = filters.get(key)
+            widget.setValue(float(value) if value not in (None, "") else 0)
+        for widget, key in (
+            (self.local_data_inicial, "data_inicial"),
+            (self.local_data_final, "data_final"),
+        ):
+            value = filters.get(key)
+            if value:
+                parsed = QDate.fromString(str(value), "yyyy-MM-dd")
+                if parsed.isValid():
+                    widget.setDate(parsed)
+        sort_position = self.local_ordenacao.findData(filters.get("sort"))
+        if sort_position >= 0:
+            self.local_ordenacao.setCurrentIndex(sort_position)
         modality = filters.get("modalidade")
         position = self.local_modalidade.findData(modality)
         self.local_modalidade.setCurrentIndex(max(0, position))
@@ -1492,7 +1669,7 @@ class MainWindow(QMainWindow):
             values = (
                 row.get("numero_controle_pncp"),
                 row.get("orgao_razao_social"),
-                row.get("orgao_cnpj"),
+                _format_cnpj(row.get("orgao_cnpj")),
                 row.get("objeto_compra"),
                 "similaridade",
                 row.get("score"),
@@ -1667,7 +1844,14 @@ class MainWindow(QMainWindow):
         end = self.sync_data_final.date().toPython()
         modalidade = self.sync_modalidade.currentData()
         codes = (int(modalidade),) if modalidade is not None else tuple(code for code, _ in MODALIDADES)
-        return tuple(SyncWindow(start, end, code) for code in codes)
+        config = self._sync_config()
+        windows: list[SyncWindow] = []
+        current = start
+        while current <= end:
+            window_end = min(end, current + timedelta(days=config.max_window_days - 1))
+            windows.extend(SyncWindow(current, window_end, code) for code in codes)
+            current = window_end + timedelta(days=1)
+        return tuple(windows)
 
     def estimar_sincronizacao(self) -> None:
         if self._sync_worker is not None and self._sync_worker.isRunning():
@@ -1686,17 +1870,27 @@ class MainWindow(QMainWindow):
         self._sync_plan = None
         self._sync_can_continue = False
         self._set_sync_busy(True, planning=True)
-        self.sync_status_label.setText("Consultando uma página para estimar a carga…")
+        self.sync_status_label.setText(
+            f"Estimando {len(windows)} lote(s). O programa reduz o ritmo entre consultas e, "
+            "se o PNCP responder HTTP 429, aguarda 60 s antes de tentar novamente…"
+        )
         self.sync_estimativa_tempo.setText("Calculando com a latência real do PNCP…")
         self.sync_estimativa_respostas.setText("Calculando…")
         self.sync_estimativa_registros.setText("Calculando…")
         self.sync_estimativa_armazenamento.setText("Calculando…")
         self.sync_estimativa_detalhes.setText(
-            "A primeira página está sendo consultada; você pode cancelar se o PNCP estiver lento."
+            "O volume é confirmado por período e modalidade. Você pode cancelar; nenhum "
+            "dado parcial da estimativa será tratado como cobertura concluída."
         )
         worker = SyncTaskThread(
             self._sync_config(),
-            action="plan_all" if len(windows) > 1 else "plan",
+            action=(
+                "plan_sample"
+                if self.sync_carga_completa.isChecked()
+                else "plan_all"
+                if len(windows) > 1
+                else "plan"
+            ),
             window=windows[0] if len(windows) == 1 else None,
             windows=windows if len(windows) > 1 else None,
             replace_plan_id=replace_plan_id,
@@ -1707,13 +1901,55 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def iniciar_sincronizacao(self) -> None:
-        if not self._sync_run_id or (
-            self._sync_worker is not None and self._sync_worker.isRunning()
-        ):
+        if self._sync_worker is not None and self._sync_worker.isRunning():
+            return
+        if self.sync_carga_completa.isChecked():
+            self._executar_carga_completa()
+            return
+        if not self._sync_run_id:
+            self.sync_status_label.setText(
+                "Faça uma estimativa para esta sincronização parcial."
+            )
             return
         self._executar_sincronizacao()
 
+    def _executar_carga_completa(self) -> None:
+        windows = self._sync_windows()
+        estimated_total_pages = (
+            self._sync_plan.total_pages
+            if isinstance(self._sync_plan, BatchPlanSummary)
+            and self._sync_plan.is_approximate
+            else None
+        )
+        self._sync_plan = None
+        self._sync_can_continue = False
+        self._set_sync_busy(True)
+        self._sync_started_monotonic = time.monotonic()
+        self._sync_last_resource = ""
+        self.sync_status_label.setText(
+            f"Carga completa iniciada: {len(windows)} lotes. Cada lote confirmado fica "
+            "salvo e não será repetido após reinício. Falhas temporárias serão tentadas "
+            "novamente até você usar Pausar."
+        )
+        worker = SyncTaskThread(
+            self._sync_config(),
+            action="full_sync",
+            windows=windows,
+            include_details=self.incluir_detalhes.isChecked(),
+            include_contracts=self.incluir_contratos.isChecked(),
+            include_atas=self.incluir_atas.isChecked(),
+            estimated_total_pages=estimated_total_pages,
+            parent=self,
+        )
+        self._connect_sync_worker(worker)
+        self._sync_worker = worker
+        worker.start()
+
     def continuar_sincronizacao(self) -> None:
+        if self.sync_carga_completa.isChecked():
+            if self._sync_worker is None or not self._sync_worker.isRunning():
+                self._executar_carga_completa()
+            return
         if not self._sync_run_id:
             modalidade = self.sync_modalidade.currentData()
             if modalidade is None:
@@ -1753,6 +1989,7 @@ class MainWindow(QMainWindow):
         worker.planned.connect(self._sync_planejado)
         worker.detail_planned.connect(self._detalhes_planejados)
         worker.progress.connect(self._sync_progresso)
+        worker.full_progress.connect(self._sync_progresso_carga_completa)
         worker.activity.connect(self._sync_atividade_alterada)
         worker.completed.connect(self._sync_concluido)
         worker.paused.connect(self._sync_pausado)
@@ -1762,7 +1999,7 @@ class MainWindow(QMainWindow):
 
     def pausar_sincronizacao(self) -> None:
         if self._sync_worker is not None and self._sync_worker.isRunning():
-            if self._sync_worker.action in {"plan", "plan_all"}:
+            if self._sync_worker.action in {"plan", "plan_all", "plan_sample"}:
                 self.sync_status_label.setText("Cancelando a estimativa…")
             else:
                 self.sync_status_label.setText("Pausando após liberar a unidade atual…")
@@ -1775,13 +2012,18 @@ class MainWindow(QMainWindow):
         self._sync_run_ids = getattr(summary, "run_ids", (summary.run_id,))
         self.sync_progresso.setRange(0, max(1, summary.total_pages))
         self.sync_progresso.setValue(0)
+        approximate = isinstance(summary, BatchPlanSummary) and summary.is_approximate
+        prefix = "Aproximação: " if approximate else ""
         self.sync_metricas.setText(
-            f"{summary.total_records} registros • {summary.total_pages} páginas • "
+            f"{prefix}{summary.total_records} registros • {summary.total_pages} páginas • "
             f"download estimado {formatar_bytes(summary.estimated_download_bytes)} • "
             f"banco estimado {formatar_bytes(summary.estimated_database_bytes)}"
         )
         self.sync_estimativa_tempo.setText(
-            f"aprox. {formatar_duracao(summary.estimated_main_seconds)} restantes "
+            f"faixa aproximada de {formatar_duracao(summary.estimated_main_seconds * 0.5)} "
+            f"a {formatar_duracao(summary.estimated_main_seconds * 2)}"
+            if approximate
+            else f"aprox. {formatar_duracao(summary.estimated_main_seconds)} restantes "
             f"(a 1ª página levou {summary.first_page_latency_ms / 1000:.1f} s)"
         )
         self.sync_estimativa_respostas.setText(
@@ -1789,15 +2031,20 @@ class MainWindow(QMainWindow):
             f"{summary.remaining_main_requests} chamada(s) de página restantes"
         )
         self.sync_estimativa_registros.setText(
-            f"{summary.total_records} contratação(ões) informadas pelo PNCP"
+            f"{summary.total_records} contratação(ões) "
+            + ("aproximadas por amostragem" if approximate else "informadas pelo PNCP")
             + (
                 f" em {len(self._sync_run_ids)} modalidades"
-                if len(self._sync_run_ids) > 1
+                if len(self._sync_run_ids) > 1 and not approximate
                 else ""
             )
         )
         self.sync_estimativa_armazenamento.setText(
-            f"{formatar_bytes(summary.estimated_download_bytes)} de rede; "
+            f"média projetada {formatar_bytes(summary.estimated_database_bytes)}; "
+            f"faixa de {formatar_bytes(round(summary.estimated_database_bytes * 0.5))} "
+            f"a {formatar_bytes(round(summary.estimated_database_bytes * 2))} no banco"
+            if approximate
+            else f"{formatar_bytes(summary.estimated_download_bytes)} de rede; "
             f"aprox. {formatar_bytes(summary.estimated_database_bytes)} no banco"
         )
         if self.incluir_detalhes.isChecked():
@@ -1832,7 +2079,13 @@ class MainWindow(QMainWindow):
         self._sync_space_ok = enough_space
         if enough_space:
             self.sync_status_label.setText(
-                f"Estimativa pronta. Espaço livre: {formatar_bytes(summary.free_disk_bytes)}."
+                (
+                    f"Estimativa aproximada baseada em {summary.sample_size} de "
+                    f"{summary.population_windows} lotes. "
+                    if approximate
+                    else "Estimativa pronta. "
+                )
+                + f"Espaço livre: {formatar_bytes(summary.free_disk_bytes)}."
                 f"{suffix}"
             )
         else:
@@ -1847,12 +2100,14 @@ class MainWindow(QMainWindow):
                 "A sincronização não será iniciada porque o local escolhido não possui "
                 "a margem de espaço estimada.",
             )
-        self.botao_sincronizar.setEnabled(enough_space)
+        self.botao_sincronizar.setEnabled(
+            enough_space or self.sync_carga_completa.isChecked()
+        )
         self.botao_continuar.setEnabled(False)
         self._update_sync_action_feedback()
         if self._auto_sync_pending:
             self._auto_sync_pending = False
-            if enough_space:
+            if enough_space or self.sync_carga_completa.isChecked():
                 QTimer.singleShot(0, self.iniciar_sincronizacao)
 
     def _detalhes_planejados(self, detail_run_id: str) -> None:
@@ -1899,6 +2154,57 @@ class MainWindow(QMainWindow):
                 f"{formatar_bytes(int(speed))}/s • {self._remaining_time(done, total, elapsed)}"
             )
 
+    def _sync_progresso_carga_completa(self, progress: FullSyncProgress) -> None:
+        """Mostra um percentual global honesto e o total conhecido do lote atual."""
+        self._full_sync_progress = progress
+        percentage = max(0.0, min(100.0, progress.percentage))
+        self.sync_progresso.setRange(0, 1000)
+        self.sync_progresso.setValue(round(percentage * 10))
+        self.sync_progresso.setFormat(
+            f"Carga completa — {percentage:.1f}%".replace(".", ",")
+        )
+        self.sync_progresso.setVisible(True)
+        self.sync_progresso_resumo.setVisible(True)
+
+        window_text = ""
+        if progress.current_window_index is not None and progress.current_window is not None:
+            window = progress.current_window
+            window_text = (
+                f" • lote atual {progress.current_window_index}: "
+                f"{window.data_inicial:%d/%m/%Y} a {window.data_final:%d/%m/%Y}, "
+                f"modalidade {window.modalidade}"
+            )
+        if progress.current_pages_total:
+            page_text = (
+                f" • páginas/respostas do lote: {progress.current_pages_done}/"
+                f"{progress.current_pages_total} confirmadas; "
+                f"{progress.current_pages_remaining} faltam"
+            )
+        elif (
+            progress.current_window_index is not None
+            and progress.current_window_index > progress.completed_windows
+        ):
+            page_text = " • quantidade de páginas do lote sendo consultada"
+        else:
+            page_text = ""
+        failure_text = (
+            f" • {progress.current_failed_pages} página(s) aguardando nova tentativa"
+            if progress.current_failed_pages
+            else ""
+        )
+        estimated_remaining = progress.estimated_pages_remaining
+        global_pages_text = (
+            f" • aprox. {estimated_remaining} respostas faltam no total pela amostra"
+            if estimated_remaining is not None
+            else " • o total global de respostas será descoberto lote a lote"
+        )
+        self.sync_progresso_resumo.setText(
+            f"Lotes: {progress.completed_windows}/{progress.total_windows} concluídos; "
+            f"{progress.remaining_windows} faltam{window_text}{page_text}{failure_text}"
+            f"{global_pages_text}. "
+            "As respostas ficam compactadas dentro do SQLite; não são arquivos separados."
+        )
+
     @staticmethod
     def _remaining_time(done: int, total: int, elapsed: float) -> str:
         if done <= 0 or total <= done:
@@ -1912,7 +2218,7 @@ class MainWindow(QMainWindow):
             details is not None and details.status == "FAILED"
         )
         # Uma falha recuperável deixa unidades pendentes; preserve a retomada.
-        self._sync_can_continue = has_failure
+        self._sync_can_continue = has_failure or self.sync_carga_completa.isChecked()
         has_rejection = main.records_rejected > 0 or (
             details is not None and details.rejected_records > 0
         )
@@ -1923,7 +2229,12 @@ class MainWindow(QMainWindow):
         else:
             prefix = "Sincronização concluída."
         self._render_sync_result(main, details, prefix)
-        self.sync_atividade.setText("Download concluído; dados confirmados no banco local.")
+        self.sync_atividade.setText(
+            "Carga interrompida por uma falha temporária. Os dados confirmados foram salvos; "
+            "use Continuar para retomar o restante."
+            if has_failure
+            else "Download concluído; dados confirmados no banco local."
+        )
         self._local_dirty = True
         if self.abas.tabText(self.abas.currentIndex()) == "Banco local":
             self.carregar_banco_local()
@@ -1936,7 +2247,9 @@ class MainWindow(QMainWindow):
         else:
             self.sync_status_label.setText("Estimativa cancelada.")
             self.sync_atividade.setText("Estimativa cancelada; nenhum download foi iniciado.")
-        self._sync_can_continue = self._sync_run_id is not None
+        self._sync_can_continue = (
+            self._sync_run_id is not None or self.sync_carga_completa.isChecked()
+        )
         self.botao_continuar.setEnabled(self._sync_can_continue)
         self._update_sync_action_feedback()
 
@@ -1978,6 +2291,8 @@ class MainWindow(QMainWindow):
         self.sync_progresso.setValue(
             min(main.succeeded_units + main.partial_units, main.planned_units)
         )
+        if self._full_sync_progress is not None and self.sync_carga_completa.isChecked():
+            self._sync_progresso_carga_completa(self._full_sync_progress)
 
     def _sync_falhou(self, mensagem: str, detalhe: str) -> None:
         self._sync_can_continue = False
@@ -1989,8 +2304,8 @@ class MainWindow(QMainWindow):
             self.sync_estimativa_registros.setText("Nenhuma estimativa confirmada")
             self.sync_estimativa_armazenamento.setText("Nenhuma estimativa confirmada")
             self.sync_estimativa_detalhes.setText(
-                "Tente novamente mais tarde ou use um período de um dia. O erro não criou "
-                "uma sincronização parcial."
+                "A estimativa tentou novamente automaticamente. Aguarde o PNCP estabilizar e "
+                "repita; o erro não marcou nenhuma cobertura como concluída."
             )
         self.sync_alertas.setText("Falha não tratada na execução; consulte o detalhe exibido.")
         self.sync_alertas.setObjectName("alertaErro")
@@ -2004,7 +2319,9 @@ class MainWindow(QMainWindow):
         dialog.setDetailedText(detalhe)
         dialog.exec()
         # Se já existe um plano, a falha pode ser retomada após a mensagem.
-        self._sync_can_continue = self._sync_run_id is not None
+        self._sync_can_continue = (
+            self._sync_run_id is not None or self.sync_carga_completa.isChecked()
+        )
         self.botao_continuar.setEnabled(self._sync_can_continue)
         self._update_sync_action_feedback()
 
@@ -2016,22 +2333,33 @@ class MainWindow(QMainWindow):
             worker.deleteLater()
 
     def _set_sync_busy(self, busy: bool, *, planning: bool = False) -> None:
-        self.sync_progresso.setVisible(busy)
+        self.sync_progresso.setVisible(
+            busy
+            or self.sync_carga_completa.isChecked()
+            or self._full_sync_progress is not None
+        )
         self.botao_estimar.setEnabled(not busy)
         self.botao_sincronizar.setEnabled(
-            not busy and self._sync_plan is not None and not planning and self._sync_space_ok
+            not busy
+            and not planning
+            and (
+                self.sync_carga_completa.isChecked()
+                or (self._sync_plan is not None and self._sync_space_ok)
+            )
         )
         self.botao_pausar.setText("Cancelar estimativa" if busy and planning else "Pausar")
         self.botao_pausar.setEnabled(busy)
         self.botao_continuar.setEnabled(not busy and self._sync_can_continue and not planning)
-        self.sync_data_inicial.setEnabled(not busy)
-        self.sync_data_final.setEnabled(not busy)
-        self.sync_modalidade.setEnabled(not busy)
+        full_load = self.sync_carga_completa.isChecked()
+        self.sync_data_inicial.setEnabled(not busy and not full_load)
+        self.sync_data_final.setEnabled(not busy and not full_load)
+        self.sync_modalidade.setEnabled(not busy and not full_load)
         self.incluir_detalhes.setEnabled(not busy)
         self.incluir_contratos.setEnabled(not busy)
         self.incluir_atas.setEnabled(not busy)
         self.botao_atualizar_desde_ultima.setEnabled(not busy)
         self.sync_automatico.setEnabled(not busy)
+        self.sync_carga_completa.setEnabled(not busy)
         database_busy = self._database_worker is not None and self._database_worker.isRunning()
         self.botao_escolher_banco.setEnabled(not busy and not database_busy)
         self._update_sync_action_feedback()
@@ -2039,15 +2367,27 @@ class MainWindow(QMainWindow):
     def _update_sync_action_feedback(self) -> None:
         busy = self._sync_worker is not None and self._sync_worker.isRunning()
         if self.botao_sincronizar.isEnabled():
-            self.botao_sincronizar.setToolTip(
-                "Inicia a carga planejada e grava cada página confirmada no banco local."
-            )
+            if self.sync_carga_completa.isChecked():
+                self.botao_sincronizar.setToolTip(
+                    "Inicia a carga completa sem exigir estimativa. Cada lote é planejado, "
+                    "baixado e confirmado separadamente."
+                )
+            else:
+                self.botao_sincronizar.setToolTip(
+                    "Inicia a carga planejada e grava cada página confirmada no banco local."
+                )
         elif busy:
             self.botao_sincronizar.setToolTip("Aguarde a operação atual terminar ou use Pausar.")
         elif self._sync_plan is None:
-            self.botao_sincronizar.setToolTip(
-                "Indisponível: clique em Estimar e aguarde a estimativa terminar."
-            )
+            if self.sync_carga_completa.isChecked():
+                self.botao_sincronizar.setToolTip(
+                    "Inicia a carga completa sem exigir estimativa. Cada lote é planejado, "
+                    "baixado e confirmado separadamente."
+                )
+            else:
+                self.botao_sincronizar.setToolTip(
+                    "Indisponível: clique em Estimar e aguarde a estimativa terminar."
+                )
         elif not self._sync_space_ok:
             self.botao_sincronizar.setToolTip(
                 "Indisponível: o local escolhido não possui a margem de espaço necessária."
@@ -2077,12 +2417,12 @@ class MainWindow(QMainWindow):
             values = (
                 row.get("numero_controle_pncp"),
                 row.get("orgao_razao_social"),
-                row.get("orgao_cnpj"),
+                _format_cnpj(row.get("orgao_cnpj")),
                 row.get("objeto_compra"),
                 row.get("modalidade_nome"),
                 row.get("situacao_compra_nome"),
                 row.get("data_encerramento_proposta"),
-                row.get("valor_total_estimado"),
+                _formatar_valor_local(row.get("valor_total_estimado")),
             )
             for column_index, value in enumerate(values):
                 cell = QTableWidgetItem(_display(value))
@@ -2143,11 +2483,12 @@ class MainWindow(QMainWindow):
             values = (
                 row.get("numero_controle_pncp"),
                 row.get("orgao_razao_social"),
+                _format_cnpj(row.get("orgao_cnpj")),
                 row.get("objeto_compra"),
                 row.get("modalidade_nome"),
                 row.get("situacao_compra_nome"),
                 row.get("data_encerramento_proposta"),
-                row.get("valor_total_estimado"),
+                _formatar_valor_local(row.get("valor_total_estimado")),
             )
             for column_index, value in enumerate(values):
                 cell = QTableWidgetItem(_display(value))
@@ -2162,20 +2503,87 @@ class MainWindow(QMainWindow):
         )
         if not caminho:
             return
-        count = exportar_linhas_csv(
-            caminho,
-            getattr(self, "_local_rows", []),
-            (
-                ("Identificador PNCP", "numero_controle_pncp"),
-                ("Órgão", "orgao_razao_social"),
-                ("Município", "municipio_nome"),
-                ("Objeto", "objeto_compra"),
-                ("Modalidade", "modalidade_nome"),
-                ("Situação", "situacao_compra_nome"),
-                ("Valor", "valor_total_estimado"),
-            ),
-        )
+        try:
+            count = exportar_linhas_csv(
+                caminho,
+                getattr(self, "_local_rows", []),
+                (
+                    ("Identificador PNCP", "numero_controle_pncp"),
+                    ("Órgão", "orgao_razao_social"),
+                    ("CNPJ do órgão", "orgao_cnpj"),
+                    ("Município", "municipio_nome"),
+                    ("Objeto", "objeto_compra"),
+                    ("Modalidade", "modalidade_nome"),
+                    ("Situação", "situacao_compra_nome"),
+                    ("Valor", "valor_total_estimado"),
+                ),
+            )
+        except OSError as exc:
+            self.local_status.setText(f"Não foi possível gravar o CSV: {exc}")
+            QMessageBox.warning(self, "Exportação não concluída", str(exc))
+            return
         self.local_status.setText(f"{count} linha(s) exportada(s) para {caminho}.")
+
+    def _filtros_banco_local(self) -> dict[str, Any]:
+        return {
+            "orgao": self.local_orgao.text().strip(),
+            "orgao_cnpj": self.local_orgao_cnpj.text().strip(),
+            "municipio": self.local_municipio.text().strip(),
+            "fornecedor": self.local_fornecedor.text().strip(),
+            "modalidade": self.local_modalidade.currentData(),
+            "situacao": self.local_situacao.text().strip(),
+            "valor_min": self.local_valor_min.value() or None,
+            "valor_max": self.local_valor_max.value() or None,
+            "data_inicial": None
+            if self.local_data_inicial.date() == self.local_data_inicial.minimumDate()
+            else self.local_data_inicial.date().toPython().isoformat(),
+            "data_final": None
+            if self.local_data_final.date() == self.local_data_final.minimumDate()
+            else self.local_data_final.date().toPython().isoformat(),
+        }
+
+    def exportar_todos_resultado_local(self) -> None:
+        caminho, _ = QFileDialog.getSaveFileName(
+            self, "Exportar todos os resultados", "pncp-resultados-completos.csv", "CSV (*.csv)"
+        )
+        if not caminho:
+            return
+        self._exportacao_local_pendente = Path(caminho)
+        self.local_status.setText("Consultando todas as páginas para preparar o CSV…")
+        self._queue_database_task(
+            "advanced_search_all",
+            text=self.local_busca.text(),
+            filters=self._filtros_banco_local(),
+            page_size=500,
+            sort=self.local_ordenacao.currentData(),
+        )
+
+    def _copiar_celula_local(self) -> None:
+        item = self.tabela_local.currentItem()
+        if item is None:
+            return
+        QApplication.clipboard().setText(item.text())
+        self.local_status.setText("Informação copiada para a área de transferência.")
+
+    def _mostrar_menu_copia_local(self, position) -> None:
+        item = self.tabela_local.itemAt(position)
+        if item is None:
+            return
+        self.tabela_local.setCurrentItem(item)
+        menu = QMenu(self)
+        copy_cell = menu.addAction("Copiar célula")
+        copy_row = menu.addAction("Copiar linha")
+        chosen = menu.exec(self.tabela_local.viewport().mapToGlobal(position))
+        if chosen == copy_cell:
+            self._copiar_celula_local()
+        elif chosen == copy_row:
+            values = [
+                self.tabela_local.item(item.row(), column).text()
+                for column in range(self.tabela_local.columnCount())
+                if self.tabela_local.item(item.row(), column) is not None
+            ]
+            QApplication.clipboard().setText("\t".join(values))
+            self.local_status.setText("Linha copiada para a área de transferência.")
 
     def pagina_local_anterior(self) -> None:
         self._local_page = max(1, getattr(self, "_local_page", 1) - 1)
@@ -2336,50 +2744,8 @@ class MainWindow(QMainWindow):
 
     def _set_ocupado(self, ocupado: bool) -> None:
         self.botao_consultar.setEnabled(not ocupado)
-        self.botao_demo.setEnabled(not ocupado)
         self.botao_cancelar.setEnabled(ocupado)
         self.progresso.setVisible(ocupado)
-
-    def carregar_demonstracao(self) -> None:
-        hoje = date.today()
-        demonstracao = (
-            ContratoLinha(
-                numero="017/2026",
-                orgao="Município de Exemplo",
-                objeto="Aquisição de medicamentos para a rede municipal de saúde",
-                fornecedor="Saúde Distribuidora Ltda.",
-                valor=248750.90,
-                vigencia_inicio=hoje - timedelta(days=30),
-                vigencia_fim=hoje + timedelta(days=335),
-                identificador_pncp="00000000000100-2-000017/2026",
-            ),
-            ContratoLinha(
-                numero="041/2026",
-                orgao="Secretaria Estadual de Educação",
-                objeto="Serviços de manutenção preventiva em unidades escolares",
-                fornecedor="Manutenção Predial Brasil S.A.",
-                valor=1_480_000.00,
-                vigencia_inicio=hoje - timedelta(days=15),
-                vigencia_fim=hoje + timedelta(days=350),
-                identificador_pncp="00000000000200-2-000041/2026",
-            ),
-            ContratoLinha(
-                numero="103/2026",
-                orgao="Fundação Pública de Tecnologia",
-                objeto="Fornecimento de notebooks e acessórios",
-                fornecedor="Tecnologia Aberta Comércio Ltda.",
-                valor=386_420.50,
-                vigencia_inicio=None,
-                vigencia_fim=None,
-                identificador_pncp="00000000000300-2-000103/2026",
-            ),
-        )
-        self._preencher_tabela(demonstracao)
-        self.resumo_label.setText("3 registros demonstrativos • não são dados reais")
-        self.status_label.setText(
-            "Modo de demonstração: estes dados são fictícios e servem apenas "
-            "para visualizar o fluxo."
-        )
 
     def _preencher_tabela(self, contratos: tuple[ContratoLinha, ...]) -> None:
         self._contratos = contratos

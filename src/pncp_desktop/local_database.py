@@ -85,6 +85,21 @@ class LocalDatabase:
         with self._connect() as connection:
             return DataServices(connection).advanced_search(**kwargs)
 
+    def advanced_search_all(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Percorre todas as páginas da pesquisa sem carregar a tabela da interface."""
+        page_size = min(int(kwargs.pop("page_size", 500)), 500)
+        if page_size < 1:
+            raise ValueError("O tamanho da página deve ser positivo.")
+        with self._connect() as connection:
+            service = DataServices(connection)
+            first = service.advanced_search(**kwargs, page=1, page_size=page_size)
+            rows = list(first.rows)
+            for page in range(2, first.pages + 1):
+                rows.extend(
+                    service.advanced_search(**kwargs, page=page, page_size=page_size).rows
+                )
+            return rows
+
     def hybrid_search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
         with self._connect() as connection:
             return DataServices(connection).hybrid_search(query, **kwargs)
@@ -106,10 +121,15 @@ class LocalDatabase:
             row = connection.execute(
                 """SELECT r.id FROM ingestion_run r
                    WHERE r.modalidade=? AND r.status IN ('PLANNED','RUNNING','PAUSED','FAILED')
-                     AND EXISTS (SELECT 1 FROM work_unit w WHERE w.run_id=r.id AND w.status IN ('PENDING','RETRY_WAIT','RUNNING'))
+                      AND EXISTS (SELECT 1 FROM work_unit w WHERE w.run_id=r.id AND w.status IN ('PENDING','RETRY_WAIT','RUNNING','FAILED'))
                    ORDER BY r.created_at DESC LIMIT 1""", (modalidade,)
             ).fetchone()
             return str(row[0]) if row else None
+
+    def recover_interrupted_units(self) -> int:
+        """Devolve à fila lotes que ficaram RUNNING após fechamento ou reinício."""
+        with SyncRepository(self.db_path) as repository:
+            return repository.recover_interrupted_units()
 
     def latest_resumable_runs(self) -> tuple[str, ...]:
         with self._connect() as connection:
@@ -398,7 +418,8 @@ class LocalDatabase:
             if not query.strip():
                 rows = connection.execute(
                     """
-                    SELECT id, numero_controle_pncp, orgao_razao_social, objeto_compra,
+                    SELECT id, numero_controle_pncp, orgao_razao_social, orgao_cnpj,
+                           objeto_compra,
                            modalidade_nome, situacao_compra_nome,
                            data_encerramento_proposta, valor_total_estimado
                     FROM contratacao
@@ -430,7 +451,8 @@ class LocalDatabase:
                         WHERE r.fornecedor_nome LIKE ? OR r.ni_fornecedor LIKE ?
                     )
                     SELECT c.id, c.numero_controle_pncp, c.orgao_razao_social,
-                           c.objeto_compra, c.modalidade_nome, c.situacao_compra_nome,
+                           c.orgao_cnpj, c.objeto_compra, c.modalidade_nome,
+                           c.situacao_compra_nome,
                            c.data_encerramento_proposta, c.valor_total_estimado
                     FROM encontrados e
                     JOIN contratacao c ON c.id = e.contratacao_id

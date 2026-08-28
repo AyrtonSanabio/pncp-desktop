@@ -18,18 +18,30 @@ async def plan_sync(
     """Consulta uma página, estima a carga e persiste unidades ainda não executadas."""
     window.validate(max_days=config.max_window_days)
     config.ensure_storage_directory()
-    # Estimar deve responder rapidamente. A carga real mantém timeout e retentativas robustos.
+    with SyncRepository(config.db_path, lease_seconds=config.lease_seconds) as repository:
+        reusable = repository.find_reusable_plan(window)
+    if reusable is not None:
+        return reusable
+    # A estimativa depende de uma resposta real do PNCP. Ela usa um limite um pouco
+    # menor que a carga, mas não deve falhar nos picos comuns de latência do portal.
     planning_config = replace(
-        config, timeout_seconds=min(config.timeout_seconds, 20), max_retries=1
+        config,
+        timeout_seconds=min(config.timeout_seconds, 60),
+        max_retries=min(config.max_retries, 3),
     )
     source = source or PypncpSource(planning_config)
     first_page = await source.fetch_publications(window, 1)
     if first_page.page_number != 1:
         raise RuntimeError("O PNCP não confirmou que a página de planejamento é a primeira.")
-    if first_page.response.status_code != 200:
+    if first_page.response.status_code not in {200, 204}:
         raise RuntimeError(
-            f"O planejamento esperava HTTP 200, recebeu {first_page.response.status_code}."
+            "O planejamento esperava HTTP 200 ou 204, recebeu "
+            f"{first_page.response.status_code}."
         )
+    if first_page.response.status_code == 204 and (
+        first_page.total_pages or first_page.total_records or first_page.record_count
+    ):
+        raise RuntimeError("O PNCP retornou HTTP 204 junto com totais não vazios.")
     if first_page.total_pages < 0 or first_page.total_records < 0:
         raise RuntimeError("O PNCP retornou totais negativos na paginação.")
     if first_page.record_count > first_page.total_records:
@@ -73,4 +85,5 @@ async def plan_sync(
         remaining_main_requests=remaining_main_requests,
         estimated_main_seconds=estimated_main_seconds,
         minimum_detail_requests=first_page.total_records,
+        reused=False,
     )

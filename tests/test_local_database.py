@@ -51,3 +51,27 @@ def test_latest_completed_date_is_scoped_by_modality(tmp_path: Path) -> None:
     assert database.latest_completed_date(12) == date(2026, 8, 20)
     assert database.latest_completed_date(6) == date(2026, 8, 25)
     assert database.latest_completed_date(1) is None
+
+
+def test_failed_page_remains_available_to_continue(tmp_path: Path) -> None:
+    db_path = tmp_path / "failed.sqlite3"
+    database = LocalDatabase(db_path)
+    database.ensure_ready()
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """INSERT INTO ingestion_run(
+                   id,resource,data_inicial,data_final,modalidade,status,
+                   collector_version,estimated_download_bytes,estimated_database_bytes,
+                   free_disk_bytes_at_plan,unmodeled_fields_json,created_at)
+               VALUES('failed-run','contratacoes_publicacao','2026-08-01','2026-08-01',
+                      12,'FAILED','test',0,0,0,'[]','2026-08-01T00:00:00+00:00')"""
+        )
+        connection.execute(
+            """INSERT INTO work_unit(
+                   run_id,resource,data_inicial,data_final,modalidade,page_number,
+                   status,created_at)
+               VALUES('failed-run','contratacoes_publicacao','2026-08-01','2026-08-01',
+                      12,1,'FAILED','2026-08-01T00:00:00+00:00')"""
+        )
+
+    assert database.latest_resumable_run(12) == "failed-run"

@@ -11,12 +11,15 @@ if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
 
 $isolatedDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ("pncp-desktop-smoke-" + [guid]::NewGuid())
 $screenshot = Join-Path $isolatedDirectory "smoke.png"
+$database = Join-Path $isolatedDirectory "data\pncp.sqlite3"
 New-Item -ItemType Directory -Path $isolatedDirectory | Out-Null
+$previousDatabaseOverride = $env:PNCP_DESKTOP_DB_PATH
 
 try {
     Copy-Item -LiteralPath $applicationDirectory -Destination $isolatedDirectory -Recurse
     $isolatedExecutable = Join-Path $isolatedDirectory "ConsultaPNCP\ConsultaPNCP.exe"
-    $process = Start-Process -FilePath $isolatedExecutable -ArgumentList @("--demo", "--screenshot", $screenshot) -PassThru -WindowStyle Hidden
+    $env:PNCP_DESKTOP_DB_PATH = $database
+    $process = Start-Process -FilePath $isolatedExecutable -ArgumentList @("--screenshot", $screenshot) -PassThru -WindowStyle Hidden
     if (-not $process.WaitForExit(30000)) {
         $process.Kill()
         throw "O aplicativo nao encerrou o smoke test em 30 segundos."
@@ -33,6 +36,7 @@ try {
     Write-Host "SMOKE_EXE_OK: $isolatedExecutable"
 }
 finally {
+    $env:PNCP_DESKTOP_DB_PATH = $previousDatabaseOverride
     if (Test-Path -LiteralPath $isolatedDirectory) {
         Remove-Item -LiteralPath $isolatedDirectory -Recurse -Force
     }

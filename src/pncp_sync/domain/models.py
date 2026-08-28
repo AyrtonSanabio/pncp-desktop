@@ -30,6 +30,59 @@ class SyncWindow:
 
 
 @dataclass(frozen=True, slots=True)
+class FullSyncProgress:
+    """Progresso global conhecido da carga completa.
+
+    O número total de páginas futuras só é conhecido depois que cada janela é
+    planejada. Por isso, o percentual global usa lotes concluídos e a fração já
+    confirmada do lote atual, sem inventar uma contagem de respostas futuras.
+    """
+
+    total_windows: int
+    completed_windows: int
+    current_window_index: int | None = None
+    current_window: SyncWindow | None = None
+    current_pages_done: int = 0
+    current_pages_total: int = 0
+    current_failed_pages: int = 0
+    confirmed_pages: int = 0
+    estimated_total_pages: int | None = None
+    records_received: int = 0
+    bytes_received: int = 0
+
+    @property
+    def remaining_windows(self) -> int:
+        return max(0, self.total_windows - self.completed_windows)
+
+    @property
+    def current_pages_remaining(self) -> int:
+        return max(0, self.current_pages_total - self.current_pages_done)
+
+    @property
+    def estimated_pages_remaining(self) -> int | None:
+        if self.estimated_total_pages is None:
+            return None
+        return max(0, self.estimated_total_pages - self.confirmed_pages)
+
+    @property
+    def completed_equivalent_windows(self) -> float:
+        fraction = 0.0
+        if (
+            self.current_pages_total > 0
+            and self.current_window_index is not None
+            and self.current_window_index > self.completed_windows
+        ):
+            fraction = min(1.0, self.current_pages_done / self.current_pages_total)
+        return min(float(self.total_windows), self.completed_windows + fraction)
+
+    @property
+    def percentage(self) -> float:
+        if self.total_windows <= 0:
+            return 0.0
+        return self.completed_equivalent_windows / self.total_windows * 100.0
+
+
+@dataclass(frozen=True, slots=True)
 class CapturedResponse:
     requested_at: str
     responded_at: str
@@ -164,11 +217,27 @@ class PlanSummary:
     remaining_main_requests: int
     estimated_main_seconds: float
     minimum_detail_requests: int
+    reused: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class BatchPlanSummary:
     plans: tuple[PlanSummary, ...]
+    population_windows: int | None = None
+
+    @property
+    def _scale(self) -> float:
+        if not self.plans or self.population_windows is None:
+            return 1.0
+        return max(1.0, self.population_windows / len(self.plans))
+
+    @property
+    def is_approximate(self) -> bool:
+        return self.population_windows is not None and self.population_windows > len(self.plans)
+
+    @property
+    def sample_size(self) -> int:
+        return len(self.plans)
 
     @property
     def run_id(self) -> str:
@@ -180,11 +249,11 @@ class BatchPlanSummary:
 
     @property
     def total_pages(self) -> int:
-        return sum(plan.total_pages for plan in self.plans)
+        return round(sum(plan.total_pages for plan in self.plans) * self._scale)
 
     @property
     def total_records(self) -> int:
-        return sum(plan.total_records for plan in self.plans)
+        return round(sum(plan.total_records for plan in self.plans) * self._scale)
 
     @property
     def first_page_records(self) -> int:
@@ -196,11 +265,11 @@ class BatchPlanSummary:
 
     @property
     def estimated_download_bytes(self) -> int:
-        return sum(plan.estimated_download_bytes for plan in self.plans)
+        return round(sum(plan.estimated_download_bytes for plan in self.plans) * self._scale)
 
     @property
     def estimated_database_bytes(self) -> int:
-        return sum(plan.estimated_database_bytes for plan in self.plans)
+        return round(sum(plan.estimated_database_bytes for plan in self.plans) * self._scale)
 
     @property
     def free_disk_bytes(self) -> int:
@@ -212,19 +281,25 @@ class BatchPlanSummary:
 
     @property
     def first_page_latency_ms(self) -> float:
-        return sum(plan.first_page_latency_ms for plan in self.plans)
+        if not self.plans:
+            return 0.0
+        return sum(plan.first_page_latency_ms for plan in self.plans) / len(self.plans)
 
     @property
     def remaining_main_requests(self) -> int:
-        return sum(plan.remaining_main_requests for plan in self.plans)
+        return round(sum(plan.remaining_main_requests for plan in self.plans) * self._scale)
 
     @property
     def estimated_main_seconds(self) -> float:
-        return sum(plan.estimated_main_seconds for plan in self.plans)
+        return sum(plan.estimated_main_seconds for plan in self.plans) * self._scale
 
     @property
     def minimum_detail_requests(self) -> int:
-        return sum(plan.minimum_detail_requests for plan in self.plans)
+        return round(sum(plan.minimum_detail_requests for plan in self.plans) * self._scale)
+
+    @property
+    def reused_plans(self) -> int:
+        return sum(1 for plan in self.plans if plan.reused)
 
 
 @dataclass(frozen=True, slots=True)

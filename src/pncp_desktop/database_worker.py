@@ -29,6 +29,7 @@ class DatabaseTaskThread(QThread):
             actions = {
                 "snapshot": "snapshot",
                 "advanced_search": "advanced_search",
+                "advanced_search_all": "advanced_search_all",
                 "hybrid_search": "hybrid_search",
                 "duplicate_candidates": "duplicate_candidates",
                 "performance_report": "performance_report",

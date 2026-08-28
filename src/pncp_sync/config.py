@@ -11,12 +11,16 @@ class SyncConfig:
     db_path: Path
     base_url: str = "https://pncp.gov.br/api/consulta/v1"
     details_base_url: str = "https://pncp.gov.br/api/pncp/v1"
-    timeout_seconds: int = 30
+    # O PNCP apresenta picos reais de latencia. O limite maior evita falsos erros,
+    # enquanto as retentativas continuam limitadas para nunca prender a aplicacao.
+    timeout_seconds: int = 90
     max_retries: int = 3
     max_concurrent: int = 1
     max_window_days: int = 31
     lease_seconds: int = 300
     max_response_bytes: int = 25 * 1024 * 1024
+    continuous_retry_base_seconds: int = 60
+    continuous_retry_max_seconds: int = 15 * 60
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "db_path", Path(self.db_path).expanduser().resolve())
@@ -36,6 +40,10 @@ class SyncConfig:
             raise ValueError("A concessão de trabalho deve durar pelo menos 30 segundos.")
         if self.max_response_bytes < 1024 or self.max_response_bytes > 100 * 1024 * 1024:
             raise ValueError("O limite de resposta deve ficar entre 1 KB e 100 MB.")
+        if self.continuous_retry_base_seconds < 1:
+            raise ValueError("A espera inicial da carga contínua deve ser positiva.")
+        if self.continuous_retry_max_seconds < self.continuous_retry_base_seconds:
+            raise ValueError("A espera máxima deve ser maior ou igual à espera inicial.")
 
     def ensure_storage_directory(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)

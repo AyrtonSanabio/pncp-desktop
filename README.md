@@ -1,157 +1,95 @@
-# Espelho local do PNCP e busca vetorial
+# Consulta PNCP Desktop
 
-Este repositório nasceu como um protótipo de interface desktop. O foco ativo mudou: construir um sincronizador que use o `pypncp` para coletar dados públicos do Portal Nacional de Contratações Públicas (PNCP), manter um banco local atualizável e, em uma etapa posterior, permitir busca semântica sobre os itens das contratações.
+Aplicativo Windows de consulta e espelhamento local dos dados públicos do Portal Nacional
+de Contratações Públicas (PNCP). O programa consulta a API oficial, organiza as respostas
+em um único banco SQLite e permite pesquisar, analisar e exportar os dados sem repetir
+consultas pela internet.
 
-O nome da pasta continua `pncp-desktop` para não quebrar caminhos existentes. A interface já implementada foi preservada como uma melhoria futura; ela não é o produto principal desta etapa.
+O aplicativo é estritamente de leitura. Ele não publica, retifica nem exclui informações
+no PNCP.
 
-## O problema que queremos resolver
+## O que o programa faz
 
-O `pypncp` simplifica consultas à API, mas não cria nem mantém um banco completo. Nosso software deverá transformar consultas paginadas em uma carga confiável e repetível:
+- consulta contratações online por período, página e CNPJ do órgão comprador;
+- sincroniza uma data/modalidade específica ou toda a série desde 01/01/2021;
+- divide a carga nacional em janelas de até 31 dias e nas 15 modalidades do PNCP;
+- confirma cada página em uma transação SQLite e retoma do primeiro checkpoint ausente;
+- repete indefinidamente falhas temporárias da carga completa, com espera progressiva;
+- preserva a resposta JSON original comprimida e os dados normalizados;
+- evita duplicação pelo identificador PNCP e detecta registros novos ou alterados;
+- pesquisa o banco local por texto, órgão, CNPJ, município, fornecedor, modalidade,
+  situação, valor e período;
+- mostra detalhes, itens, resultados/fornecedores, histórico de sincronizações e análises;
+- exporta resultados filtrados para CSV;
+- cria backups e verifica a integridade do banco.
 
-```text
-API pública do PNCP
-    -> pypncp
-        -> coletor por períodos, modalidades e páginas
-            -> dados brutos preservados
-                -> validação e normalização
-                    -> banco relacional
-                        -> índice textual e vetorial dos itens
-                            -> CLI, API ou interface simples
+PDFs e outros documentos não são baixados automaticamente.
+
+## Áreas da interface
+
+- **Comece aqui:** explica os conceitos e apresenta um primeiro roteiro de uso.
+- **Consulta online:** faz uma consulta pontual no PNCP sem gravar uma carga nacional.
+- **Sincronização:** estima, baixa, pausa e retoma os dados no banco principal.
+- **Banco local:** pesquisa, histórico, análises, backup, diagnóstico e manutenção.
+
+## Executar o projeto
+
+No Windows, execute `run.bat`. O lançador cria o ambiente virtual e instala as dependências
+quando necessário. O projeto requer Python 3.12 ou mais recente para desenvolvimento.
+
+Também é possível preparar manualmente o ambiente:
+
+```powershell
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\python.exe -m pncp_desktop
 ```
 
-Embora a conversa use a palavra “scraper”, o caminho principal será consumir APIs públicas. Extração de páginas HTML só deve existir se algum dado necessário não estiver disponível em uma API permitida e estável.
-
-## Estado atual
-
-- pacote `pncp_sync` implementado sem acoplamento à interface antiga;
-- CLI para planejar, executar, retomar, verificar e pesquisar contratações e detalhes;
-- SQLite com migração, FTS5, payload bruto comprimido, dados normalizados e auditoria;
-- carga por publicação, checkpoints por página, retomada e idempotência implementados;
-- campos úteis ainda ignorados pelo modelo do `pypncp` preservados e normalizados;
-- banco local carregado em segundo plano, sem bloquear a troca de abas;
-- escolha persistente do arquivo SQLite e atualização incremental pela última execução;
-- painel de cobertura, erros, rejeições, validações do `pypncp` e integridade do banco;
-- fatia real de 94 contratações concluída e reexecutada sem duplicação;
-- prova da Fase 2 com um item e seu resultado/fornecedor concluída e reexecutada;
-- protótipo anterior da interface mantido no código e em `docs/melhorias-futuras/`;
-- cobertura ampla de itens/resultados, contratos, atas, atualização incremental e índice
-  vetorial ainda pendentes.
-
-O `run.bat` abre a interface integrada, com as áreas Consulta online, Sincronização e
-Banco local. A interface mostra estimativa, progresso, pausa/continuação, detalhes de
-contratações, itens e fornecedores, além de pesquisa textual local.
-
-A aba **Comece aqui** explica para que os dados servem, a diferença entre contrato e
-contratação, o papel de cada área, um primeiro teste seguro e um glossário. A estimativa
-mostra tempo aproximado da carga principal, páginas/respostas compactadas, registros,
-rede e banco. Itens e resultados são apresentados como chamadas adicionais mínimas,
-pois sua quantidade só é descoberta durante a coleta.
-
-## Executável para Windows
-
-Com Python instalado apenas na máquina de desenvolvimento, gere o pacote portátil:
+## Gerar o aplicativo Windows
 
 ```powershell
 .\build_exe.bat
 ```
 
-O resultado é `dist\\ConsultaPNCP.exe`. Para distribuir, copie o executável para uma
-pasta com permissão de escrita; o banco será criado em `data\\pncp.sqlite3` ao lado dele.
-O usuário final não precisa instalar Python nem abrir um terminal.
+O pacote portátil é criado em `dist\ConsultaPNCP\`. A pasta inteira deve ser distribuída,
+pois contém o executável e as bibliotecas do Qt. `build_installer.bat` gera o instalador
+quando o Inno Setup está disponível.
 
-## Executar a primeira fatia
+Em uma instalação nova, o banco padrão fica em:
 
-```powershell
-.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
-.\.venv\Scripts\pncp-sync.exe --db data/pncp.sqlite3 doctor
-.\.venv\Scripts\pncp-sync.exe --db data/pncp.sqlite3 plan `
-    --data-inicial 2026-08-26 --data-final 2026-08-26 --modalidade 12
+```text
+%LOCALAPPDATA%\AyrtonSanabio\PNCPDesktop\pncp.sqlite3
 ```
 
-O comando `plan` consulta somente a primeira página, informa volume, espaço e campos
-não modelados e retorna um `run_id`. A carga só começa ao executar:
+O botão **Escolher local dos dados** pode apontar o banco para outra unidade. A escolha fica
+salva para as próximas execuções.
+
+## Qualidade
 
 ```powershell
-.\.venv\Scripts\pncp-sync.exe --db data/pncp.sqlite3 run --run-id SEU_RUN_ID
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m ruff check .
 ```
 
-Use `Ctrl+C` para interromper com segurança e `resume` para continuar. O checkpoint só
-é confirmado na mesma transação que grava o payload e os registros normalizados.
+O build oficial também executa um teste isolado do executável sem consultar a internet.
 
-Depois de concluir uma execução de contratações, itens e resultados podem ser planejados
-sem fazer requisições:
+## Limites atuais
 
-```powershell
-.\.venv\Scripts\pncp-sync.exe --db data/pncp.sqlite3 plan-details `
-    --source-run-id SEU_RUN_ID --limit 1
-.\.venv\Scripts\pncp-sync.exe --db data/pncp.sqlite3 run-details `
-    --detail-run-id SEU_DETAIL_RUN_ID
-```
+- o tempo da carga depende da disponibilidade e dos limites de frequência do PNCP;
+- a estimativa nacional usa uma amostra de até 12 lotes e apresenta aproximações;
+- a carga contínua automática cobre as contratações principais; itens e resultados possuem
+  execuções próprias e aumentam significativamente a quantidade de chamadas;
+- os dados locais são uma cópia para consulta e não substituem o registro, edital ou documento
+  oficial do PNCP.
 
-O limite pequeno é intencional enquanto medimos a quantidade de itens e chamadas de
-resultado por contratação.
+## Documentação técnica
 
-## Primeiro recorte implementável
+- [Índice da documentação](docs/README.md)
+- [Arquitetura](docs/ARQUITETURA.md)
+- [Banco de dados](docs/BANCO_DE_DADOS.md)
+- [Sincronização e recuperação](docs/SINCRONIZACAO_E_RECUPERACAO.md)
+- [API e dados armazenados](docs/API_E_DADOS.md)
+- [Segurança e responsabilidade](docs/SEGURANCA_E_RESPONSABILIDADE.md)
+- [Desenvolvimento e distribuição](docs/DESENVOLVIMENTO.md)
 
-Antes de tentar baixar “o PNCP inteiro”, faremos uma fatia vertical pequena e verificável:
-
-1. coletar contratações de um período curto e de uma modalidade;
-2. preservar a resposta original e gravar registros normalizados;
-3. salvar o ponto de continuação da carga;
-4. interromper e retomar sem duplicar dados;
-5. repetir a mesma carga e provar idempotência;
-6. medir requisições, registros, erros, tempo e espaço em disco;
-7. só depois incluir itens, resultados, contratos e atas;
-8. criar embeddings e índice vetorial somente após os itens estarem completos e estáveis.
-
-## Documentação principal
-
-- [Visão do produto e definição do problema](docs/VISAO_DO_SINCRONIZADOR_PNCP.md)
-- [Arquitetura do sincronizador e do banco](docs/ARQUITETURA_DO_SINCRONIZADOR.md)
-- [Complexidade, riscos e plano de execução](docs/COMPLEXIDADE_E_PLANO_DE_EXECUCAO.md)
-- [Dimensionamento, memória, busca vetorial e segurança](docs/DIMENSIONAMENTO_MEMORIA_TEMPO_E_SEGURANCA.md)
-- [Implementação da Fase 1 e prova real](docs/IMPLEMENTACAO_FASE_1.md)
-- [Implementação inicial da Fase 2: itens e resultados](docs/IMPLEMENTACAO_FASE_2.md)
-- [Interface, atualização incremental, erros e validações](docs/INTERFACE_INCREMENTAL_ERROS_E_VALIDACOES.md)
-- [Performance, gargalos e experiência do usuário](docs/PERFORMANCE_GARGALOS_E_EXPERIENCIA_DO_USUARIO.md)
-- [Glossário e trilha de pesquisa](docs/GLOSSARIO_E_TRILHA_DE_ESTUDO.md)
-- [Contexto completo para outra IA](docs/CONTEXTO_PARA_OUTRA_IA.md)
-- [Política de somente leitura e credenciamento](docs/POLITICA_SOMENTE_LEITURA_E_CREDENCIAMENTO.md)
-- [Como Python encontra a biblioteca pypncp](docs/COMO_PYTHON_ENCONTRA_PYPNCP.md)
-- [Melhorias futuras e material preservado](docs/melhorias-futuras/README.md)
-
-## Decisões já tomadas
-
-- O software é estritamente de leitura: não publica, retifica ou exclui dados no PNCP.
-- O `pypncp` será uma dependência e continuará em seu próprio repositório.
-- Uma execução que falha deve poder ser retomada do último ponto confirmado.
-- Reexecutar uma janela já processada não pode duplicar registros.
-- O dado bruto, a origem e a data da coleta serão preservados.
-- Velocidade será obtida com concorrência limitada, lotes e medições; nunca sobrecarregando a fonte.
-- A busca vetorial complementará filtros exatos e busca textual; ela não substituirá o banco relacional.
-- Outras APIs governamentais, novas bibliotecas e a interface final estão fora do foco atual e foram preservadas como melhorias futuras.
-
-## Hipótese de tecnologia
-
-Para uma prova local pequena, SQLite ainda pode ser útil. Para a base completa, a hipótese principal é PostgreSQL, com `pgvector` para a etapa semântica. Essa escolha só será fechada depois de medirmos volume, velocidade de escrita, custo do índice e forma de distribuição no Windows.
-
-Referências técnicas iniciais:
-
-- [Manuais oficiais do PNCP](https://www.gov.br/pncp/pt-br/pncp/manuais)
-- [Dados Abertos do PNCP](https://www.gov.br/pncp/pt-br/acesso-a-informacao/dados-abertos)
-- [PostgreSQL: INSERT e ON CONFLICT](https://www.postgresql.org/docs/current/sql-insert.html)
-- [pgvector: busca vetorial no PostgreSQL](https://github.com/pgvector/pgvector)
-
-## Interface preservada
-
-O protótipo gráfico existente ainda pode ser executado para estudo:
-
-```powershell
-.\run.bat
-```
-
-No Windows, também é possível abrir a pasta no Explorador de Arquivos e dar dois
-cliques em `run.bat`. Na primeira execução, o lançador cria o ambiente virtual e
-instala as dependências automaticamente. É necessário ter Python 3.12 ou mais recente.
-
-Sua arquitetura e prévia estão em [Melhorias futuras — interface desktop](docs/melhorias-futuras/INTERFACE_DESKTOP_ARQUITETURA_E_DESAFIOS.md).
+Fonte dos dados: [Portal Nacional de Contratações Públicas](https://pncp.gov.br/).

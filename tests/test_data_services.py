@@ -46,7 +46,8 @@ def _database_with_contract(path: Path) -> LocalDatabase:
                  data_publicacao_pncp,valor_total_estimado,record_hash,
                  normalizer_version,source_payload_id,first_seen_at,last_seen_at,local_updated_at)
                VALUES(1,'PNCP-1','Manutenção de computadores para escolas',
-                 'suporte ao parque tecnológico','123','Secretaria de Educação','Recife',6,
+                 'suporte ao parque tecnológico','12345678000195',
+                 'Secretaria de Educação','Recife',6,
                  'Pregão Eletrônico',1,'Divulgada','2026-08-20','1000.50','hash-1','test',
                  1,'2026-08-20','2026-08-20','2026-08-20')"""
         )
@@ -78,6 +79,8 @@ def test_migration_v3_is_additive(tmp_path: Path) -> None:
 
 def test_advanced_search_saved_query_synonyms_and_documents(tmp_path: Path) -> None:
     database = _database_with_contract(tmp_path / "data.sqlite3")
+    snapshot = database.snapshot()
+    assert snapshot.rows[0]["orgao_cnpj"] == "12345678000195"
     with database._connect() as connection:  # API de baixo nível testada sem Qt
         service = DataServices(connection)
         service.set_synonyms("assistência em informática", ["manutenção de computadores"])
@@ -87,6 +90,7 @@ def test_advanced_search_saved_query_synonyms_and_documents(tmp_path: Path) -> N
                 "municipio": "Recife",
                 "modalidade": 6,
                 "valor_min": 900,
+                "orgao_cnpj": "12.345.678/0001-95",
             },
         )
         assert page.total == 1

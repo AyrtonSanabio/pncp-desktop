@@ -14,10 +14,23 @@ from pncp_sync.persistence.repositories import PersistResult, SyncRepository
 
 ProgressCallback = Callable[[WorkUnit, PersistResult], Any]
 ActivityCallback = Callable[[WorkUnit], Any]
+StatusCallback = Callable[[str], Any]
 
 
 def _is_recoverable(exc: PNCPError) -> bool:
     return not isinstance(exc, (AuthError, NotFoundError, ValidationError))
+
+
+def _is_rate_limited(exc: PNCPError) -> bool:
+    message = str(exc).casefold()
+    return "too many requests" in message or "429" in message
+
+
+def _retry_delay_seconds(exc: PNCPError, attempt_count: int) -> int:
+    """Respeita uma pausa longa quando o PNCP aplica limitação HTTP 429."""
+    if _is_rate_limited(exc):
+        return 60
+    return min(2 ** max(0, attempt_count - 1), 30)
 
 
 async def run_sync(
@@ -28,6 +41,7 @@ async def run_sync(
     max_pages: int | None = None,
     progress: ProgressCallback | None = None,
     activity: ActivityCallback | None = None,
+    status: StatusCallback | None = None,
 ) -> RunSummary:
     """Executa páginas sequencialmente; cada página é um checkpoint transacional."""
     if max_pages is not None and max_pages < 1:
@@ -47,7 +61,9 @@ async def run_sync(
 
         processed = 0
         while max_pages is None or processed < max_pages:
-            work_unit = repository.claim_next_work_unit(run_id)
+            work_unit = repository.claim_next_work_unit(
+                run_id, max_attempts=config.max_retries
+            )
             if work_unit is None:
                 repository.finalize_run(run_id)
                 return repository.get_summary(run_id)
@@ -87,7 +103,25 @@ async def run_sync(
                     message=str(exc),
                     detail=type(exc).__name__,
                     recoverable=_is_recoverable(exc),
+                    max_attempts=config.max_retries,
                 )
+                if _is_recoverable(exc) and work_unit.attempt_count < config.max_retries:
+                    # Backoff exponencial entre tentativas do lote. O cliente HTTP também
+                    # possui retry próprio; esta camada protege o checkpoint persistente.
+                    delay = _retry_delay_seconds(exc, work_unit.attempt_count)
+                    if status is not None:
+                        reason = (
+                            "O PNCP limitou temporariamente as consultas (HTTP 429)."
+                            if _is_rate_limited(exc)
+                            else "O PNCP apresentou uma falha temporária."
+                        )
+                        status(
+                            f"{reason} A página {work_unit.page_number} continua pendente; "
+                            f"nova tentativa automática em {delay} s "
+                            f"({work_unit.attempt_count + 1}/{config.max_retries})."
+                        )
+                    await asyncio.sleep(delay)
+                    continue
                 return repository.get_summary(run_id)
             except SourceError as exc:
                 repository.mark_unit_error(

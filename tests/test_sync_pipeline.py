@@ -9,11 +9,17 @@ from pypncp import PNCPError
 
 from pncp_desktop.local_database import LocalDatabase
 from pncp_sync.application.plan_sync import plan_sync
-from pncp_sync.application.run_sync import run_sync
+from pncp_sync.application.run_sync import _retry_delay_seconds, run_sync
 from pncp_sync.config import SyncConfig
 from pncp_sync.domain.models import CapturedResponse, SourcePage, SyncWindow
 from pncp_sync.persistence.repositories import SyncRepository
 from tests.test_sync_normalization import sample_record
+
+
+def test_http_429_uses_longer_checkpoint_retry_delay() -> None:
+    assert _retry_delay_seconds(PNCPError("Too Many Requests"), 1) == 60
+    assert _retry_delay_seconds(PNCPError("HTTP 429"), 2) == 60
+    assert _retry_delay_seconds(PNCPError("falha temporária"), 2) == 2
 
 
 def make_page(
@@ -175,6 +181,76 @@ async def test_estimativa_sem_registros_ainda_representa_a_pagina_consultada(
 
 
 @pytest.mark.asyncio
+async def test_http_204_sem_conteudo_eh_lote_vazio_valido(tmp_path: Path) -> None:
+    config = config_for(tmp_path / "empty-204.sqlite3")
+    window = SyncWindow(date(2021, 1, 1), date(2021, 1, 31), 1)
+    empty = SourcePage(
+        page_number=1,
+        total_pages=0,
+        total_records=0,
+        remaining_pages=0,
+        records=(),
+        request_params={},
+        response=CapturedResponse(
+            requested_at="2026-08-27T00:00:00+00:00",
+            responded_at="2026-08-27T00:00:00+00:00",
+            status_code=204,
+            url="https://pncp.gov.br/api/consulta/v1/contratacoes/publicacao",
+            headers={"content-type": "application/json"},
+            content=b"",
+            latency_ms=10,
+        ),
+    )
+    source = FakeSource({1: empty})
+
+    plan = await plan_sync(config, window, source=source)
+    summary = await run_sync(config, plan.run_id, source=source)
+
+    assert plan.total_records == 0
+    assert plan.total_pages == 1
+    assert summary.status == "COMPLETED"
+    assert summary.records_received == 0
+
+
+@pytest.mark.asyncio
+async def test_estimativa_persistida_e_reutilizada_sem_nova_requisicao(
+    tmp_path: Path,
+) -> None:
+    config = config_for(tmp_path / "reusable-plan.sqlite3")
+    window = SyncWindow(date(2026, 8, 26), date(2026, 8, 26), 6)
+    page = make_page(
+        [sample_record(1)], page_number=1, total_pages=3, total_records=21
+    )
+
+    first = await plan_sync(config, window, source=FakeSource({1: page}))
+    reused = await plan_sync(config, window, source=ErrorSource())
+
+    assert reused.run_id == first.run_id
+    assert reused.reused is True
+    assert reused.total_pages == first.total_pages
+    assert reused.total_records == first.total_records
+    with SyncRepository(config.db_path) as repository:
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM ingestion_run"
+        ).fetchone()[0] == 1
+        assert repository.find_resumable_run(window) == first.run_id
+
+    completed = await run_sync(
+        config,
+        first.run_id,
+        source=FakeSource(
+            {
+                2: make_page([], page_number=2, total_pages=3, total_records=21),
+                3: make_page([], page_number=3, total_pages=3, total_records=21),
+            }
+        ),
+    )
+    assert completed.status == "COMPLETED"
+    with SyncRepository(config.db_path) as repository:
+        assert repository.find_completed_run(window) == first.run_id
+
+
+@pytest.mark.asyncio
 async def test_estimativa_rejeita_totais_incoerentes_do_pncp(tmp_path: Path) -> None:
     config = config_for(tmp_path / "invalid-totals.sqlite3")
     window = SyncWindow(date(2026, 8, 26), date(2026, 8, 26), 6)
@@ -224,9 +300,12 @@ async def test_falha_recuperavel_pausa_sem_avancar_checkpoint(tmp_path: Path) ->
 
     summary = await run_sync(config, plan.run_id, source=ErrorSource())
 
-    assert summary.status == "PAUSED"
+    # A execução esgota automaticamente as tentativas do lote nesta chamada.
+    # O checkpoint permanece recuperável para uma retomada posterior.
+    assert summary.status == "FAILED"
     assert summary.succeeded_units == 1
-    assert summary.pending_units == 1
+    assert summary.pending_units == 0
+    assert summary.failed_units == 1
     with SyncRepository(config.db_path) as repository:
         error = repository.connection.execute(
             "SELECT category, recoverable FROM ingestion_error"
@@ -234,7 +313,7 @@ async def test_falha_recuperavel_pausa_sem_avancar_checkpoint(tmp_path: Path) ->
         assert error["category"] == "PNCP"
         assert error["recoverable"] == 1
     diagnostics = LocalDatabase(config.db_path).diagnostics()
-    assert diagnostics.main_errors == 1
+    assert diagnostics.main_errors == config.max_retries
     assert diagnostics.errors[0]["recoverable"] == 1
 
 

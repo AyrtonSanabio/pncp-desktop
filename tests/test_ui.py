@@ -7,11 +7,17 @@ from datetime import date, timedelta
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QLabel
+from PySide6.QtWidgets import QApplication, QHeaderView, QLabel
 
 from pncp_desktop.local_database import DatabaseSnapshot, DatabaseStats, DiagnosticsReport
 from pncp_desktop.ui import ContractDetailDialog, DiagnosticsDialog, MainWindow, formatar_duracao
-from pncp_sync.domain.models import BatchPlanSummary, PlanSummary, RunSummary
+from pncp_sync.domain.models import (
+    BatchPlanSummary,
+    FullSyncProgress,
+    PlanSummary,
+    RunSummary,
+    SyncWindow,
+)
 
 
 def _app() -> QApplication:
@@ -33,6 +39,55 @@ def test_main_window_exposes_tutorial_and_three_work_areas(tmp_path) -> None:
     tutorial_text = " ".join(label.text() for label in window.findChildren(QLabel))
     assert "Primeiro teste recomendado" in tutorial_text
     assert "Contratação" in tutorial_text
+    assert "Como usar as áreas do Banco local" in tutorial_text
+    assert "Segurança e manutenção" in tutorial_text
+    assert "espera progressiva" in tutorial_text
+    assert not hasattr(window, "botao_demo")
+    assert window.tabela_local.horizontalHeader().sectionResizeMode(2) == (
+        QHeaderView.ResizeMode.Fixed
+    )
+    assert window.tabela_local.horizontalHeader().sectionResizeMode(3) == (
+        QHeaderView.ResizeMode.Stretch
+    )
+    window.close()
+    app.processEvents()
+
+
+def test_database_environment_override_is_used_before_saved_settings(
+    monkeypatch, tmp_path
+) -> None:
+    app = _app()
+    forced = tmp_path / "isolated.sqlite3"
+    monkeypatch.setenv("PNCP_DESKTOP_DB_PATH", str(forced))
+
+    window = MainWindow()
+
+    assert window._db_path == forced.resolve()
+    window.close()
+    app.processEvents()
+
+
+def test_local_rows_keep_cnpj_and_object_in_their_columns(tmp_path) -> None:
+    app = _app()
+    window = MainWindow(tmp_path / "columns.sqlite3")
+    window._render_database_rows(
+        [
+            {
+                "id": 1,
+                "numero_controle_pncp": "PNCP-1",
+                "orgao_razao_social": "Órgão comprador",
+                "orgao_cnpj": "12345678000195",
+                "objeto_compra": "Manutenção de computadores",
+                "modalidade_nome": "Pregão eletrônico",
+                "situacao_compra_nome": "Divulgada",
+                "data_encerramento_proposta": "2026-08-30",
+                "valor_total_estimado": "1000.00",
+            }
+        ]
+    )
+
+    assert window.tabela_local.item(0, 2).text() == "12.345.678/0001-95"
+    assert window.tabela_local.item(0, 3).text() == "Manutenção de computadores"
     window.close()
     app.processEvents()
 
@@ -227,3 +282,83 @@ def test_all_modalities_plan_is_aggregated_and_can_start(tmp_path) -> None:
     assert window.botao_sincronizar.isEnabled()
     window.close()
     app.processEvents()
+
+
+def test_full_load_splits_history_into_safe_windows(tmp_path) -> None:
+    app = _app()
+    window = MainWindow(tmp_path / "full-load.sqlite3")
+
+    window.sync_carga_completa.setChecked(True)
+    windows = window._sync_windows()
+
+    assert windows
+    assert {item.modalidade for item in windows} == set(range(1, 16))
+    assert min(item.data_inicial for item in windows).year == 2021
+    assert max(item.data_final for item in windows) == date.today()
+    assert all((item.data_final - item.data_inicial).days < 31 for item in windows)
+    assert not window.sync_data_inicial.isEnabled()
+    assert not window.sync_modalidade.isEnabled()
+    assert not window.incluir_detalhes.isChecked()
+    assert window.botao_sincronizar.isEnabled()
+    assert "sem exigir estimativa" in window.botao_sincronizar.toolTip()
+    window.close()
+    app.processEvents()
+
+
+def test_full_load_progress_shows_global_percentage_and_remaining_pages(tmp_path) -> None:
+    app = _app()
+    window = MainWindow(tmp_path / "full-progress.sqlite3")
+    window.sync_carga_completa.setChecked(True)
+    progress = FullSyncProgress(
+        total_windows=1005,
+        completed_windows=112,
+        current_window_index=113,
+        current_window=SyncWindow(date(2021, 8, 6), date(2021, 9, 5), 8),
+        current_pages_done=17,
+        current_pages_total=63,
+        current_failed_pages=1,
+        confirmed_pages=201,
+        estimated_total_pages=126_211,
+        records_received=170,
+        bytes_received=372_800,
+    )
+
+    window._sync_progresso_carga_completa(progress)
+
+    assert window.sync_progresso.maximum() == 1000
+    assert window.sync_progresso.value() == 112
+    assert "11,2%" in window.sync_progresso.format()
+    assert "112/1005" in window.sync_progresso_resumo.text()
+    assert "893 faltam" in window.sync_progresso_resumo.text()
+    assert "46 faltam" in window.sync_progresso_resumo.text()
+    assert "126010 respostas faltam" in window.sync_progresso_resumo.text()
+    assert "SQLite" in window.sync_progresso_resumo.text()
+    window.close()
+    app.processEvents()
+
+
+def test_sample_summary_extrapolates_population() -> None:
+    plans = tuple(
+        PlanSummary(
+            run_id=f"sample-{index}",
+            total_pages=2,
+            total_records=20,
+            first_page_records=10,
+            first_page_bytes=100,
+            estimated_download_bytes=1000,
+            estimated_database_bytes=2000,
+            free_disk_bytes=1_000_000,
+            unmodeled_fields=(),
+            first_page_latency_ms=1000,
+            remaining_main_requests=1,
+            estimated_main_seconds=10,
+            minimum_detail_requests=20,
+        )
+        for index in range(4)
+    )
+    summary = BatchPlanSummary(plans, population_windows=40)
+
+    assert summary.is_approximate is True
+    assert summary.sample_size == 4
+    assert summary.total_records == 800
+    assert summary.estimated_database_bytes == 80_000

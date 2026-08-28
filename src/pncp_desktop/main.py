@@ -36,7 +36,6 @@ def _current_version() -> str:
 
 def _argumentos() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Consulta PNCP Desktop")
-    parser.add_argument("--demo", action="store_true", help="abre com dados demonstrativos")
     parser.add_argument("--screenshot", type=Path, help="salva uma captura e encerra")
     parser.add_argument(
         "--check-updates",
@@ -50,9 +49,6 @@ def main() -> int:
     argumentos = _argumentos()
     app = criar_aplicacao()
     janela = MainWindow()
-
-    if argumentos.demo:
-        janela.carregar_demonstracao()
 
     janela.show()
     janela.raise_()
