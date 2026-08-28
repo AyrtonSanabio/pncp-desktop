@@ -14,6 +14,7 @@ from pncp_sync.application.plan_details import plan_details
 from pncp_sync.application.plan_sync import plan_sync
 from pncp_sync.application.run_details import run_details
 from pncp_sync.application.run_sync import run_sync
+from pncp_sync.application.run_sync_parallel import run_sync_parallel
 from pncp_sync.config import SyncConfig
 from pncp_sync.domain.models import (
     BatchPlanSummary,
@@ -28,7 +29,7 @@ from pncp_sync.persistence.repositories import SyncRepository
 
 class SyncTaskThread(QThread):
     _PLANNING_ATTEMPTS = 5
-    _PLANNING_PACE_SECONDS = 2.5
+    _PLANNING_PACE_SECONDS = 1.0
     _SAMPLE_WINDOWS = 12
     planned = Signal(object)
     detail_planned = Signal(str)
@@ -54,6 +55,7 @@ class SyncTaskThread(QThread):
         include_contracts: bool = False,
         include_atas: bool = False,
         estimated_total_pages: int | None = None,
+        estimated_total_records: int | None = None,
         replace_plan_id: str | None = None,
         parent: Any = None,
     ) -> None:
@@ -69,6 +71,7 @@ class SyncTaskThread(QThread):
         self.include_contracts = include_contracts
         self.include_atas = include_atas
         self.estimated_total_pages = estimated_total_pages
+        self.estimated_total_records = estimated_total_records
         self.replace_plan_id = replace_plan_id
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task[Any] | None = None
@@ -79,6 +82,7 @@ class SyncTaskThread(QThread):
         self._full_current_index: int | None = None
         self._full_current_window: SyncWindow | None = None
         self._full_confirmed_pages = 0
+        self._full_stored_records: int | None = None
 
     def run(self) -> None:
         loop = asyncio.new_event_loop()
@@ -187,12 +191,7 @@ class SyncTaskThread(QThread):
                     self.activity.emit(
                         f"Retomando {reopened} página(s) do lote {index}."
                     )
-                main_summary = await run_sync(
-                        self.config,
-                        current_run_id,
-                        progress=self._main_progress,
-                        activity=self._main_activity,
-                    )
+                main_summary = await self._run_main_sync(current_run_id)
                 summaries.append(main_summary)
                 if main_summary.status.startswith("COMPLETED") and self.include_details:
                     detail_plan = plan_details(self.config, current_run_id)
@@ -221,12 +220,7 @@ class SyncTaskThread(QThread):
             self.activity.emit(
                 f"Retomando {reopened} página(s) que tiveram falha temporária no PNCP."
             )
-        main_summary = await run_sync(
-            self.config,
-            self.run_id,
-            progress=self._main_progress,
-            activity=self._main_activity,
-        )
+        main_summary = await self._run_main_sync(self.run_id)
         detail_summary = None
         if main_summary.status.startswith("COMPLETED") and self.include_details:
             if not self.detail_run_id:
@@ -271,6 +265,8 @@ class SyncTaskThread(QThread):
         self._full_total_windows = len(self.windows)
         self._full_completed_windows = 0
         self._full_confirmed_pages = 0
+        with SyncRepository(self.config.db_path) as repository:
+            self._full_stored_records = repository.count_contratacoes()
         self._emit_full_progress()
         for index, window in enumerate(self.windows, start=1):
             self._full_current_index = index
@@ -344,13 +340,7 @@ class SyncTaskThread(QThread):
         consecutive_failures = 0
         previous_done = -1
         while True:
-            summary = await run_sync(
-                self.config,
-                run_id,
-                progress=self._main_progress,
-                activity=self._main_activity,
-                status=self.activity.emit,
-            )
+            summary = await self._run_main_sync(run_id, status_updates=True)
             if summary.status.startswith("COMPLETED"):
                 return summary
 
@@ -382,6 +372,22 @@ class SyncTaskThread(QThread):
                 reopened=reopened,
                 cycle=consecutive_failures,
             )
+
+    async def _run_main_sync(
+        self, run_id: str, *, status_updates: bool = False
+    ) -> RunSummary:
+        runner = run_sync_parallel if self.config.max_concurrent > 1 else run_sync
+        return await runner(
+            self.config,
+            run_id,
+            progress=self._main_progress,
+            activity=self._main_activity,
+            status=(
+                self.activity.emit
+                if status_updates or self.config.max_concurrent > 1
+                else None
+            ),
+        )
 
     async def _wait_before_full_retry(
         self,
@@ -504,9 +510,13 @@ class SyncTaskThread(QThread):
         totals = {field: sum(getattr(summary, field) for summary in summaries) for field in fields}
         return DetailRunSummary(detail_run_id="batch", status=status, **totals)
 
-    def _main_progress(self, *_: Any) -> None:
+    def _main_progress(self, *args: Any) -> None:
         if not self.run_id:
             return
+        if self.action == "full_sync" and len(args) >= 2:
+            inserted = int(getattr(args[1], "inserted", 0))
+            if self._full_stored_records is not None:
+                self._full_stored_records += inserted
         with SyncRepository(self.config.db_path) as repository:
             summary = repository.get_summary(self.run_id)
             self.progress.emit("contratacoes", summary)
@@ -526,6 +536,10 @@ class SyncTaskThread(QThread):
             failed = summary.failed_units
             records = summary.records_received
             received = summary.bytes_received
+        if self._full_stored_records is None:
+            with SyncRepository(self.config.db_path) as repository:
+                self._full_stored_records = repository.count_contratacoes()
+        stored_records = self._full_stored_records
         self.full_progress.emit(
             FullSyncProgress(
                 total_windows=self._full_total_windows,
@@ -537,6 +551,8 @@ class SyncTaskThread(QThread):
                 current_failed_pages=failed,
                 confirmed_pages=self._full_confirmed_pages + done,
                 estimated_total_pages=self.estimated_total_pages,
+                stored_records=stored_records,
+                estimated_total_records=self.estimated_total_records,
                 records_received=records,
                 bytes_received=received,
             )

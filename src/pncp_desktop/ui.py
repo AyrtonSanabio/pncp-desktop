@@ -88,6 +88,7 @@ MODALIDADES = (
 # O domínio do PNCP e os modelos do projeto aceitam contratações a partir de 2021.
 # O modo de carga completa divide esse intervalo em lotes seguros de até 31 dias.
 PNCP_HISTORY_START = date(2021, 1, 1)
+FULL_SYNC_ESTIMATE_PREFERENCE = "sync.full_estimate.v1"
 
 
 class ConsultaThread(QThread):
@@ -144,6 +145,10 @@ def formatar_bytes(value: int) -> str:
             return f"{size:.1f} {suffix}" if suffix != "B" else f"{int(size)} B"
         size /= 1024
     return f"{size:.1f} TB"
+
+
+def formatar_inteiro(value: int) -> str:
+    return f"{max(0, int(value)):,}".replace(",", ".")
 
 
 def formatar_duracao(seconds: float) -> str:
@@ -818,7 +823,10 @@ class MainWindow(QMainWindow):
             "quantidade só fica conhecida durante a coleta; por isso são mostrados como um "
             "mínimo, não como uma promessa exata. Internet, lentidão do PNCP e novas tentativas "
             "podem aumentar bastante o tempo. Na carga completa, falhas temporárias entram em "
-            "espera progressiva e são tentadas novamente até você usar Pausar.",
+            "espera progressiva e são tentadas novamente até você usar Pausar. A barra usa "
+            "registros armazenados sobre o total projetado; lotes e páginas são métricas "
+            "separadas. Em Downloads simultâneos, 1 preserva o caminho conservador e 2 ou 4 "
+            "ativam a rede adaptativa, que volta para 1 ao detectar falhas.",
         )
         layout.addWidget(estimate)
 
@@ -942,6 +950,28 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.incluir_detalhes, 2, 3)
         grid.addWidget(self.incluir_contratos, 2, 4)
         grid.addWidget(self.incluir_atas, 2, 5)
+        self.sync_concorrencia = QComboBox()
+        self.sync_concorrencia.addItem("1 — conservador", 1)
+        self.sync_concorrencia.addItem("2 — equilibrado", 2)
+        self.sync_concorrencia.addItem("4 — acelerado experimental", 4)
+        saved_concurrency = self._settings.value("sync_concurrency", 1, type=int)
+        concurrency_index = self.sync_concorrencia.findData(saved_concurrency)
+        self.sync_concorrencia.setCurrentIndex(max(0, concurrency_index))
+        self.sync_concorrencia.setToolTip(
+            "Quantidade máxima de páginas baixadas simultaneamente. O modo acelerado "
+            "reduz automaticamente para uma página quando o PNCP apresenta erros."
+        )
+        self.sync_concorrencia.currentIndexChanged.connect(
+            lambda: self._settings.setValue(
+                "sync_concurrency", int(self.sync_concorrencia.currentData() or 1)
+            )
+        )
+        concurrency_layout = QHBoxLayout()
+        concurrency_label = QLabel("Downloads simultâneos")
+        concurrency_label.setToolTip(self.sync_concorrencia.toolTip())
+        concurrency_layout.addWidget(concurrency_label)
+        concurrency_layout.addWidget(self.sync_concorrencia)
+        concurrency_layout.addStretch(1)
         self.botao_atualizar_desde_ultima = QPushButton("Atualizar desde a última execução")
         self.botao_atualizar_desde_ultima.setObjectName("secundario")
         self.botao_atualizar_desde_ultima.setToolTip(
@@ -984,9 +1014,10 @@ class MainWindow(QMainWindow):
         ):
             botoes.addWidget(button)
         botoes.addStretch(1)
-        grid.addLayout(botoes, 3, 0, 1, 6)
-        grid.addWidget(self.sync_carga_completa, 4, 0, 1, 4)
-        grid.addWidget(self.sync_automatico, 5, 0, 1, 3)
+        grid.addLayout(concurrency_layout, 3, 0, 1, 6)
+        grid.addLayout(botoes, 4, 0, 1, 6)
+        grid.addWidget(self.sync_carga_completa, 5, 0, 1, 4)
+        grid.addWidget(self.sync_automatico, 6, 0, 1, 3)
         grid.setColumnStretch(3, 1)
         grid.setColumnStretch(4, 1)
         layout.addWidget(filters)
@@ -1091,7 +1122,9 @@ class MainWindow(QMainWindow):
             )
             self.sync_progresso.setRange(0, 1000)
             self.sync_progresso.setValue(0)
-            self.sync_progresso.setFormat("Carga completa — 0,0%")
+            self.sync_progresso.setFormat(
+                "Carga completa — percentual depende da estimativa de registros"
+            )
             self.sync_progresso.setVisible(True)
             self.sync_progresso_resumo.setText(
                 "Ao iniciar, o programa lerá o banco e mostrará lotes concluídos, restantes "
@@ -1827,7 +1860,8 @@ class MainWindow(QMainWindow):
         self.carregar_banco_local()
 
     def _sync_config(self) -> SyncConfig:
-        return SyncConfig(db_path=self._db_path)
+        concurrency = int(self.sync_concorrencia.currentData() or 1)
+        return SyncConfig(db_path=self._db_path, max_concurrent=concurrency)
 
     def _sync_window(self) -> SyncWindow:
         modalidade = self.sync_modalidade.currentData()
@@ -1915,12 +1949,10 @@ class MainWindow(QMainWindow):
 
     def _executar_carga_completa(self) -> None:
         windows = self._sync_windows()
-        estimated_total_pages = (
-            self._sync_plan.total_pages
-            if isinstance(self._sync_plan, BatchPlanSummary)
-            and self._sync_plan.is_approximate
-            else None
-        )
+        estimate = self._full_sync_estimate(windows)
+        estimated_total_pages = estimate.get("total_pages")
+        estimated_total_records = estimate.get("total_records")
+        config = self._sync_config()
         self._sync_plan = None
         self._sync_can_continue = False
         self._set_sync_busy(True)
@@ -1929,21 +1961,48 @@ class MainWindow(QMainWindow):
         self.sync_status_label.setText(
             f"Carga completa iniciada: {len(windows)} lotes. Cada lote confirmado fica "
             "salvo e não será repetido após reinício. Falhas temporárias serão tentadas "
-            "novamente até você usar Pausar."
+            f"novamente até você usar Pausar. Rede: até {config.max_concurrent} página(s) "
+            "simultânea(s), com redução automática em caso de erro."
         )
         worker = SyncTaskThread(
-            self._sync_config(),
+            config,
             action="full_sync",
             windows=windows,
             include_details=self.incluir_detalhes.isChecked(),
             include_contracts=self.incluir_contratos.isChecked(),
             include_atas=self.incluir_atas.isChecked(),
             estimated_total_pages=estimated_total_pages,
+            estimated_total_records=estimated_total_records,
             parent=self,
         )
         self._connect_sync_worker(worker)
         self._sync_worker = worker
         worker.start()
+
+    def _full_sync_estimate(self, windows: tuple[SyncWindow, ...]) -> dict[str, int]:
+        if isinstance(self._sync_plan, BatchPlanSummary) and self._sync_plan.is_approximate:
+            return {
+                "total_pages": self._sync_plan.total_pages,
+                "total_records": self._sync_plan.total_records,
+            }
+        saved = self._local_database.get_preference(FULL_SYNC_ESTIMATE_PREFERENCE, {})
+        if not isinstance(saved, dict) or not windows:
+            return {}
+        expected_start = min(window.data_inicial for window in windows).isoformat()
+        expected_end = max(window.data_final for window in windows).isoformat()
+        if (
+            saved.get("total_windows") != len(windows)
+            or saved.get("scope_start") != expected_start
+            or saved.get("scope_end") != expected_end
+        ):
+            return {}
+        total_pages = saved.get("total_pages")
+        total_records = saved.get("total_records")
+        if not isinstance(total_pages, int) or total_pages <= 0:
+            return {}
+        if not isinstance(total_records, int) or total_records <= 0:
+            return {}
+        return {"total_pages": total_pages, "total_records": total_records}
 
     def continuar_sincronizacao(self) -> None:
         if self.sync_carga_completa.isChecked():
@@ -2013,6 +2072,27 @@ class MainWindow(QMainWindow):
         self.sync_progresso.setRange(0, max(1, summary.total_pages))
         self.sync_progresso.setValue(0)
         approximate = isinstance(summary, BatchPlanSummary) and summary.is_approximate
+        if approximate:
+            windows = self._sync_windows()
+            estimate = {
+                "total_pages": summary.total_pages,
+                "total_records": summary.total_records,
+                "total_windows": len(windows),
+                "sample_size": summary.sample_size,
+                "scope_start": min(window.data_inicial for window in windows).isoformat(),
+                "scope_end": max(window.data_final for window in windows).isoformat(),
+                "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            }
+            try:
+                self._local_database.set_preference(
+                    FULL_SYNC_ESTIMATE_PREFERENCE, estimate
+                )
+            except Exception as exc:
+                self.sync_alertas.setText(
+                    "A estimativa foi calculada, mas não pôde ser preservada no banco: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                self.sync_alertas.setObjectName("alertaErro")
         prefix = "Aproximação: " if approximate else ""
         self.sync_metricas.setText(
             f"{prefix}{summary.total_records} registros • {summary.total_pages} páginas • "
@@ -2155,14 +2235,44 @@ class MainWindow(QMainWindow):
             )
 
     def _sync_progresso_carga_completa(self, progress: FullSyncProgress) -> None:
-        """Mostra um percentual global honesto e o total conhecido do lote atual."""
+        """Separa o percentual estimado por registros das métricas exatas de execução."""
         self._full_sync_progress = progress
-        percentage = max(0.0, min(100.0, progress.percentage))
-        self.sync_progresso.setRange(0, 1000)
-        self.sync_progresso.setValue(round(percentage * 10))
-        self.sync_progresso.setFormat(
-            f"Carga completa — {percentage:.1f}%".replace(".", ",")
-        )
+        records_percentage = progress.record_percentage
+        if records_percentage is None:
+            self.sync_progresso.setRange(0, 1000)
+            self.sync_progresso.setValue(0)
+            self.sync_progresso.setFormat(
+                "Carga completa — estime o total de registros para calcular %"
+            )
+            records_text = (
+                f"Registros únicos no banco: {formatar_inteiro(progress.stored_records)}; "
+                "total ainda sem "
+                "estimativa. Use Estimar para criar uma projeção por amostragem"
+            )
+        else:
+            displayed_percentage = max(0.0, min(100.0, records_percentage))
+            self.sync_progresso.setRange(0, 1000)
+            self.sync_progresso.setValue(round(displayed_percentage * 10))
+            self.sync_progresso.setFormat(
+                f"Registros armazenados — {displayed_percentage:.2f}% estimado".replace(
+                    ".", ","
+                )
+            )
+            if records_percentage > 100:
+                records_text = (
+                    "Registros únicos no banco: "
+                    f"{formatar_inteiro(progress.stored_records)}; a projeção de "
+                    f"{formatar_inteiro(progress.estimated_total_records or 0)} foi superada "
+                    "e deve ser recalculada"
+                )
+            else:
+                records_text = (
+                    "Registros únicos no banco: "
+                    f"{formatar_inteiro(progress.stored_records)}/aprox. "
+                    f"{formatar_inteiro(progress.estimated_total_records or 0)}; cerca de "
+                    f"{formatar_inteiro(progress.estimated_records_remaining or 0)} "
+                    "faltam pela amostra"
+                )
         self.sync_progresso.setVisible(True)
         self.sync_progresso_resumo.setVisible(True)
 
@@ -2199,10 +2309,13 @@ class MainWindow(QMainWindow):
             else " • o total global de respostas será descoberto lote a lote"
         )
         self.sync_progresso_resumo.setText(
-            f"Lotes: {progress.completed_windows}/{progress.total_windows} concluídos; "
+            f"{records_text}. Lotes: {progress.completed_windows}/"
+            f"{progress.total_windows} concluídos "
+            f"({progress.window_percentage:.1f}% operacional); "
             f"{progress.remaining_windows} faltam{window_text}{page_text}{failure_text}"
             f"{global_pages_text}. "
-            "As respostas ficam compactadas dentro do SQLite; não são arquivos separados."
+            "O percentual da barra usa registros estimados; lotes e páginas são mostrados "
+            "separadamente. As respostas ficam compactadas dentro do SQLite."
         )
 
     @staticmethod
@@ -2357,6 +2470,7 @@ class MainWindow(QMainWindow):
         self.incluir_detalhes.setEnabled(not busy)
         self.incluir_contratos.setEnabled(not busy)
         self.incluir_atas.setEnabled(not busy)
+        self.sync_concorrencia.setEnabled(not busy)
         self.botao_atualizar_desde_ultima.setEnabled(not busy)
         self.sync_automatico.setEnabled(not busy)
         self.sync_carga_completa.setEnabled(not busy)

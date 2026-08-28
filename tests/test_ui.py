@@ -7,6 +7,7 @@ from datetime import date, timedelta
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication, QHeaderView, QLabel
 
 from pncp_desktop.local_database import DatabaseSnapshot, DatabaseStats, DiagnosticsReport
@@ -264,7 +265,7 @@ def test_all_modalities_plan_is_aggregated_and_can_start(tmp_path) -> None:
             first_page_bytes=100,
             estimated_download_bytes=1000,
             estimated_database_bytes=2000,
-            free_disk_bytes=1_000_000,
+            free_disk_bytes=1_000_000_000,
             unmodeled_fields=(),
             first_page_latency_ms=100,
             remaining_main_requests=max(0, code - 1),
@@ -319,6 +320,8 @@ def test_full_load_progress_shows_global_percentage_and_remaining_pages(tmp_path
         current_failed_pages=1,
         confirmed_pages=201,
         estimated_total_pages=126_211,
+        stored_records=1_000,
+        estimated_total_records=1_000_000,
         records_received=170,
         bytes_received=372_800,
     )
@@ -326,13 +329,75 @@ def test_full_load_progress_shows_global_percentage_and_remaining_pages(tmp_path
     window._sync_progresso_carga_completa(progress)
 
     assert window.sync_progresso.maximum() == 1000
-    assert window.sync_progresso.value() == 112
-    assert "11,2%" in window.sync_progresso.format()
+    assert window.sync_progresso.value() == 1
+    assert "0,10% estimado" in window.sync_progresso.format()
+    assert "1.000/aprox. 1.000.000" in window.sync_progresso_resumo.text()
+    assert "999.000 faltam" in window.sync_progresso_resumo.text()
+    assert "11.2% operacional" in window.sync_progresso_resumo.text()
     assert "112/1005" in window.sync_progresso_resumo.text()
     assert "893 faltam" in window.sync_progresso_resumo.text()
     assert "46 faltam" in window.sync_progresso_resumo.text()
     assert "126010 respostas faltam" in window.sync_progresso_resumo.text()
     assert "SQLite" in window.sync_progresso_resumo.text()
+    window.close()
+    app.processEvents()
+
+
+def test_sync_concurrency_is_opt_in_and_can_reach_four(tmp_path) -> None:
+    app = _app()
+    settings = QSettings("AyrtonSanabio", "PNCPDesktop")
+    previous = settings.value("sync_concurrency", None)
+    window = MainWindow(tmp_path / "concurrency.sqlite3")
+    try:
+        window.sync_concorrencia.setCurrentIndex(window.sync_concorrencia.findData(1))
+        assert window._sync_config().max_concurrent == 1
+
+        window.sync_concorrencia.setCurrentIndex(window.sync_concorrencia.findData(4))
+        assert window._sync_config().max_concurrent == 4
+        assert "experimental" in window.sync_concorrencia.currentText()
+    finally:
+        window.close()
+        if previous is None:
+            settings.remove("sync_concurrency")
+        else:
+            settings.setValue("sync_concurrency", previous)
+        settings.sync()
+        app.processEvents()
+
+
+def test_full_load_estimate_is_preserved_in_its_database(tmp_path) -> None:
+    app = _app()
+    database_path = tmp_path / "estimate.sqlite3"
+    window = MainWindow(database_path)
+    window.sync_carga_completa.setChecked(True)
+    population_windows = len(window._sync_windows())
+    plans = tuple(
+        PlanSummary(
+            run_id=f"sample-{index}",
+            total_pages=2,
+            total_records=20,
+            first_page_records=10,
+            first_page_bytes=100,
+            estimated_download_bytes=1000,
+            estimated_database_bytes=2000,
+            free_disk_bytes=1_000_000_000,
+            unmodeled_fields=(),
+            first_page_latency_ms=1000,
+            remaining_main_requests=1,
+            estimated_main_seconds=10,
+            minimum_detail_requests=20,
+        )
+        for index in range(4)
+    )
+    summary = BatchPlanSummary(plans, population_windows=population_windows)
+
+    window._sync_planejado(summary)
+    saved = window._full_sync_estimate(window._sync_windows())
+
+    assert saved == {
+        "total_pages": summary.total_pages,
+        "total_records": summary.total_records,
+    }
     window.close()
     app.processEvents()
 

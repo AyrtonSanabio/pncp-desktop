@@ -45,9 +45,15 @@ repetida com segurança.
 
 ## Concorrência e memória
 
-A carga principal usa uma unidade de rede por vez. A página recebida é processada e liberada
-antes da próxima, portanto a memória não cresce com o total nacional. SQLite possui um único
-fluxo gravador, `busy_timeout`, chaves estrangeiras e modo WAL configurado pelos repositórios.
+A carga principal mantém dois motores. O sequencial é usado no modo conservador. O motor
+acelerado pode manter até 2 ou 4 downloads de páginas em andamento, mas processa e confirma
+os resultados um por vez. Assim, SQLite continua com um único fluxo gravador e os checkpoints
+mantêm a mesma transação do modo conservador.
+
+A concorrência é adaptativa: começa abaixo do teto, aumenta somente depois de páginas
+confirmadas e volta imediatamente para 1 após falha HTTP. O número de respostas mantidas em
+memória fica limitado ao teto selecionado, sem relação com o volume nacional. SQLite usa
+`busy_timeout`, chaves estrangeiras e modo WAL configurado pelos repositórios.
 
 ## Consulta online e banco local
 

@@ -1,0 +1,182 @@
+from __future__ import annotations
+
+import asyncio
+from collections import Counter
+from datetime import date
+from pathlib import Path
+
+import pytest
+from pypncp import PNCPError
+
+from pncp_sync.application import run_sync_parallel as parallel_module
+from pncp_sync.application.plan_sync import plan_sync
+from pncp_sync.application.run_sync_parallel import run_sync_parallel
+from pncp_sync.config import SyncConfig
+from pncp_sync.domain.models import SourcePage, SyncWindow
+from pncp_sync.persistence.repositories import SyncRepository
+from tests.test_sync_normalization import sample_record
+from tests.test_sync_pipeline import make_page
+
+
+class ConcurrentSource:
+    def __init__(self, pages: dict[int, SourcePage]) -> None:
+        self.pages = pages
+        self.calls: list[int] = []
+        self.active = 0
+        self.max_active = 0
+
+    async def fetch_publications(
+        self, _window: SyncWindow, page_number: int
+    ) -> SourcePage:
+        self.calls.append(page_number)
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            await asyncio.sleep(0.01)
+            return self.pages[page_number]
+        finally:
+            self.active -= 1
+
+
+class FailOnceSource:
+    def __init__(self, pages: dict[int, SourcePage]) -> None:
+        self.pages = pages
+        self.calls: Counter[int] = Counter()
+
+    async def fetch_publications(
+        self, _window: SyncWindow, page_number: int
+    ) -> SourcePage:
+        self.calls[page_number] += 1
+        if page_number == 2 and self.calls[page_number] == 1:
+            raise PNCPError("HTTP 504 controlado")
+        return self.pages[page_number]
+
+
+class BlockingSource:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def fetch_publications(
+        self, _window: SyncWindow, _page_number: int
+    ) -> SourcePage:
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("a fonte bloqueada deveria ter sido cancelada")
+
+
+def _pages(total: int) -> dict[int, SourcePage]:
+    return {
+        page: make_page(
+            [sample_record(page)],
+            page_number=page,
+            total_pages=total,
+            total_records=total,
+        )
+        for page in range(1, total + 1)
+    }
+
+
+def _config(path: Path, *, concurrency: int = 4) -> SyncConfig:
+    return SyncConfig(
+        db_path=path,
+        lease_seconds=30,
+        max_concurrent=concurrency,
+        max_retries=3,
+    )
+
+
+@pytest.mark.asyncio
+async def test_parallel_runner_ramps_to_four_and_keeps_individual_checkpoints(
+    tmp_path: Path,
+) -> None:
+    pages = _pages(21)
+    source = ConcurrentSource(pages)
+    config = _config(tmp_path / "parallel.sqlite3")
+    window = SyncWindow(date(2026, 8, 1), date(2026, 8, 1), 6)
+    plan = await plan_sync(config, window, source=source)
+
+    summary = await run_sync_parallel(config, plan.run_id, source=source)
+
+    assert summary.status == "COMPLETED"
+    assert summary.succeeded_units == 21
+    assert summary.records_inserted == 21
+    assert source.max_active == 4
+    assert source.calls.count(1) == 1
+    with SyncRepository(config.db_path) as repository:
+        assert repository.count_contratacoes() == 21
+        statuses = repository.connection.execute(
+            "SELECT status, COUNT(*) FROM work_unit GROUP BY status"
+        ).fetchall()
+        assert [(row[0], row[1]) for row in statuses] == [("SUCCEEDED", 21)]
+        assert repository.verify(plan.run_id)["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_parallel_runner_drops_to_one_and_retries_without_gaps(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pages = _pages(6)
+    source = FailOnceSource(pages)
+    config = _config(tmp_path / "adaptive.sqlite3")
+    window = SyncWindow(date(2026, 8, 2), date(2026, 8, 2), 6)
+    plan = await plan_sync(config, window, source=source)
+    messages: list[str] = []
+
+    async def no_wait(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(parallel_module.asyncio, "sleep", no_wait)
+    summary = await run_sync_parallel(
+        config,
+        plan.run_id,
+        source=source,
+        status=messages.append,
+    )
+
+    assert summary.status == "COMPLETED"
+    assert summary.succeeded_units == 6
+    assert summary.failed_units == 0
+    assert source.calls[2] == 2
+    assert any("reduzida automaticamente para 1" in message for message in messages)
+    with SyncRepository(config.db_path) as repository:
+        assert repository.count_contratacoes() == 6
+        assert repository.verify(plan.run_id)["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_parallel_cancellation_releases_claims_and_sequential_path_can_resume(
+    tmp_path: Path,
+) -> None:
+    pages = _pages(4)
+    planning_source = ConcurrentSource(pages)
+    parallel_config = _config(tmp_path / "cancel.sqlite3")
+    window = SyncWindow(date(2026, 8, 3), date(2026, 8, 3), 6)
+    plan = await plan_sync(parallel_config, window, source=planning_source)
+    blocking_source = BlockingSource()
+
+    task = asyncio.create_task(
+        run_sync_parallel(parallel_config, plan.run_id, source=blocking_source)
+    )
+    await blocking_source.started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    with SyncRepository(parallel_config.db_path) as repository:
+        summary = repository.get_summary(plan.run_id)
+        assert summary.status == "PAUSED"
+        assert summary.pending_units == 4
+        assert summary.succeeded_units == 0
+
+    sequential_config = _config(parallel_config.db_path, concurrency=1)
+    resumed = await run_sync_parallel(
+        sequential_config,
+        plan.run_id,
+        source=ConcurrentSource(pages),
+    )
+
+    assert resumed.status == "COMPLETED"
+    assert resumed.succeeded_units == 4
+    with SyncRepository(parallel_config.db_path) as repository:
+        assert repository.count_contratacoes() == 4
+        assert repository.verify(plan.run_id)["ok"] is True

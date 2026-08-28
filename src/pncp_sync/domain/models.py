@@ -34,8 +34,9 @@ class FullSyncProgress:
     """Progresso global conhecido da carga completa.
 
     O número total de páginas futuras só é conhecido depois que cada janela é
-    planejada. Por isso, o percentual global usa lotes concluídos e a fração já
-    confirmada do lote atual, sem inventar uma contagem de respostas futuras.
+    planejada. A barra principal usa contratos únicos armazenados sobre o total
+    projetado pela amostra, deixando a natureza estimada explícita. Lotes e
+    páginas continuam disponíveis como métricas exatas separadas.
     """
 
     total_windows: int
@@ -47,6 +48,8 @@ class FullSyncProgress:
     current_failed_pages: int = 0
     confirmed_pages: int = 0
     estimated_total_pages: int | None = None
+    stored_records: int = 0
+    estimated_total_records: int | None = None
     records_received: int = 0
     bytes_received: int = 0
 
@@ -76,10 +79,22 @@ class FullSyncProgress:
         return min(float(self.total_windows), self.completed_windows + fraction)
 
     @property
-    def percentage(self) -> float:
+    def window_percentage(self) -> float:
         if self.total_windows <= 0:
             return 0.0
         return self.completed_equivalent_windows / self.total_windows * 100.0
+
+    @property
+    def record_percentage(self) -> float | None:
+        if self.estimated_total_records is None or self.estimated_total_records <= 0:
+            return None
+        return self.stored_records / self.estimated_total_records * 100.0
+
+    @property
+    def estimated_records_remaining(self) -> int | None:
+        if self.estimated_total_records is None:
+            return None
+        return max(0, self.estimated_total_records - self.stored_records)
 
 
 @dataclass(frozen=True, slots=True)

@@ -18,14 +18,24 @@ Para cada lote, o programa:
 
 1. ignora cobertura integral já confirmada;
 2. reabre uma execução incompleta existente ou cria um plano;
-3. baixa e confirma uma página por vez;
-4. conclui o lote antes de avançar ao seguinte.
+3. baixa uma ou mais páginas conforme o modo escolhido;
+4. confirma cada página separadamente e em ordem transacional no SQLite;
+5. conclui o lote antes de avançar ao seguinte.
+
+O seletor **Downloads simultâneos** oferece 1, 2 ou 4. O modo 1 usa o motor sequencial
+original. Acima de 1, um motor separado paraleliza somente a rede: normalização e escrita
+continuam seriais. O modo acelerado começa com duas páginas, sobe gradualmente após grupos
+de sucessos e nunca ultrapassa o limite escolhido.
 
 ## Falhas temporárias
 
 Timeout, desconexão, HTTP 429 e erros HTTP 5xx são recuperáveis. A página não confirmada é
 mantida no banco. A carga completa repete automaticamente a mesma unidade até funcionar ou
 até o usuário clicar **Pausar**.
+
+No modo acelerado, qualquer falha de rede reduz imediatamente a concorrência para 1. Ela
+só volta a subir depois de oito páginas confirmadas sem erro. Assim, quatro é um teto, não
+uma pressão constante sobre o PNCP.
 
 Depois que as tentativas curtas da página se esgotam, a carga contínua aplica espera
 progressiva:
@@ -54,10 +64,14 @@ interface.
 
 ## Progresso
 
-A barra global usa lotes concluídos mais a fração de páginas confirmadas no lote atual. Ela
-mostra lotes restantes, período, modalidade e páginas/respostas restantes no lote. Páginas
-de lotes futuros só são conhecidas quando o PNCP responde; qualquer total nacional exibido
-antes disso é identificado como aproximação amostral.
+A barra global usa contratações únicas já armazenadas divididas pelo total projetado pela
+amostra. O texto apresenta os dois números, a quantidade aproximadamente restante e identifica
+o percentual como estimado. A projeção é preservada no próprio banco e pode ser reutilizada
+após reiniciar o aplicativo; se o escopo de datas mudar, uma nova estimativa é exigida.
+
+Lotes concluídos e páginas confirmadas continuam exibidos separadamente como métricas exatas
+de execução. Eles não controlam mais a porcentagem principal. Sem estimativa válida, a barra
+não inventa percentual e orienta o usuário a executar **Estimar**.
 
 Cada página é armazenada comprimida dentro do SQLite. O programa não cria um arquivo separado
 para cada resposta.

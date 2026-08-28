@@ -14,6 +14,7 @@ no PNCP.
 - sincroniza uma data/modalidade específica ou toda a série desde 01/01/2021;
 - divide a carga nacional em janelas de até 31 dias e nas 15 modalidades do PNCP;
 - confirma cada página em uma transação SQLite e retoma do primeiro checkpoint ausente;
+- oferece rede sequencial ou até quatro downloads simultâneos com redução automática após erros;
 - repete indefinidamente falhas temporárias da carga completa, com espera progressiva;
 - preserva a resposta JSON original comprimida e os dados normalizados;
 - evita duplicação pelo identificador PNCP e detecta registros novos ou alterados;
@@ -77,6 +78,8 @@ O build oficial também executa um teste isolado do executável sem consultar a 
 
 - o tempo da carga depende da disponibilidade e dos limites de frequência do PNCP;
 - a estimativa nacional usa uma amostra de até 12 lotes e apresenta aproximações;
+- a porcentagem nacional compara registros únicos armazenados com essa projeção; lotes e
+  páginas aparecem como métricas operacionais separadas;
 - a carga contínua automática cobre as contratações principais; itens e resultados possuem
   execuções próprias e aumentam significativamente a quantidade de chamadas;
 - os dados locais são uma cópia para consulta e não substituem o registro, edital ou documento

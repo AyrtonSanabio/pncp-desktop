@@ -187,6 +187,14 @@ class LocalDatabase:
                 "winners_by_category": service.winners_by_category(),
             }
 
+    def set_preference(self, key: str, value: Any) -> None:
+        with self._connect() as connection:
+            DataServices(connection).set_preference(key, value)
+
+    def get_preference(self, key: str, default: Any = None) -> Any:
+        with self._connect() as connection:
+            return DataServices(connection).get_preference(key, default)
+
     def refresh_insights(self, *, limit: int = 100_000) -> dict[str, int]:
         with self._connect() as connection:
             return DataServices(connection).refresh_insights(limit=limit)
