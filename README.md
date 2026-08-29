@@ -14,8 +14,11 @@ no PNCP.
 - sincroniza uma data/modalidade específica ou toda a série desde 01/01/2021;
 - divide a carga nacional em janelas de até 31 dias e nas 15 modalidades do PNCP;
 - confirma cada página em uma transação SQLite e retoma do primeiro checkpoint ausente;
+- permite escolher de 10 a 500 registros por página em novas execuções sem alterar
+  cargas que já começaram;
 - oferece rede sequencial ou até quatro downloads simultâneos com redução automática após erros;
-- repete indefinidamente falhas temporárias da carga completa, com espera progressiva;
+- repete falhas temporárias de qualquer carga principal, com espera progressiva e cancelável;
+- preserva a sessão da carga nacional e a retoma automaticamente após queda ou reinício;
 - preserva a resposta JSON original comprimida e os dados normalizados;
 - evita duplicação pelo identificador PNCP e detecta registros novos ou alterados;
 - pesquisa o banco local por texto, órgão, CNPJ, município, fornecedor, modalidade,

@@ -172,6 +172,7 @@ class WorkUnit:
     data_final: date
     modalidade: int
     page_number: int
+    page_size: int
     attempt_count: int
 
 

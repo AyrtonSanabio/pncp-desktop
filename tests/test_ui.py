@@ -402,6 +402,57 @@ def test_full_load_estimate_is_preserved_in_its_database(tmp_path) -> None:
     app.processEvents()
 
 
+def test_full_load_session_survives_restart_and_respects_manual_pause(
+    monkeypatch, tmp_path
+) -> None:
+    app = _app()
+    settings = QSettings("AyrtonSanabio", "PNCPDesktop")
+    previous = settings.value("sync_concurrency", None)
+    database_path = tmp_path / "full-session.sqlite3"
+    first = MainWindow(database_path)
+    restored = None
+    try:
+        first.sync_carga_completa.setChecked(True)
+        first.incluir_contratos.setChecked(True)
+        first.sync_concorrencia.setCurrentIndex(first.sync_concorrencia.findData(4))
+        windows = first._sync_windows()
+        first._salvar_sessao_carga_completa(windows, manual_pause=False)
+        expected_start = min(item.data_inicial for item in windows)
+        expected_end = max(item.data_final for item in windows)
+        first.close()
+
+        restored = MainWindow(database_path)
+
+        assert restored.sync_carga_completa.isChecked()
+        assert restored.sync_data_inicial.date().toPython() == expected_start
+        assert restored.sync_data_final.date().toPython() == expected_end
+        assert restored.incluir_contratos.isChecked()
+        assert restored.sync_concorrencia.currentData() == 4
+
+        resumed: list[bool] = []
+        monkeypatch.setattr(
+            restored,
+            "_executar_carga_completa",
+            lambda: resumed.append(True),
+        )
+        restored._retomar_carga_completa_automaticamente()
+        assert resumed == [True]
+
+        restored._atualizar_estado_sessao_carga_completa(manual_pause=True)
+        restored._retomar_carga_completa_automaticamente()
+        assert resumed == [True]
+    finally:
+        first.close()
+        if restored is not None:
+            restored.close()
+        if previous is None:
+            settings.remove("sync_concurrency")
+        else:
+            settings.setValue("sync_concurrency", previous)
+        settings.sync()
+        app.processEvents()
+
+
 def test_sample_summary_extrapolates_population() -> None:
     plans = tuple(
         PlanSummary(

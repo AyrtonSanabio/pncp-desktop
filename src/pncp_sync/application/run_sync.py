@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import unicodedata
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 from pypncp import AuthError, NotFoundError, PNCPError, ValidationError
@@ -17,8 +19,31 @@ ActivityCallback = Callable[[WorkUnit], Any]
 StatusCallback = Callable[[str], Any]
 
 
+def _normalized_error_message(exc: PNCPError) -> str:
+    decomposed = unicodedata.normalize("NFKD", str(exc)).casefold()
+    return "".join(character for character in decomposed if not unicodedata.combining(character))
+
+
+def _is_false_period_limit_error(exc: PNCPError) -> bool:
+    """Reconhece o 422 incoerente já observado em janelas válidas do PNCP.
+
+    A janela é validada localmente antes da requisição e nunca ultrapassa o limite
+    configurado. Portanto, essa resposta específica do serviço é transitória e deve
+    permanecer retomável; outros erros de validação continuam sendo definitivos.
+    """
+    return isinstance(exc, ValidationError) and (
+        "periodo inicial e final maior que 365 dias" in _normalized_error_message(exc)
+    )
+
+
 def _is_recoverable(exc: PNCPError) -> bool:
-    return not isinstance(exc, (AuthError, NotFoundError, ValidationError))
+    if _is_false_period_limit_error(exc):
+        return True
+    # As janelas e os parâmetros já foram validados localmente antes da chamada.
+    # O PNCP ocasionalmente devolve HTTP 422 contraditório para a mesma requisição
+    # que funciona em uma tentativa posterior. Por isso ValidationError participa
+    # das tentativas curtas e, se persistir, a página é adiada sem bloquear as demais.
+    return not isinstance(exc, (AuthError, NotFoundError))
 
 
 def _is_rate_limited(exc: PNCPError) -> bool:
@@ -46,9 +71,11 @@ async def run_sync(
     """Executa páginas sequencialmente; cada página é um checkpoint transacional."""
     if max_pages is not None and max_pages < 1:
         raise ValueError("max_pages deve ser positivo.")
-    source = source or PypncpSource(config)
-
     with SyncRepository(config.db_path, lease_seconds=config.lease_seconds) as repository:
+        run_page_size = repository.get_run_page_size(run_id)
+        source = source or PypncpSource(
+            replace(config, publication_page_size=run_page_size)
+        )
         window = repository.get_window(run_id)
         window.validate(max_days=config.max_window_days)
         requirements = repository.get_plan_requirements(run_id)
@@ -122,7 +149,13 @@ async def run_sync(
                         )
                     await asyncio.sleep(delay)
                     continue
-                return repository.get_summary(run_id)
+                if status is not None:
+                    status(
+                        f"Página {work_unit.page_number} adiada após "
+                        f"{work_unit.attempt_count} tentativa(s). O índice e o erro "
+                        "foram catalogados; a sincronização seguirá para a próxima página."
+                    )
+                continue
             except SourceError as exc:
                 repository.mark_unit_error(
                     work_unit,
@@ -131,7 +164,12 @@ async def run_sync(
                     detail=type(exc).__name__,
                     recoverable=False,
                 )
-                return repository.get_summary(run_id)
+                if status is not None:
+                    status(
+                        f"Página {work_unit.page_number} adiada por resposta incompatível. "
+                        "O diagnóstico foi catalogado e as próximas páginas continuarão."
+                    )
+                continue
             except Exception as exc:
                 repository.mark_unit_error(
                     work_unit,

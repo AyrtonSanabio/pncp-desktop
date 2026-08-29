@@ -16,6 +16,7 @@ class SyncConfig:
     timeout_seconds: int = 90
     max_retries: int = 3
     max_concurrent: int = 1
+    publication_page_size: int = 50
     max_window_days: int = 31
     lease_seconds: int = 300
     max_response_bytes: int = 25 * 1024 * 1024
@@ -34,6 +35,8 @@ class SyncConfig:
             raise ValueError("O número de tentativas deve ser positivo.")
         if self.max_concurrent < 1 or self.max_concurrent > 4:
             raise ValueError("A concorrência deve ficar entre 1 e 4.")
+        if not 1 <= self.publication_page_size <= 500:
+            raise ValueError("O tamanho da página deve ficar entre 1 e 500.")
         if self.max_window_days < 1:
             raise ValueError("A janela máxima deve ser positiva.")
         if self.lease_seconds < 30:

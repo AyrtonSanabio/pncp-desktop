@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from pypncp import PNCPError
 
@@ -34,6 +34,7 @@ async def run_sync_parallel(
     run_id: str,
     *,
     source: SourceProtocol | None = None,
+    initial_concurrency: int | None = None,
     max_pages: int | None = None,
     progress: ProgressCallback | None = None,
     activity: ActivityCallback | None = None,
@@ -45,6 +46,10 @@ async def run_sync_parallel(
     No modo acelerado, somente a rede é concorrente. Normalização e escrita no SQLite
     permanecem seriais, o que conserva as mesmas transações e regras de integridade.
     """
+    if initial_concurrency is not None and not 1 <= initial_concurrency <= config.max_concurrent:
+        raise ValueError(
+            "A concorrência inicial deve ficar entre 1 e o limite configurado."
+        )
     if config.max_concurrent <= 1:
         return await run_sync(
             config,
@@ -58,13 +63,20 @@ async def run_sync_parallel(
     if max_pages is not None and max_pages < 1:
         raise ValueError("max_pages deve ser positivo.")
 
-    source = source or PypncpSource(config)
     target_concurrency = config.max_concurrent
-    current_concurrency = min(2, target_concurrency)
+    current_concurrency = (
+        initial_concurrency
+        if initial_concurrency is not None
+        else min(2, target_concurrency)
+    )
     successful_streak = 0
     processed = 0
 
     with SyncRepository(config.db_path, lease_seconds=config.lease_seconds) as repository:
+        run_page_size = repository.get_run_page_size(run_id)
+        source = source or PypncpSource(
+            replace(config, publication_page_size=run_page_size)
+        )
         window = repository.get_window(run_id)
         window.validate(max_days=config.max_window_days)
         requirements = repository.get_plan_requirements(run_id)
@@ -139,12 +151,12 @@ async def run_sync_parallel(
                 raise
 
             retry_delays: list[int] = []
-            terminal_failure = False
+            fatal_failure: BaseException | None = None
             batch_successes = 0
             for (work_unit, _), outcome in zip(claimed, outcomes, strict=True):
                 if isinstance(outcome, asyncio.CancelledError):
                     repository.release_unit(work_unit)
-                    terminal_failure = True
+                    fatal_failure = outcome
                     continue
                 if isinstance(outcome, PNCPError):
                     recoverable = _is_recoverable(outcome)
@@ -160,8 +172,12 @@ async def run_sync_parallel(
                         retry_delays.append(
                             _retry_delay_seconds(outcome, work_unit.attempt_count)
                         )
-                    else:
-                        terminal_failure = True
+                    elif status is not None:
+                        status(
+                            f"Página {work_unit.page_number} adiada após "
+                            f"{work_unit.attempt_count} tentativa(s). O índice e o erro "
+                            "foram catalogados; o lote continuará."
+                        )
                     continue
                 if isinstance(outcome, SourceError):
                     repository.mark_unit_error(
@@ -171,7 +187,11 @@ async def run_sync_parallel(
                         detail=type(outcome).__name__,
                         recoverable=False,
                     )
-                    terminal_failure = True
+                    if status is not None:
+                        status(
+                            f"Página {work_unit.page_number} adiada por resposta "
+                            "incompatível. O diagnóstico foi catalogado e o lote continuará."
+                        )
                     continue
                 if isinstance(outcome, BaseException):
                     repository.mark_unit_error(
@@ -181,7 +201,7 @@ async def run_sync_parallel(
                         detail=f"{type(outcome).__name__}: {outcome}",
                         recoverable=False,
                     )
-                    terminal_failure = True
+                    fatal_failure = outcome
                     continue
 
                 try:
@@ -204,7 +224,11 @@ async def run_sync_parallel(
                         detail=type(exc).__name__,
                         recoverable=False,
                     )
-                    terminal_failure = True
+                    if status is not None:
+                        status(
+                            f"Página {work_unit.page_number} adiada por paginação "
+                            "incompatível. O diagnóstico foi catalogado e o lote continuará."
+                        )
                     continue
                 except Exception as exc:
                     repository.mark_unit_error(
@@ -214,7 +238,7 @@ async def run_sync_parallel(
                         detail=f"{type(exc).__name__}: {exc}",
                         recoverable=False,
                     )
-                    terminal_failure = True
+                    fatal_failure = exc
                     continue
 
                 processed += 1
@@ -245,8 +269,8 @@ async def run_sync_parallel(
                             f"{current_concurrency}/{target_concurrency}."
                         )
 
-            if terminal_failure:
-                return repository.get_summary(run_id)
+            if fatal_failure is not None:
+                raise fatal_failure
             if retry_delays:
                 delay = max(retry_delays)
                 if status is not None:

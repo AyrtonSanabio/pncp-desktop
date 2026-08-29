@@ -71,15 +71,15 @@ def import_new_records(target_path: Path, source_path: Path) -> dict[str, Any]:
             """INSERT INTO ingestion_run(
                    id,resource,data_inicial,data_final,modalidade,status,collector_version,
                    estimated_download_bytes,estimated_database_bytes,free_disk_bytes_at_plan,
-                   unmodeled_fields_json,created_at,started_at,finished_at)
-               VALUES(?,?,?,?,?,'COMPLETED','database-import',0,0,0,'[]',?,?,?)""",
-            (run_id, "database_import", now[:10], now[:10], 1, now, now, now),
+                   unmodeled_fields_json,created_at,started_at,finished_at,page_size)
+               VALUES(?,?,?,?,?,'COMPLETED','database-import',0,0,0,'[]',?,?,?,?)""",
+            (run_id, "database_import", now[:10], now[:10], 1, now, now, now, 10),
         )
         unit = target.execute(
             """INSERT INTO work_unit(
                    run_id,resource,data_inicial,data_final,modalidade,page_number,status,created_at,
-                   started_at,finished_at)
-               VALUES(?,?,?,?,?,1,'SUCCEEDED',?,?,?)""",
+                   started_at,finished_at,page_size)
+               VALUES(?,?,?,?,?,1,'SUCCEEDED',?,?,?,10)""",
             (run_id, "database_import", now[:10], now[:10], 1, now, now, now),
         ).lastrowid
         payload = target.execute(

@@ -185,14 +185,10 @@ class SyncTaskThread(QThread):
             for index, current_run_id in enumerate(self.run_ids, start=1):
                 self.run_id = current_run_id
                 self.activity.emit(f"Sincronizando lote {index}/{len(self.run_ids)}…")
-                with SyncRepository(self.config.db_path) as repository:
-                    reopened = repository.retry_recoverable_units(current_run_id)
-                if reopened:
-                    self.activity.emit(
-                        f"Retomando {reopened} página(s) do lote {index}."
-                    )
-                main_summary = await self._run_main_sync(current_run_id)
+                main_summary = await self._run_main_continuously(current_run_id)
                 summaries.append(main_summary)
+                if not main_summary.status.startswith("COMPLETED"):
+                    break
                 if main_summary.status.startswith("COMPLETED") and self.include_details:
                     detail_plan = plan_details(self.config, current_run_id)
                     self.detail_run_id = detail_plan.detail_run_id
@@ -208,19 +204,15 @@ class SyncTaskThread(QThread):
             aggregate_details = (
                 self._aggregate_details(tuple(detail_summaries)) if detail_summaries else None
             )
-            await self._run_catalog_resources()
-            self.completed.emit(self._aggregate_runs(tuple(summaries)), aggregate_details)
+            aggregate = self._aggregate_runs(tuple(summaries))
+            if aggregate.status.startswith("COMPLETED"):
+                await self._run_catalog_resources()
+            self.completed.emit(aggregate, aggregate_details)
             return
         if self.action != "run" or not self.run_id:
             raise ValueError("A execução planejada não foi informada.")
 
-        with SyncRepository(self.config.db_path) as repository:
-            reopened = repository.retry_recoverable_units(self.run_id)
-        if reopened:
-            self.activity.emit(
-                f"Retomando {reopened} página(s) que tiveram falha temporária no PNCP."
-            )
-        main_summary = await self._run_main_sync(self.run_id)
+        main_summary = await self._run_main_continuously(self.run_id)
         detail_summary = None
         if main_summary.status.startswith("COMPLETED") and self.include_details:
             if not self.detail_run_id:
@@ -291,6 +283,7 @@ class SyncTaskThread(QThread):
             with SyncRepository(self.config.db_path) as repository:
                 resumable_run = repository.find_resumable_run(window)
                 if resumable_run:
+                    repository.reclassify_false_period_limit_errors(resumable_run)
                     repository.retry_recoverable_units(resumable_run)
             plan = None if resumable_run else await self._plan_with_retry(window)
             current_run_id = resumable_run or plan.run_id
@@ -299,17 +292,23 @@ class SyncTaskThread(QThread):
             self._planned_count = index
             with SyncRepository(self.config.db_path) as repository:
                 self._emit_full_progress(repository.get_summary(current_run_id))
-            main_summary = await self._run_full_window_continuously(current_run_id)
+            main_summary = await self._run_main_continuously(
+                current_run_id,
+                defer_after_sweep=True,
+            )
             summaries.append(main_summary)
-            if not main_summary.status.startswith("COMPLETED"):
-                self._emit_full_progress(main_summary)
-                break
             self._full_completed_windows = index
             self._full_confirmed_pages += (
                 main_summary.succeeded_units + main_summary.partial_units
             )
             self._emit_full_progress()
-            if self.include_details:
+            if main_summary.failed_units:
+                self.activity.emit(
+                    f"Lote {index}/{len(self.windows)} percorrido com "
+                    f"{main_summary.failed_units} página(s) adiada(s). Os índices "
+                    "foram catalogados e a carga seguirá para o próximo lote."
+                )
+            elif self.include_details:
                 detail_plan = plan_details(self.config, current_run_id)
                 self.detail_run_id = detail_plan.detail_run_id
                 self.detail_planned.emit(self.detail_run_id)
@@ -335,13 +334,50 @@ class SyncTaskThread(QThread):
                 await self._run_catalog_resources()
             self.completed.emit(aggregate, aggregate_details)
 
-    async def _run_full_window_continuously(self, run_id: str) -> RunSummary:
-        """Repete falhas recuperáveis até concluir ou receber cancelamento do usuário."""
+    async def _run_main_continuously(
+        self,
+        run_id: str,
+        *,
+        defer_after_sweep: bool = False,
+    ) -> RunSummary:
+        """Repete falhas recuperáveis até concluir ou receber cancelamento do usuário.
+
+        Este é o caminho único para cargas novas e retomadas. Uma falha temporária
+        esgota primeiro as tentativas curtas da página, entra em espera progressiva
+        e depois reabre apenas unidades cujo diagnóstico mais recente é recuperável.
+        """
         consecutive_failures = 0
         previous_done = -1
+        conservative_start = False
+
+        with SyncRepository(self.config.db_path) as repository:
+            corrected_at_start = repository.reclassify_false_period_limit_errors(run_id)
+            reopened_at_start = repository.retry_recoverable_units(run_id)
+        if corrected_at_start:
+            self.activity.emit(
+                f"Corrigido o diagnóstico de {corrected_at_start} página(s) cuja janela "
+                "era válida, mas o PNCP respondeu incorretamente sobre o período."
+            )
+        if reopened_at_start:
+            self.activity.emit(
+                f"Retomando {reopened_at_start} página(s) que tiveram falha temporária "
+                "no PNCP."
+            )
+
         while True:
-            summary = await self._run_main_sync(run_id, status_updates=True)
+            summary = await self._run_main_sync(
+                run_id,
+                status_updates=True,
+                conservative_start=conservative_start,
+            )
             if summary.status.startswith("COMPLETED"):
+                return summary
+
+            # Na carga completa, cada página já esgotou as tentativas curtas e as
+            # demais páginas do lote já foram percorridas. Adiar a nova rodada
+            # permite avançar para outros lotes; a unidade FAILED permanece como
+            # checkpoint indexado para Continuar ou para a próxima sessão.
+            if defer_after_sweep and summary.failed_units and not summary.pending_units:
                 return summary
 
             with SyncRepository(self.config.db_path) as repository:
@@ -366,30 +402,46 @@ class SyncTaskThread(QThread):
                 if latest_error
                 else "falha temporária do PNCP"
             )[:240]
-            await self._wait_before_full_retry(
+            await self._wait_before_retry(
                 delay,
                 reason=reason,
                 reopened=reopened,
                 cycle=consecutive_failures,
             )
+            # Depois que a API falha, cada novo ciclo recomeça com uma única
+            # requisição. O motor paralelo volta a subir gradualmente após sucessos.
+            conservative_start = True
 
     async def _run_main_sync(
-        self, run_id: str, *, status_updates: bool = False
+        self,
+        run_id: str,
+        *,
+        status_updates: bool = False,
+        conservative_start: bool = False,
     ) -> RunSummary:
-        runner = run_sync_parallel if self.config.max_concurrent > 1 else run_sync
-        return await runner(
+        status = (
+            self.activity.emit
+            if status_updates or self.config.max_concurrent > 1
+            else None
+        )
+        if self.config.max_concurrent > 1:
+            return await run_sync_parallel(
+                self.config,
+                run_id,
+                initial_concurrency=1 if conservative_start else None,
+                progress=self._main_progress,
+                activity=self._main_activity,
+                status=status,
+            )
+        return await run_sync(
             self.config,
             run_id,
             progress=self._main_progress,
             activity=self._main_activity,
-            status=(
-                self.activity.emit
-                if status_updates or self.config.max_concurrent > 1
-                else None
-            ),
+            status=status,
         )
 
-    async def _wait_before_full_retry(
+    async def _wait_before_retry(
         self,
         seconds: int,
         *,

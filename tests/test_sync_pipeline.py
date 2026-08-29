@@ -5,11 +5,11 @@ from datetime import date
 from pathlib import Path
 
 import pytest
-from pypncp import PNCPError
+from pypncp import PNCPError, ValidationError
 
 from pncp_desktop.local_database import LocalDatabase
 from pncp_sync.application.plan_sync import plan_sync
-from pncp_sync.application.run_sync import _retry_delay_seconds, run_sync
+from pncp_sync.application.run_sync import _is_recoverable, _retry_delay_seconds, run_sync
 from pncp_sync.config import SyncConfig
 from pncp_sync.domain.models import CapturedResponse, SourcePage, SyncWindow
 from pncp_sync.persistence.repositories import SyncRepository
@@ -20,6 +20,13 @@ def test_http_429_uses_longer_checkpoint_retry_delay() -> None:
     assert _retry_delay_seconds(PNCPError("Too Many Requests"), 1) == 60
     assert _retry_delay_seconds(PNCPError("HTTP 429"), 2) == 60
     assert _retry_delay_seconds(PNCPError("falha temporária"), 2) == 2
+
+
+def test_server_validation_participates_in_finite_retry() -> None:
+    assert _is_recoverable(
+        ValidationError("Período inicial e final maior que 365 dias.")
+    )
+    assert _is_recoverable(ValidationError("Parâmetro obrigatório ausente."))
 
 
 def make_page(
@@ -67,6 +74,18 @@ class FakeSource:
 class ErrorSource:
     async def fetch_publications(self, window: SyncWindow, page_number: int) -> SourcePage:
         raise PNCPError(f"timeout controlado na página {page_number}")
+
+
+class OneBrokenPageSource(FakeSource):
+    def __init__(self, pages: dict[int, SourcePage], broken_page: int) -> None:
+        super().__init__(pages)
+        self.broken_page = broken_page
+
+    async def fetch_publications(self, window: SyncWindow, page_number: int) -> SourcePage:
+        self.calls.append(page_number)
+        if page_number == self.broken_page:
+            raise PNCPError(f"HTTP 422 contraditório na página {page_number}")
+        return self.pages[page_number]
 
 
 def config_for(path: Path) -> SyncConfig:
@@ -251,6 +270,52 @@ async def test_estimativa_persistida_e_reutilizada_sem_nova_requisicao(
 
 
 @pytest.mark.asyncio
+async def test_tamanho_de_pagina_fica_preservado_na_execucao(tmp_path: Path) -> None:
+    config = SyncConfig(
+        db_path=tmp_path / "page-size.sqlite3",
+        lease_seconds=30,
+        publication_page_size=100,
+    )
+    window = SyncWindow(date(2026, 8, 26), date(2026, 8, 26), 6)
+    page = make_page([sample_record(1)], page_number=1, total_pages=2, total_records=101)
+
+    plan = await plan_sync(config, window, source=FakeSource({1: page}))
+
+    with SyncRepository(config.db_path) as repository:
+        assert repository.get_run_page_size(plan.run_id) == 100
+        stored_sizes = repository.connection.execute(
+            "SELECT DISTINCT page_size FROM work_unit WHERE run_id=?", (plan.run_id,)
+        ).fetchall()
+        assert [row[0] for row in stored_sizes] == [100]
+
+
+@pytest.mark.asyncio
+async def test_plano_com_tamanho_diferente_nao_eh_reutilizado(tmp_path: Path) -> None:
+    path = tmp_path / "different-page-size.sqlite3"
+    window = SyncWindow(date(2026, 8, 26), date(2026, 8, 26), 6)
+    page = make_page([sample_record(1)], page_number=1, total_pages=1, total_records=1)
+    first_source = FakeSource({1: page})
+    second_source = FakeSource({1: page})
+
+    first = await plan_sync(
+        SyncConfig(db_path=path, lease_seconds=30, publication_page_size=10),
+        window,
+        source=first_source,
+    )
+    second = await plan_sync(
+        SyncConfig(db_path=path, lease_seconds=30, publication_page_size=100),
+        window,
+        source=second_source,
+    )
+
+    assert second.run_id != first.run_id
+    assert second_source.calls == [1]
+    with SyncRepository(path) as repository:
+        assert repository.get_run_page_size(first.run_id) == 10
+        assert repository.get_run_page_size(second.run_id) == 100
+
+
+@pytest.mark.asyncio
 async def test_estimativa_rejeita_totais_incoerentes_do_pncp(tmp_path: Path) -> None:
     config = config_for(tmp_path / "invalid-totals.sqlite3")
     window = SyncWindow(date(2026, 8, 26), date(2026, 8, 26), 6)
@@ -318,6 +383,53 @@ async def test_falha_recuperavel_pausa_sem_avancar_checkpoint(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_pagina_defeituosa_e_catalogada_sem_bloquear_as_seguintes(
+    tmp_path: Path,
+) -> None:
+    config = config_for(tmp_path / "deferred-page.sqlite3")
+    window = SyncWindow(date(2026, 8, 26), date(2026, 8, 26), 6)
+    pages = {
+        page: make_page(
+            [sample_record(page)],
+            page_number=page,
+            total_pages=3,
+            total_records=3,
+        )
+        for page in range(1, 4)
+    }
+    source = OneBrokenPageSource(pages, broken_page=2)
+    plan = await plan_sync(config, window, source=source)
+
+    summary = await run_sync(config, plan.run_id, source=source)
+
+    assert summary.status == "FAILED"
+    assert summary.succeeded_units == 2
+    assert summary.failed_units == 1
+    assert source.calls == [1, 2, 2, 2, 3]
+    with SyncRepository(config.db_path) as repository:
+        assert repository.count_contratacoes() == 2
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM contratacao WHERE sequencial_compra=3"
+        ).fetchone()[0] == 1
+        errors = repository.connection.execute(
+            """SELECT unit.page_number,error.recoverable
+               FROM ingestion_error AS error
+               JOIN work_unit AS unit ON unit.id=error.work_unit_id
+               ORDER BY error.id"""
+        ).fetchall()
+        assert [(row["page_number"], row["recoverable"]) for row in errors] == [
+            (2, 1),
+            (2, 1),
+            (2, 1),
+        ]
+
+    diagnostics = LocalDatabase(config.db_path).diagnostics()
+    assert diagnostics.errors[0]["page_number"] == 2
+    assert diagnostics.errors[0]["scope"] == "2026-08-26 a 2026-08-26"
+    assert diagnostics.errors[0]["modalidade"] == 6
+
+
+@pytest.mark.asyncio
 async def test_falha_recuperavel_esgotada_pode_ser_reaberta_e_concluida(tmp_path: Path) -> None:
     config = config_for(tmp_path / "retry-exhausted.sqlite3")
     window = SyncWindow(date(2026, 8, 26), date(2026, 8, 26), 6)
@@ -338,3 +450,36 @@ async def test_falha_recuperavel_esgotada_pode_ser_reaberta_e_concluida(tmp_path
     completed = await run_sync(config, plan.run_id, source=FakeSource(pages))
     assert completed.status == "COMPLETED"
     assert completed.records_inserted == 2
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Período inicial e final maior que 365 dias.",
+        "Data Inicial deve ser anterior ou igual à Data Final",
+    ),
+)
+@pytest.mark.asyncio
+async def test_reclassifica_periodo_contraditorio_gravado_por_versao_anterior(
+    tmp_path: Path, message: str
+) -> None:
+    config = config_for(tmp_path / "period-limit.sqlite3")
+    window = SyncWindow(date(2026, 7, 8), date(2026, 8, 7), 8)
+    pages = {
+        1: make_page([sample_record(1)], page_number=1, total_pages=2, total_records=2),
+        2: make_page([sample_record(2)], page_number=2, total_pages=2, total_records=2),
+    }
+    plan = await plan_sync(config, window, source=FakeSource(pages))
+    await run_sync(config, plan.run_id, source=FakeSource(pages), max_pages=1)
+    await run_sync(config, plan.run_id, source=ErrorSource())
+
+    with SyncRepository(config.db_path) as repository:
+        repository.connection.execute(
+            """UPDATE ingestion_error
+               SET message=?, recoverable=0
+               WHERE id=(SELECT MAX(id) FROM ingestion_error WHERE run_id=?)""",
+            (message, plan.run_id),
+        )
+        repository.connection.commit()
+        assert repository.reclassify_false_period_limit_errors(plan.run_id) == 1
+        assert repository.retry_recoverable_units(plan.run_id) == 1

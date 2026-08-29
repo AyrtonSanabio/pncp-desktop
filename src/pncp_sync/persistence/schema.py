@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 MIGRATION_V1 = """
 CREATE TABLE IF NOT EXISTS ingestion_run (
@@ -295,6 +295,13 @@ CREATE TABLE IF NOT EXISTS pncp_ata (
 );
 CREATE INDEX IF NOT EXISTS idx_pncp_ata_purchase ON pncp_ata(numero_controle_pncp_compra);
 CREATE INDEX IF NOT EXISTS idx_pncp_ata_validity ON pncp_ata(vigencia_fim);
+"""
+
+MIGRATION_V6 = """
+ALTER TABLE ingestion_run ADD COLUMN page_size INTEGER NOT NULL DEFAULT 10
+    CHECK(page_size BETWEEN 1 AND 500);
+ALTER TABLE work_unit ADD COLUMN page_size INTEGER NOT NULL DEFAULT 10
+    CHECK(page_size BETWEEN 1 AND 500);
 """
 
 MIGRATION_V2 = """

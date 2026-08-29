@@ -19,7 +19,9 @@ async def plan_sync(
     window.validate(max_days=config.max_window_days)
     config.ensure_storage_directory()
     with SyncRepository(config.db_path, lease_seconds=config.lease_seconds) as repository:
-        reusable = repository.find_reusable_plan(window)
+        reusable = repository.find_reusable_plan(
+            window, page_size=config.publication_page_size
+        )
     if reusable is not None:
         return reusable
     # A estimativa depende de uma resposta real do PNCP. Ela usa um limite um pouco
@@ -69,6 +71,7 @@ async def plan_sync(
             estimated_download_bytes=estimated_download,
             estimated_database_bytes=estimated_database,
             free_disk_bytes=free_disk,
+            page_size=config.publication_page_size,
         )
 
     return PlanSummary(

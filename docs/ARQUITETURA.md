@@ -2,8 +2,10 @@
 
 ## Visão geral
 
-O Consulta PNCP Desktop é uma aplicação PySide6 que usa o pacote `pypncp` para acessar a
-API pública do PNCP e SQLite para persistência local.
+O Consulta PNCP Desktop é uma aplicação PySide6 que usa o pacote `pypncp` para modelos e
+recursos suportados. Quando a API oferece um parâmetro ainda não exposto pela biblioteca,
+como `tamanhoPagina` na carga principal, o adaptador local usa HTTPX diretamente. SQLite
+faz a persistência local.
 
 ```text
 Interface PySide6
@@ -43,6 +45,12 @@ e repositórios. Não depende dos componentes visuais para executar uma sincroni
 Se o processo terminar antes do commit, a página não é considerada concluída e pode ser
 repetida com segurança.
 
+O tamanho solicitado também faz parte do checkpoint. Bancos anteriores à versão 6 do
+esquema recebem o valor histórico 10; novas execuções usam a opção selecionada, entre 10 e
+500. Alterar a preferência não modifica execuções existentes, porque trocar o tamanho no
+meio da paginação poderia pular registros. O adaptador envia `tamanhoPagina` com HTTPX e
+continua validando cada contratação com o modelo público do `pypncp`.
+
 ## Concorrência e memória
 
 A carga principal mantém dois motores. O sequencial é usado no modo conservador. O motor
@@ -54,6 +62,15 @@ A concorrência é adaptativa: começa abaixo do teto, aumenta somente depois de
 confirmadas e volta imediatamente para 1 após falha HTTP. O número de respostas mantidas em
 memória fica limitado ao teto selecionado, sem relação com o volume nacional. SQLite usa
 `busy_timeout`, chaves estrangeiras e modo WAL configurado pelos repositórios.
+
+Falhas recuperáveis passam por duas camadas. Primeiro, a unidade usa tentativas curtas. Se
+elas se esgotarem, o worker reabre apenas unidades cujo último diagnóstico é recuperável,
+aguarda de 1 a 15 minutos e reinicia a rede com concorrência 1. O mesmo ciclo atende cargas
+novas, o botão Continuar e a carga nacional.
+
+A intenção da carga nacional também é persistida em `app_preference`: intervalo, recursos
+opcionais, concorrência, estado ativo e pausa manual. Isso permite reconstruir os lotes futuros
+depois de uma queda, mesmo que eles ainda não tivessem sido planejados individualmente.
 
 ## Consulta online e banco local
 

@@ -17,9 +17,13 @@ def _database_with_contract(path: Path) -> LocalDatabase:
     with sqlite3.connect(path) as connection:
         now = "2026-08-20T00:00:00+00:00"
         connection.execute(
-            """INSERT INTO ingestion_run VALUES(
+            """INSERT INTO ingestion_run(
+               id,resource,data_inicial,data_final,modalidade,status,collector_version,
+               estimated_download_bytes,estimated_database_bytes,free_disk_bytes_at_plan,
+               unmodeled_fields_json,created_at,started_at,finished_at,page_size
+               ) VALUES(
                'run','contratacoes_publicacao','2026-08-20','2026-08-20',6,'COMPLETED',
-               'test',0,0,0,'[]',?,?,?)""",
+               'test',0,0,0,'[]',?,?,?,10)""",
             (now, now, now),
         )
         connection.execute(
@@ -67,7 +71,13 @@ def test_migration_v3_is_additive(tmp_path: Path) -> None:
         connection.executescript(MIGRATION_V2)
         connection.execute("PRAGMA user_version=2")
     with SyncRepository(path) as repository:
-        assert repository.connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert repository.connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert repository.connection.execute(
+            "SELECT page_size FROM ingestion_run LIMIT 1"
+        ).fetchone() is None
+        assert "page_size" in {
+            row[1] for row in repository.connection.execute("PRAGMA table_info(work_unit)")
+        }
         tables = {
             row[0]
             for row in repository.connection.execute(

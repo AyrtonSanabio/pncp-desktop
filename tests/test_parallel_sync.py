@@ -52,6 +52,22 @@ class FailOnceSource:
         return self.pages[page_number]
 
 
+class AlwaysFailOnePageSource(ConcurrentSource):
+    def __init__(self, pages: dict[int, SourcePage], broken_page: int) -> None:
+        super().__init__(pages)
+        self.broken_page = broken_page
+        self.call_counts: Counter[int] = Counter()
+
+    async def fetch_publications(
+        self, _window: SyncWindow, page_number: int
+    ) -> SourcePage:
+        self.calls.append(page_number)
+        self.call_counts[page_number] += 1
+        if page_number == self.broken_page:
+            raise PNCPError(f"HTTP 504 persistente na página {page_number}")
+        return self.pages[page_number]
+
+
 class BlockingSource:
     def __init__(self) -> None:
         self.started = asyncio.Event()
@@ -112,6 +128,31 @@ async def test_parallel_runner_ramps_to_four_and_keeps_individual_checkpoints(
 
 
 @pytest.mark.asyncio
+async def test_parallel_recovery_starts_with_one_and_ramps_only_after_successes(
+    tmp_path: Path,
+) -> None:
+    pages = _pages(21)
+    source = ConcurrentSource(pages)
+    config = _config(tmp_path / "parallel-recovery.sqlite3")
+    window = SyncWindow(date(2026, 8, 4), date(2026, 8, 4), 6)
+    plan = await plan_sync(config, window, source=source)
+    messages: list[str] = []
+
+    summary = await run_sync_parallel(
+        config,
+        plan.run_id,
+        source=source,
+        initial_concurrency=1,
+        status=messages.append,
+    )
+
+    assert summary.status == "COMPLETED"
+    assert source.max_active == 3
+    assert any("concorrência aumentada para 2/4" in message for message in messages)
+    assert any("concorrência aumentada para 3/4" in message for message in messages)
+
+
+@pytest.mark.asyncio
 async def test_parallel_runner_drops_to_one_and_retries_without_gaps(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -141,6 +182,41 @@ async def test_parallel_runner_drops_to_one_and_retries_without_gaps(
     with SyncRepository(config.db_path) as repository:
         assert repository.count_contratacoes() == 6
         assert repository.verify(plan.run_id)["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_parallel_adia_pagina_defeituosa_e_confirma_as_seguintes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pages = _pages(5)
+    source = AlwaysFailOnePageSource(pages, broken_page=2)
+    config = _config(tmp_path / "parallel-deferred.sqlite3", concurrency=4)
+    window = SyncWindow(date(2026, 8, 5), date(2026, 8, 5), 6)
+    plan = await plan_sync(config, window, source=source)
+    messages: list[str] = []
+
+    async def no_wait(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(parallel_module.asyncio, "sleep", no_wait)
+    summary = await run_sync_parallel(
+        config,
+        plan.run_id,
+        source=source,
+        status=messages.append,
+    )
+
+    assert summary.status == "FAILED"
+    assert summary.succeeded_units == 4
+    assert summary.failed_units == 1
+    assert source.call_counts[2] == config.max_retries
+    assert all(page in source.calls for page in (3, 4, 5))
+    assert any("Página 2 adiada" in message for message in messages)
+    with SyncRepository(config.db_path) as repository:
+        assert repository.count_contratacoes() == 4
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM contratacao WHERE sequencial_compra=5"
+        ).fetchone()[0] == 1
 
 
 @pytest.mark.asyncio

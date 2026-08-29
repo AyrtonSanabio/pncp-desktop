@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import json
 import sqlite3
+import unicodedata
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -34,6 +35,7 @@ from pncp_sync.persistence.schema import (
     MIGRATION_V3,
     MIGRATION_V4,
     MIGRATION_V5,
+    MIGRATION_V6,
     SCHEMA_VERSION,
 )
 
@@ -172,6 +174,11 @@ class SyncRepository:
             self.connection.executescript(MIGRATION_V5)
             self.connection.execute("PRAGMA user_version = 5")
             self.connection.commit()
+            current = 5
+        if current < 6:
+            self.connection.executescript(MIGRATION_V6)
+            self.connection.execute("PRAGMA user_version = 6")
+            self.connection.commit()
 
     def create_plan(
         self,
@@ -181,6 +188,7 @@ class SyncRepository:
         estimated_download_bytes: int,
         estimated_database_bytes: int,
         free_disk_bytes: int,
+        page_size: int,
     ) -> str:
         run_id = str(uuid4())
         now = utc_now_iso()
@@ -192,9 +200,9 @@ class SyncRepository:
                     id, resource, data_inicial, data_final, modalidade,
                     status, collector_version, estimated_download_bytes,
                     estimated_database_bytes, free_disk_bytes_at_plan,
-                    unmodeled_fields_json, created_at
+                    unmodeled_fields_json, created_at, page_size
                 ) VALUES (
-                    ?, 'contratacoes_publicacao', ?, ?, ?, 'PLANNED', ?, ?, ?, ?, ?, ?
+                    ?, 'contratacoes_publicacao', ?, ?, ?, 'PLANNED', ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -208,6 +216,7 @@ class SyncRepository:
                     free_disk_bytes,
                     canonical_json(first_page.unmodeled_fields),
                     now,
+                    page_size,
                 ),
             )
             for page_number in range(1, planned_pages + 1):
@@ -215,8 +224,8 @@ class SyncRepository:
                     """
                     INSERT INTO work_unit(
                         run_id, resource, data_inicial, data_final, modalidade,
-                        page_number, status, created_at
-                    ) VALUES (?, 'contratacoes_publicacao', ?, ?, ?, ?, 'PENDING', ?)
+                        page_number, status, created_at, page_size
+                    ) VALUES (?, 'contratacoes_publicacao', ?, ?, ?, ?, 'PENDING', ?, ?)
                     """,
                     (
                         run_id,
@@ -225,6 +234,7 @@ class SyncRepository:
                         window.modalidade,
                         page_number,
                         now,
+                        page_size,
                     ),
                 )
             first_unit_id = int(
@@ -258,7 +268,9 @@ class SyncRepository:
             )
         return run_id
 
-    def find_reusable_plan(self, window: SyncWindow) -> PlanSummary | None:
+    def find_reusable_plan(
+        self, window: SyncWindow, *, page_size: int
+    ) -> PlanSummary | None:
         """Reabre uma estimativa persistida sem consultar novamente o PNCP."""
         row = self.connection.execute(
             """SELECT r.*, c.planned_pages
@@ -267,6 +279,7 @@ class SyncRepository:
                WHERE r.resource='contratacoes_publicacao'
                  AND r.data_inicial=? AND r.data_final=? AND r.modalidade=?
                  AND r.status='PLANNED' AND r.collector_version=?
+                 AND r.page_size=?
                  AND NOT EXISTS (
                      SELECT 1 FROM work_unit w
                      WHERE w.run_id=r.id AND w.status!='PENDING'
@@ -277,6 +290,7 @@ class SyncRepository:
                 window.data_final.isoformat(),
                 window.modalidade,
                 __version__,
+                page_size,
             ),
         ).fetchone()
         if row is None:
@@ -295,6 +309,7 @@ class SyncRepository:
             data_final=date.fromisoformat(unit_row["data_final"]),
             modalidade=int(unit_row["modalidade"]),
             page_number=int(unit_row["page_number"]),
+            page_size=int(unit_row["page_size"]),
             attempt_count=int(unit_row["attempt_count"]),
         )
         probe = self.load_probe(work_unit)
@@ -501,6 +516,14 @@ class SyncRepository:
             "free_disk_bytes_at_plan": int(row["free_disk_bytes_at_plan"]),
         }
 
+    def get_run_page_size(self, run_id: str) -> int:
+        row = self.connection.execute(
+            "SELECT page_size FROM ingestion_run WHERE id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Execução não encontrada: {run_id}")
+        return int(row["page_size"])
+
     def claim_next_work_unit(self, run_id: str, *, max_attempts: int = 3) -> WorkUnit | None:
         now = datetime.now(UTC)
         lease_until = (now + timedelta(seconds=self.lease_seconds)).isoformat(
@@ -557,6 +580,7 @@ class SyncRepository:
                 data_final=date.fromisoformat(row["data_final"]),
                 modalidade=int(row["modalidade"]),
                 page_number=int(row["page_number"]),
+                page_size=int(row["page_size"]),
                 attempt_count=attempt_count,
             )
 
@@ -962,6 +986,61 @@ class SyncRepository:
                     (run_id,),
                 )
             return reopened
+
+    def reclassify_false_period_limit_errors(self, run_id: str) -> int:
+        """Reclassifica somente o 422 de período contraditório em janelas válidas.
+
+        Versões anteriores gravavam essa resposta do PNCP como falha definitiva.
+        A correção é restrita à ocorrência mais recente de unidades com falha e a
+        execuções cuja janela já respeita o limite local de 31 dias.
+        """
+        run = self.connection.execute(
+            "SELECT data_inicial,data_final FROM ingestion_run WHERE id=?",
+            (run_id,),
+        ).fetchone()
+        if run is None:
+            return 0
+        start = date.fromisoformat(run["data_inicial"])
+        end = date.fromisoformat(run["data_final"])
+        if end < start or (end - start).days > 30:
+            return 0
+
+        rows = self.connection.execute(
+            """SELECT work_unit.id AS work_unit_id, error.id AS error_id, error.message
+               FROM work_unit
+               JOIN ingestion_error AS error ON error.id = (
+                   SELECT latest.id FROM ingestion_error AS latest
+                   WHERE latest.work_unit_id=work_unit.id
+                   ORDER BY latest.id DESC LIMIT 1
+               )
+               WHERE work_unit.run_id=? AND work_unit.status='FAILED'
+                 AND error.category='PNCP' AND error.recoverable=0""",
+            (run_id,),
+        ).fetchall()
+        matching_error_ids = []
+        expected_messages = (
+            "periodo inicial e final maior que 365 dias",
+            "data inicial deve ser anterior ou igual a data final",
+        )
+        for row in rows:
+            decomposed = unicodedata.normalize("NFKD", row["message"] or "").casefold()
+            normalized = "".join(
+                character
+                for character in decomposed
+                if not unicodedata.combining(character)
+            )
+            if any(expected in normalized for expected in expected_messages):
+                matching_error_ids.append(row["error_id"])
+
+        if not matching_error_ids:
+            return 0
+        placeholders = ",".join("?" for _ in matching_error_ids)
+        with self._transaction() as cursor:
+            cursor.execute(
+                f"UPDATE ingestion_error SET recoverable=1 WHERE id IN ({placeholders})",
+                matching_error_ids,
+            )
+            return cursor.rowcount
 
     def latest_error(self, run_id: str) -> dict[str, Any] | None:
         """Retorna a ocorrência mais recente para explicar uma espera automática."""

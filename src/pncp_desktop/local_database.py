@@ -311,13 +311,21 @@ class LocalDatabase:
             ).fetchone()
             errors = connection.execute(
                 """
-                SELECT 'Contratações' source, run_id, work_unit_id, created_at,
-                       category, recoverable, message, COALESCE(detail, '') detail
-                FROM ingestion_error
+                SELECT 'Contratações' AS source, error.run_id AS run_id,
+                       error.work_unit_id AS work_unit_id,
+                       unit.page_number AS page_number,
+                       unit.data_inicial || ' a ' || unit.data_final AS scope,
+                       unit.modalidade AS modalidade, error.created_at AS created_at,
+                       error.category AS category, error.recoverable AS recoverable,
+                       error.message AS message, COALESCE(error.detail, '') AS detail
+                FROM ingestion_error AS error
+                LEFT JOIN work_unit AS unit ON unit.id=error.work_unit_id
                 UNION ALL
-                SELECT 'Itens/resultados', detail_run_id, work_unit_id, created_at,
-                       category, recoverable, message, COALESCE(detail, '')
-                FROM detail_error
+                SELECT 'Itens/resultados', error.detail_run_id, error.work_unit_id,
+                       NULL, unit.resource, NULL, error.created_at, error.category,
+                       error.recoverable, error.message, COALESCE(error.detail, '')
+                FROM detail_error AS error
+                LEFT JOIN detail_work_unit AS unit ON unit.id=error.work_unit_id
                 ORDER BY created_at DESC
                 LIMIT ?
                 """,
