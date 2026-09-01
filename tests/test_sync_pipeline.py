@@ -89,7 +89,10 @@ class OneBrokenPageSource(FakeSource):
 
 
 def config_for(path: Path) -> SyncConfig:
-    return SyncConfig(db_path=path, lease_seconds=30)
+    # Os testes do pipeline validam contagens exatas de uma rodada curta. Mantemos
+    # três tentativas aqui para que sejam rápidos; o padrão de produção (oito) é
+    # coberto em test_sync_worker.py.
+    return SyncConfig(db_path=path, lease_seconds=30, max_retries=3)
 
 
 @pytest.mark.asyncio

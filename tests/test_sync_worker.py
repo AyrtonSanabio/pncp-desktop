@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import date
 
 import pytest
+from pypncp import PNCPError
 
 from pncp_desktop import sync_worker
 from pncp_desktop.sync_worker import SyncTaskThread
 from pncp_sync.config import SyncConfig
-from pncp_sync.domain.models import RunSummary
+from pncp_sync.domain.models import RunSummary, SyncWindow
 
 
 def _summary(status: str, *, done: int, failed: int = 0) -> RunSummary:
@@ -26,6 +28,52 @@ def _summary(status: str, *, done: int, failed: int = 0) -> RunSummary:
         records_rejected=0,
         bytes_received=done * 100,
     )
+
+
+def test_default_page_retry_budget_is_not_fragile(tmp_path) -> None:
+    config = SyncConfig(db_path=tmp_path / "retries.sqlite3")
+
+    assert config.max_retries == 8
+
+
+@pytest.mark.asyncio
+async def test_full_sync_planning_retries_past_interactive_limit(
+    monkeypatch, tmp_path
+) -> None:
+    attempts = 0
+    expected = object()
+
+    async def fake_plan_sync(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 6:
+            raise PNCPError("HTTP 504 temporário")
+        return expected
+
+    waits: list[int] = []
+
+    async def fake_sleep(seconds: int) -> None:
+        waits.append(seconds)
+
+    monkeypatch.setattr(sync_worker, "plan_sync", fake_plan_sync)
+    monkeypatch.setattr(sync_worker.asyncio, "sleep", fake_sleep)
+    worker = SyncTaskThread(
+        SyncConfig(
+            db_path=tmp_path / "continuous-plan.sqlite3",
+            continuous_retry_base_seconds=1,
+            continuous_retry_max_seconds=4,
+        ),
+        action="full_sync",
+    )
+
+    result = await worker._plan_with_retry(
+        SyncWindow(date(2024, 1, 1), date(2024, 1, 31), 8),
+        continuous=True,
+    )
+
+    assert result is expected
+    assert attempts == 7
+    assert waits == [1, 2, 4, 4, 4, 4]
 
 
 @pytest.mark.asyncio

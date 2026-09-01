@@ -1,21 +1,54 @@
+# Python
 __pycache__/
 *.py[cod]
 .venv/
+*.egg-info/
+
+# Ferramentas de teste, qualidade e cobertura
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
+
+# PyInstaller e builds locais
 build/
 dist/
 build-*/
 dist-*/
-*.egg-info/
 *.spec
 !pncp-desktop.spec
+
+# Instalador e pacotes distribuíveis
+installer/Output/
+*.exe
+*.msi
+*.msix
+*.zip
+
+# Capturas e artefatos de smoke/debug
+smoke*.png
+smoke*.json
+smoke-output/
+test-output/
+*.tmp
+
+# Logs e exportações locais
 *.log
 *.csv
 *.xlsx
+
+# Bancos locais e arquivos auxiliares do SQLite
 data/*.sqlite3
 data/*.sqlite3-shm
 data/*.sqlite3-wal
+*.db
+*.db-shm
+*.db-wal
+
+# Arquivos do sistema operacional e IDE
+Thumbs.db
+Desktop.ini
+.idea/

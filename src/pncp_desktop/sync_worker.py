@@ -285,7 +285,11 @@ class SyncTaskThread(QThread):
                 if resumable_run:
                     repository.reclassify_false_period_limit_errors(resumable_run)
                     repository.retry_recoverable_units(resumable_run)
-            plan = None if resumable_run else await self._plan_with_retry(window)
+            plan = (
+                None
+                if resumable_run
+                else await self._plan_with_retry(window, continuous=True)
+            )
             current_run_id = resumable_run or plan.run_id
             self.run_id = current_run_id
             self.run_ids = (*self.run_ids, current_run_id)
@@ -294,7 +298,6 @@ class SyncTaskThread(QThread):
                 self._emit_full_progress(repository.get_summary(current_run_id))
             main_summary = await self._run_main_continuously(
                 current_run_id,
-                defer_after_sweep=True,
             )
             summaries.append(main_summary)
             self._full_completed_windows = index
@@ -337,8 +340,6 @@ class SyncTaskThread(QThread):
     async def _run_main_continuously(
         self,
         run_id: str,
-        *,
-        defer_after_sweep: bool = False,
     ) -> RunSummary:
         """Repete falhas recuperáveis até concluir ou receber cancelamento do usuário.
 
@@ -371,13 +372,6 @@ class SyncTaskThread(QThread):
                 conservative_start=conservative_start,
             )
             if summary.status.startswith("COMPLETED"):
-                return summary
-
-            # Na carga completa, cada página já esgotou as tentativas curtas e as
-            # demais páginas do lote já foram percorridas. Adiar a nova rodada
-            # permite avançar para outros lotes; a unidade FAILED permanece como
-            # checkpoint indexado para Continuar ou para a próxima sessão.
-            if defer_after_sweep and summary.failed_units and not summary.pending_units:
                 return summary
 
             with SyncRepository(self.config.db_path) as repository:
@@ -461,21 +455,47 @@ class SyncTaskThread(QThread):
             await asyncio.sleep(step)
             remaining -= step
 
-    async def _plan_with_retry(self, window: SyncWindow) -> Any:
-        """Planeja um recorte com espera adequada para timeout e HTTP 429."""
-        for attempt in range(1, self._PLANNING_ATTEMPTS + 1):
+    async def _plan_with_retry(
+        self,
+        window: SyncWindow,
+        *,
+        continuous: bool = False,
+    ) -> Any:
+        """Planeja um recorte com espera adequada para timeout e HTTP 429.
+
+        Estimativas solicitadas isoladamente continuam com um limite de tentativas
+        para devolver controle ao usuario. A carga completa nao expira por uma
+        indisponibilidade recuperavel: aguarda com backoff ate concluir ou receber
+        o cancelamento de Pausar.
+        """
+        attempt = 0
+        while continuous or attempt < self._PLANNING_ATTEMPTS:
+            attempt += 1
             try:
                 return await plan_sync(self.config, window)
             except PNCPError as exc:
-                if attempt >= self._PLANNING_ATTEMPTS:
+                if not continuous and attempt >= self._PLANNING_ATTEMPTS:
                     raise
                 message = str(exc).lower()
                 rate_limited = "too many requests" in message or "429" in message
-                delay = 60 if rate_limited else min(10 * (2 ** (attempt - 1)), 60)
+                delay = (
+                    60
+                    if rate_limited
+                    else min(
+                        self.config.continuous_retry_base_seconds
+                        * (2 ** min(10, max(0, attempt - 1))),
+                        self.config.continuous_retry_max_seconds,
+                    )
+                )
                 reason = "limite de requisições HTTP 429" if rate_limited else "falha temporária"
+                attempt_label = (
+                    f"{attempt + 1}; a carga continuará tentando"
+                    if continuous
+                    else f"{attempt + 1}/{self._PLANNING_ATTEMPTS}"
+                )
                 self.activity.emit(
                     f"PNCP informou {reason}. Aguardando {delay} s antes da tentativa "
-                    f"{attempt + 1}/{self._PLANNING_ATTEMPTS}; não feche o programa."
+                    f"{attempt_label}; use Pausar para interromper com segurança."
                 )
                 await asyncio.sleep(delay)
 

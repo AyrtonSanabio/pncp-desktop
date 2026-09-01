@@ -28,8 +28,8 @@ Para cada lote, o programa:
 2. reabre uma execução incompleta existente ou cria um plano;
 3. baixa uma ou mais páginas conforme o modo escolhido;
 4. confirma cada página separadamente e em ordem transacional no SQLite;
-5. cataloga páginas que esgotaram as tentativas e avança ao lote seguinte sem
-   descartar o índice da pendência.
+5. cataloga páginas que esgotaram a rodada curta, aguarda com espera progressiva e
+   reabre somente as falhas recuperáveis até concluir ou o usuário apertar **Pausar**.
 
 O seletor **Downloads simultâneos** oferece 1, 2 ou 4. O modo 1 usa o motor sequencial
 original. Acima de 1, um motor separado paraleliza somente a rede: normalização e escrita
@@ -38,16 +38,19 @@ de sucessos e nunca ultrapassa o limite escolhido.
 
 ## Falhas temporárias
 
-Timeout, desconexão, HTTP 429, erros HTTP 5xx e validações HTTP devolvidas pelo PNCP
-participam de tentativas finitas. A página não confirmada é mantida no banco pelo número,
-intervalo, modalidade, quantidade de tentativas e diagnóstico. A execução tenta novamente a
-mesma página até o limite configurado; se ainda falhar, marca a unidade como `FAILED` e segue
-para as próximas páginas.
+Timeout, desconexão, HTTP 429 e erros HTTP 5xx participam de rodadas curtas de até oito
+tentativas por página. A página não confirmada é mantida no banco pelo número, intervalo,
+modalidade, quantidade de tentativas e diagnóstico. As demais páginas do lote continuam sendo
+percorridas; ao fim da rodada, falhas recuperáveis são reabertas depois de uma espera
+progressiva. Esse ciclo não possui limite global na carga completa: continua enquanto o
+aplicativo estiver aberto, até a página responder ou o usuário apertar **Pausar**.
 
-Na carga completa, uma página `FAILED` também não impede a passagem para os lotes seguintes.
-Ela permanece ligada à execução em `work_unit` e cada ocorrência fica em `ingestion_error`.
-Ao usar **Continuar** ou iniciar novamente o mesmo escopo, falhas recuperáveis são reabertas;
-páginas já confirmadas não são baixadas novamente.
+O planejamento de cada novo lote da carga completa segue a mesma regra contínua. Uma sequência
+longa de HTTP 429, HTTP 5xx ou falhas de rede não encerra a sincronização depois de um número
+fixo de tentativas. Estimativas isoladas continuam limitadas a cinco tentativas para devolver
+o controle da tela ao usuário. Erros incompatíveis com o contrato da fonte e falhas inesperadas
+de programação ou gravação permanecem fatais, pois repeti-los indefinidamente poderia esconder
+corrupção ou um defeito do software.
 
 No modo acelerado, qualquer falha de rede reduz imediatamente a concorrência para 1. Se as
 tentativas da página se esgotarem, o ciclo seguinte também começa em 1; ele não volta direto

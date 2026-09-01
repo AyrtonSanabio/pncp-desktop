@@ -11,10 +11,11 @@ class SyncConfig:
     db_path: Path
     base_url: str = "https://pncp.gov.br/api/consulta/v1"
     details_base_url: str = "https://pncp.gov.br/api/pncp/v1"
-    # O PNCP apresenta picos reais de latencia. O limite maior evita falsos erros,
-    # enquanto as retentativas continuam limitadas para nunca prender a aplicacao.
+    # O PNCP apresenta picos reais de latencia. O limite maior evita falsos erros.
+    # Cada rodada curta tenta a mesma pagina varias vezes; a carga completa reabre
+    # falhas recuperaveis depois de uma espera cancelavel ate o usuario pausar.
     timeout_seconds: int = 90
-    max_retries: int = 3
+    max_retries: int = 8
     max_concurrent: int = 1
     publication_page_size: int = 50
     max_window_days: int = 31
