@@ -68,6 +68,13 @@ class AlwaysFailOnePageSource(ConcurrentSource):
         return self.pages[page_number]
 
 
+class RateLimitedSource:
+    async def fetch_publications(
+        self, _window: SyncWindow, _page_number: int
+    ) -> SourcePage:
+        raise PNCPError("Too Many Requests")
+
+
 class BlockingSource:
     def __init__(self) -> None:
         self.started = asyncio.Event()
@@ -111,7 +118,12 @@ async def test_parallel_runner_ramps_to_four_and_keeps_individual_checkpoints(
     window = SyncWindow(date(2026, 8, 1), date(2026, 8, 1), 6)
     plan = await plan_sync(config, window, source=source)
 
-    summary = await run_sync_parallel(config, plan.run_id, source=source)
+    summary = await run_sync_parallel(
+        config,
+        plan.run_id,
+        source=source,
+        stop_after_failed_batch=True,
+    )
 
     assert summary.status == "COMPLETED"
     assert summary.succeeded_units == 21
@@ -217,6 +229,67 @@ async def test_parallel_adia_pagina_defeituosa_e_confirma_as_seguintes(
         assert repository.connection.execute(
             "SELECT COUNT(*) FROM contratacao WHERE sequencial_compra=5"
         ).fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_parallel_stops_after_failed_batch_without_limiting_healthy_runs(
+    tmp_path: Path,
+) -> None:
+    pages = _pages(6)
+    source = AlwaysFailOnePageSource(pages, broken_page=2)
+    config = SyncConfig(
+        db_path=tmp_path / "bounded-sweep.sqlite3",
+        lease_seconds=30,
+        max_concurrent=4,
+        max_retries=1,
+    )
+    window = SyncWindow(date(2026, 8, 6), date(2026, 8, 6), 6)
+    plan = await plan_sync(config, window, source=source)
+
+    summary = await run_sync_parallel(
+        config,
+        plan.run_id,
+        source=source,
+        stop_after_failed_batch=True,
+    )
+
+    assert source.calls == [1, 2]
+    assert summary.failed_units == 1
+    assert summary.pending_units == 4
+    assert summary.status == "FAILED"
+
+
+@pytest.mark.asyncio
+async def test_parallel_waits_globally_after_rate_limit_before_next_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pages = _pages(3)
+    config = SyncConfig(
+        db_path=tmp_path / "rate-limited-sweep.sqlite3",
+        lease_seconds=30,
+        max_concurrent=4,
+        max_retries=1,
+    )
+    window = SyncWindow(date(2026, 8, 7), date(2026, 8, 7), 6)
+    plan = await plan_sync(config, window, source=ConcurrentSource(pages))
+    waits: list[float] = []
+    messages: list[str] = []
+
+    async def record_wait(seconds: float) -> None:
+        waits.append(seconds)
+
+    monkeypatch.setattr(parallel_module.asyncio, "sleep", record_wait)
+    summary = await run_sync_parallel(
+        config,
+        plan.run_id,
+        source=RateLimitedSource(),
+        stop_after_failed_batch=True,
+        status=messages.append,
+    )
+
+    assert summary.status == "FAILED"
+    assert waits == [60]
+    assert any("carga inteira aguardará 60 s" in message for message in messages)
 
 
 @pytest.mark.asyncio

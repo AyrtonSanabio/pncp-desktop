@@ -539,13 +539,25 @@ class SyncRepository:
                 """,
                 (run_id, now_text),
             )
+            # Versões anteriores podiam deixar uma unidade PENDING exatamente no
+            # teto de tentativas após fechamento/reinício. A recuperação do lease
+            # precisa acontecer antes desta normalização para que uma unidade
+            # RUNNING abandonada no teto também volte a ser reivindicável já nesta
+            # chamada. FAILED é o único estado terminal válido.
+            cursor.execute(
+                """UPDATE work_unit
+                   SET attempt_count = ?
+                   WHERE run_id = ? AND status = 'PENDING' AND attempt_count >= ?""",
+                (max_attempts - 1, run_id, max_attempts),
+            )
             row = cursor.execute(
                 """
                 SELECT * FROM work_unit
                 WHERE run_id = ?
                   AND status IN ('PENDING', 'RETRY_WAIT')
                   AND attempt_count < ?
-                ORDER BY page_number
+                ORDER BY CASE status WHEN 'PENDING' THEN 0 ELSE 1 END,
+                         page_number
                 LIMIT 1
                 """,
                 (run_id, max_attempts),
@@ -916,7 +928,9 @@ class SyncRepository:
             )
             cursor.execute(
                 "UPDATE ingestion_run SET status = ? WHERE id = ?",
-                ("PAUSED" if unit_status == "RETRY_WAIT" else "FAILED", work_unit.run_id),
+                # RETRY_WAIT faz parte de uma execução ativa. PAUSED é reservado
+                # exclusivamente para cancelamento/pausa solicitada pelo usuário.
+                ("RUNNING" if unit_status == "RETRY_WAIT" else "FAILED", work_unit.run_id),
             )
 
     def release_unit(self, work_unit: WorkUnit) -> None:
@@ -952,7 +966,8 @@ class SyncRepository:
         with self._transaction() as cursor:
             cursor.execute(
                 """UPDATE work_unit
-                   SET status='PENDING', lease_until=NULL, finished_at=NULL
+                   SET status='PENDING', lease_until=NULL, finished_at=NULL,
+                       attempt_count=MAX(0, attempt_count - 1)
                    WHERE status='RUNNING'"""
             )
             recovered = cursor.rowcount
@@ -970,7 +985,7 @@ class SyncRepository:
         with self._transaction() as cursor:
             cursor.execute(
                 """UPDATE work_unit
-                   SET status='PENDING', attempt_count=0, lease_until=NULL, finished_at=NULL
+                   SET status='RETRY_WAIT', attempt_count=0, lease_until=NULL, finished_at=NULL
                    WHERE run_id=? AND status='FAILED'
                      AND COALESCE((
                          SELECT e.recoverable FROM ingestion_error e
@@ -982,10 +997,25 @@ class SyncRepository:
             reopened = cursor.rowcount
             if reopened:
                 cursor.execute(
-                    "UPDATE ingestion_run SET status='PAUSED',finished_at=NULL WHERE id=?",
+                    "UPDATE ingestion_run SET status='RUNNING',finished_at=NULL WHERE id=?",
                     (run_id,),
                 )
             return reopened
+
+    def count_recoverable_failed_units(self, run_id: str) -> int:
+        """Conta pendências temporárias sem alterar o estado persistido da execução."""
+        row = self.connection.execute(
+            """SELECT COUNT(*)
+               FROM work_unit
+               WHERE run_id=? AND status='FAILED'
+                 AND COALESCE((
+                     SELECT e.recoverable FROM ingestion_error e
+                     WHERE e.work_unit_id=work_unit.id
+                     ORDER BY e.id DESC LIMIT 1
+                 ),0)=1""",
+            (run_id,),
+        ).fetchone()
+        return int(row[0])
 
     def reclassify_false_period_limit_errors(self, run_id: str) -> int:
         """Reclassifica somente o 422 de período contraditório em janelas válidas.

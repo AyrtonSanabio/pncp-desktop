@@ -64,6 +64,7 @@ async def run_sync(
     *,
     source: SourceProtocol | None = None,
     max_pages: int | None = None,
+    stop_after_failure: bool = False,
     progress: ProgressCallback | None = None,
     activity: ActivityCallback | None = None,
     status: StatusCallback | None = None,
@@ -132,6 +133,17 @@ async def run_sync(
                     recoverable=_is_recoverable(exc),
                     max_attempts=config.max_retries,
                 )
+                if stop_after_failure:
+                    if _is_rate_limited(exc):
+                        delay = _retry_delay_seconds(exc, work_unit.attempt_count)
+                        if status is not None:
+                            status(
+                                "O PNCP aplicou limite HTTP 429. A carga inteira aguardará "
+                                f"{delay} s antes de consultar outro lote, evitando uma "
+                                "sequência de requisições rejeitadas."
+                            )
+                        await asyncio.sleep(delay)
+                    return repository.get_summary(run_id)
                 if _is_recoverable(exc) and work_unit.attempt_count < config.max_retries:
                     # Backoff exponencial entre tentativas do lote. O cliente HTTP também
                     # possui retry próprio; esta camada protege o checkpoint persistente.
@@ -164,6 +176,8 @@ async def run_sync(
                     detail=type(exc).__name__,
                     recoverable=False,
                 )
+                if stop_after_failure:
+                    return repository.get_summary(run_id)
                 if status is not None:
                     status(
                         f"Página {work_unit.page_number} adiada por resposta incompatível. "

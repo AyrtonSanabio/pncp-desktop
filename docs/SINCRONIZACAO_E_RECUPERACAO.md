@@ -28,8 +28,10 @@ Para cada lote, o programa:
 2. reabre uma execução incompleta existente ou cria um plano;
 3. baixa uma ou mais páginas conforme o modo escolhido;
 4. confirma cada página separadamente e em ordem transacional no SQLite;
-5. cataloga páginas que esgotaram a rodada curta, aguarda com espera progressiva e
-   reabre somente as falhas recuperáveis até concluir ou o usuário apertar **Pausar**.
+5. cataloga páginas que esgotaram a rodada curta e segue imediatamente para os próximos
+   lotes, sem permitir que uma única resposta defeituosa monopolize a carga;
+6. depois da passagem pelos lotes primários, revisita as pendências recuperáveis em rodízio,
+   com espera progressiva entre as rodadas, até concluir ou o usuário apertar **Pausar**.
 
 O seletor **Downloads simultâneos** oferece 1, 2 ou 4. O modo 1 usa o motor sequencial
 original. Acima de 1, um motor separado paraleliza somente a rede: normalização e escrita
@@ -38,19 +40,27 @@ de sucessos e nunca ultrapassa o limite escolhido.
 
 ## Falhas temporárias
 
-Timeout, desconexão, HTTP 429 e erros HTTP 5xx participam de rodadas curtas de até oito
-tentativas por página. A página não confirmada é mantida no banco pelo número, intervalo,
-modalidade, quantidade de tentativas e diagnóstico. As demais páginas do lote continuam sendo
-percorridas; ao fim da rodada, falhas recuperáveis são reabertas depois de uma espera
-progressiva. Esse ciclo não possui limite global na carga completa: continua enquanto o
-aplicativo estiver aberto, até a página responder ou o usuário apertar **Pausar**.
+Timeout, desconexão, interrupção durante leitura, HTTP 429 e erros HTTP 5xx participam de
+rodadas curtas. Na carga completa, uma execução saudável continua baixando e aumenta
+gradualmente até o limite de concorrência escolhido. Quando um grupo apresenta falha, seus
+resultados são catalogados, as páginas restantes continuam pendentes e a execução vai para o
+fim da fila. Assim, dezenas de páginas com HTTP 504 não monopolizam a carga nem limitam os
+lotes saudáveis a rodadas pequenas. O HTTP 429 recebe tratamento mais conservador: toda a
+carga aguarda 60 segundos antes de consultar outro lote, evitando transformar a limitação do
+servidor em centenas de requisições rejeitadas. Depois da
+passagem primária, as execuções com falhas recuperáveis formam uma fila circular: cada uma
+recebe uma nova rodada antes que qualquer execução seja tentada outra vez. Esse ciclo não
+possui limite global na carga completa e continua enquanto o aplicativo estiver aberto, até as
+páginas responderem ou o usuário apertar **Pausar**.
 
-O planejamento de cada novo lote da carga completa segue a mesma regra contínua. Uma sequência
-longa de HTTP 429, HTTP 5xx ou falhas de rede não encerra a sincronização depois de um número
-fixo de tentativas. Estimativas isoladas continuam limitadas a cinco tentativas para devolver
-o controle da tela ao usuário. Erros incompatíveis com o contrato da fonte e falhas inesperadas
-de programação ou gravação permanecem fatais, pois repeti-los indefinidamente poderia esconder
-corrupção ou um defeito do software.
+O planejamento também participa do rodízio. Na carga completa, a descoberta de um lote faz uma
+sondagem de no máximo 30 segundos e sem retries internos; se a primeira página não responder,
+esse recorte é adiado em memória e o próximo lote é planejado. Depois da
+passagem primária, planejamentos adiados e páginas catalogadas são alternados nas rodadas de
+recuperação. Ao reiniciar o aplicativo, as janelas são reconstruídas da sessão persistida e os
+recortes ainda sem plano voltam à fila. Erros incompatíveis com o contrato da fonte e falhas
+inesperadas de programação ou gravação permanecem fatais, pois repeti-los indefinidamente
+poderia esconder corrupção ou um defeito do software.
 
 No modo acelerado, qualquer falha de rede reduz imediatamente a concorrência para 1. Se as
 tentativas da página se esgotarem, o ciclo seguinte também começa em 1; ele não volta direto
@@ -63,7 +73,8 @@ Entre tentativas recuperáveis, a carga aplica espera progressiva:
 1 min -> 2 min -> 4 min -> 8 min -> máximo de 15 min
 ```
 
-Se alguma página avançar, a sequência volta para um minuto. A tela mostra o motivo, páginas
+A espera progressiva é aplicada entre rodadas de recuperação. A exceção é o HTTP 429, cuja
+pausa global imediata também vale durante a passagem primária. A tela mostra o motivo, lotes
 pendentes, duração da espera e ciclo atual. Não há loop apertado nem consultas durante a
 espera.
 
@@ -91,6 +102,15 @@ exibição não remove erros antigos.
 **Pausar** cancela a espera ou a requisição atual. Uma unidade sem commit volta para
 `PENDING`. Ao abrir o programa, unidades deixadas como `RUNNING` por queda de energia ou
 fechamento forçado também voltam para `PENDING`.
+
+Uma tentativa interrompida antes de produzir resposta não consome definitivamente o orçamento
+da página. Na recuperação, o contador é devolvido em uma unidade. Checkpoints antigos que
+tenham ficado `PENDING` já no teto de tentativas também são reparados automaticamente, evitando
+o estado inválido em que a página está pendente, mas nunca pode ser selecionada.
+
+O estado `PAUSED` e a preferência `manual_pause` são reservados ao comando explícito do
+usuário. HTTP 429, HTTP 5xx, timeout, páginas adiadas e rodadas de recuperação não podem
+simular um clique em **Pausar** nem desativar a retomada automática.
 
 Antes da primeira chamada de rede da carga completa, o programa grava no próprio SQLite o
 intervalo, opções de conteúdo e limite de concorrência. Se o aplicativo ou o computador cair,

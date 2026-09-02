@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import traceback
+from collections import deque
+from dataclasses import replace
 from typing import Any
 
 from pypncp import PNCPError
@@ -248,11 +250,15 @@ class SyncTaskThread(QThread):
         return tuple(windows[index] for index in sorted(indexes))
 
     async def _run_full_sync(self) -> None:
-        """Planeja e confirma um recorte por vez, com checkpoint durável."""
+        """Percorre todos os recortes e revisita falhas temporárias em rodízio."""
         if not self.windows:
             raise ValueError("Os lotes da carga completa não foram informados.")
-        summaries = []
+        summaries: dict[str, RunSummary] = {}
+        confirmed_by_run: dict[str, int] = {}
+        deferred_windows: list[SyncWindow] = []
+        deferred_runs: list[str] = []
         detail_summaries = []
+        detailed_runs: set[str] = set()
         self._planned_total = len(self.windows)
         self._full_total_windows = len(self.windows)
         self._full_completed_windows = 0
@@ -273,11 +279,11 @@ class SyncTaskThread(QThread):
             if completed_run:
                 with SyncRepository(self.config.db_path) as repository:
                     summary = repository.get_summary(completed_run)
-                summaries.append(summary)
+                summaries[completed_run] = summary
+                confirmed = summary.succeeded_units + summary.partial_units
+                confirmed_by_run[completed_run] = confirmed
                 self._full_completed_windows = index
-                self._full_confirmed_pages += (
-                    summary.succeeded_units + summary.partial_units
-                )
+                self._full_confirmed_pages += confirmed
                 self._emit_full_progress()
                 continue
             with SyncRepository(self.config.db_path) as repository:
@@ -285,48 +291,72 @@ class SyncTaskThread(QThread):
                 if resumable_run:
                     repository.reclassify_false_period_limit_errors(resumable_run)
                     repository.retry_recoverable_units(resumable_run)
-            plan = (
-                None
-                if resumable_run
-                else await self._plan_with_retry(window, continuous=True)
-            )
+            try:
+                plan = (
+                    None
+                    if resumable_run
+                    else await self._plan_full_window(window)
+                )
+            except PNCPError as exc:
+                deferred_windows.append(window)
+                self.activity.emit(
+                    f"Planejamento do lote {index}/{len(self.windows)} adiado: {exc}. "
+                    "A carga seguirá para o próximo lote e voltará a este depois."
+                )
+                self._full_completed_windows = index
+                self._emit_full_progress()
+                continue
             current_run_id = resumable_run or plan.run_id
             self.run_id = current_run_id
             self.run_ids = (*self.run_ids, current_run_id)
             self._planned_count = index
             with SyncRepository(self.config.db_path) as repository:
                 self._emit_full_progress(repository.get_summary(current_run_id))
-            main_summary = await self._run_main_continuously(
-                current_run_id,
-            )
-            summaries.append(main_summary)
+            # Uma carga completa não pode ficar monopolizada por uma única página.
+            # Cada lote recebe uma varredura finita; falhas recuperáveis são
+            # preservadas e entram no rodízio executado após os lotes primários.
+            main_summary = await self._run_main_sweep(current_run_id)
+            summaries[current_run_id] = main_summary
+            confirmed = main_summary.succeeded_units + main_summary.partial_units
+            confirmed_by_run[current_run_id] = confirmed
             self._full_completed_windows = index
-            self._full_confirmed_pages += (
-                main_summary.succeeded_units + main_summary.partial_units
-            )
+            self._full_confirmed_pages += confirmed
             self._emit_full_progress()
-            if main_summary.failed_units:
+            if main_summary.failed_units or main_summary.pending_units:
+                with SyncRepository(self.config.db_path) as repository:
+                    recoverable = repository.count_recoverable_failed_units(
+                        current_run_id
+                    )
+                has_deferred = recoverable or main_summary.pending_units
+                if has_deferred and current_run_id not in deferred_runs:
+                    deferred_runs.append(current_run_id)
                 self.activity.emit(
                     f"Lote {index}/{len(self.windows)} percorrido com "
-                    f"{main_summary.failed_units} página(s) adiada(s). Os índices "
+                    f"{main_summary.failed_units + main_summary.pending_units} "
+                    "página(s) adiada(s). Os índices "
                     "foram catalogados e a carga seguirá para o próximo lote."
                 )
             elif self.include_details:
-                detail_plan = plan_details(self.config, current_run_id)
-                self.detail_run_id = detail_plan.detail_run_id
-                self.detail_planned.emit(self.detail_run_id)
-                detail_summaries.append(
-                    await run_details(
-                        self.config,
-                        self.detail_run_id,
-                        progress=self._detail_progress,
-                        activity=self._detail_activity,
-                    )
+                await self._collect_details_for_run(
+                    current_run_id, detail_summaries, detailed_runs
                 )
             if index < len(self.windows) and plan is not None and not plan.reused:
                 await asyncio.sleep(self._PLANNING_PACE_SECONDS)
 
-        aggregate = self._aggregate_runs(tuple(summaries))
+            if main_summary.status == "PAUSED":
+                break
+
+        if not any(item.status == "PAUSED" for item in summaries.values()):
+            await self._retry_deferred_work(
+                deferred_windows,
+                deferred_runs,
+                summaries,
+                confirmed_by_run,
+                detail_summaries,
+                detailed_runs,
+            )
+
+        aggregate = self._aggregate_runs(tuple(summaries.values()))
         aggregate_details = (
             self._aggregate_details(tuple(detail_summaries)) if detail_summaries else None
         )
@@ -336,6 +366,188 @@ class SyncTaskThread(QThread):
             if aggregate.status.startswith("COMPLETED"):
                 await self._run_catalog_resources()
             self.completed.emit(aggregate, aggregate_details)
+
+    async def _run_main_sweep(self, run_id: str) -> RunSummary:
+        """Executa uma rodada finita e deixa falhas recuperáveis para outro momento."""
+        with SyncRepository(self.config.db_path) as repository:
+            corrected = repository.reclassify_false_period_limit_errors(run_id)
+            reopened = repository.retry_recoverable_units(run_id)
+        if corrected:
+            self.activity.emit(
+                f"Corrigido o diagnóstico de {corrected} página(s) da execução."
+            )
+        if reopened:
+            self.activity.emit(
+                f"Revisitando {reopened} página(s) temporariamente pendente(s), "
+                "sem bloquear os outros lotes."
+            )
+        # Uma rodada nacional visita cada página no máximo uma vez. O erro fica
+        # catalogado e a página volta somente no próximo ciclo do rodízio; assim
+        # um único 504 não monopoliza oito tentativas nem impede páginas saudáveis.
+        sweep_config = replace(self.config, max_retries=1)
+        return await self._run_main_sync(
+            run_id,
+            status_updates=True,
+            conservative_start=bool(reopened),
+            config=sweep_config,
+            stop_after_failed_batch=True,
+        )
+
+    async def _retry_deferred_work(
+        self,
+        deferred_windows: list[SyncWindow],
+        deferred_runs: list[str],
+        summaries: dict[str, RunSummary],
+        confirmed_by_run: dict[str, int],
+        detail_summaries: list[DetailRunSummary],
+        detailed_runs: set[str],
+    ) -> None:
+        """Revisita planejamentos e páginas em rodadas sem inanição."""
+        windows = deque(dict.fromkeys(deferred_windows))
+        runs = deque(dict.fromkeys(deferred_runs))
+        queue: deque[tuple[str, SyncWindow | str]] = deque()
+        # Intercala desde a primeira rodada e prioriza páginas já catalogadas.
+        while windows or runs:
+            if runs:
+                queue.append(("run", runs.popleft()))
+            if windows:
+                queue.append(("window", windows.popleft()))
+
+        cycle = 1
+        remaining_in_cycle = len(queue)
+        processed_run_ids: set[str] = set()
+        scheduled_run_ids = {
+            str(value) for kind, value in queue if kind == "run"
+        }
+        if queue:
+            self.activity.emit(
+                f"Rodada {cycle} de recuperação: revisitando "
+                f"{len(queue)} lote(s) pendente(s)."
+            )
+
+        while queue:
+            if remaining_in_cycle == 0:
+                cycle += 1
+                delay = min(
+                    self.config.continuous_retry_base_seconds
+                    * (2 ** min(10, cycle - 2)),
+                    self.config.continuous_retry_max_seconds,
+                )
+                await self._wait_before_retry(
+                    delay,
+                    reason="pendências temporárias catalogadas",
+                    reopened=len(queue),
+                    cycle=cycle,
+                )
+                remaining_in_cycle = len(queue)
+                processed_run_ids.clear()
+                self.activity.emit(
+                    f"Rodada {cycle} de recuperação: revisitando "
+                    f"{len(queue)} lote(s) pendente(s)."
+                )
+
+            kind, value = queue.popleft()
+            remaining_in_cycle -= 1
+            if kind == "window":
+                window = value
+                if not isinstance(window, SyncWindow):
+                    raise TypeError("Item inválido na fila de planejamento.")
+                try:
+                    plan = await self._plan_full_window(window)
+                except PNCPError as exc:
+                    queue.append(("window", window))
+                    self.activity.emit(
+                        f"Planejamento ainda indisponível para "
+                        f"{window.data_inicial:%d/%m/%Y} a "
+                        f"{window.data_final:%d/%m/%Y}, modalidade "
+                        f"{window.modalidade}: {exc}. Mantido no rodízio."
+                    )
+                    continue
+                run_id = plan.run_id
+                if run_id in scheduled_run_ids or run_id in processed_run_ids:
+                    self.activity.emit(
+                        f"A execução {run_id[:8]} já está neste rodízio; "
+                        "a duplicata foi ignorada."
+                    )
+                    continue
+                processed_run_ids.add(run_id)
+                self.run_id = run_id
+                if run_id not in self.run_ids:
+                    self.run_ids = (*self.run_ids, run_id)
+                summary = await self._run_main_sweep(run_id)
+                self._record_recovery_progress(
+                    summary, summaries, confirmed_by_run
+                )
+                if summary.status == "PAUSED":
+                    return
+                with SyncRepository(self.config.db_path) as repository:
+                    recoverable = repository.count_recoverable_failed_units(run_id)
+                if recoverable or summary.pending_units:
+                    queue.append(("run", run_id))
+                    scheduled_run_ids.add(run_id)
+                elif summary.status.startswith("COMPLETED"):
+                    await self._collect_details_for_run(
+                        run_id, detail_summaries, detailed_runs
+                    )
+                continue
+
+            run_id = str(value)
+            scheduled_run_ids.discard(run_id)
+            if run_id in processed_run_ids:
+                continue
+            processed_run_ids.add(run_id)
+            summary = await self._run_main_sweep(run_id)
+            self._record_recovery_progress(summary, summaries, confirmed_by_run)
+            if summary.status == "PAUSED":
+                return
+            with SyncRepository(self.config.db_path) as repository:
+                recoverable = repository.count_recoverable_failed_units(run_id)
+            if recoverable or summary.pending_units:
+                queue.append(("run", run_id))
+                scheduled_run_ids.add(run_id)
+            elif summary.status.startswith("COMPLETED"):
+                self.activity.emit(
+                    f"Pendências da execução {run_id[:8]} concluídas."
+                )
+                await self._collect_details_for_run(
+                    run_id, detail_summaries, detailed_runs
+                )
+
+    def _record_recovery_progress(
+        self,
+        summary: RunSummary,
+        summaries: dict[str, RunSummary],
+        confirmed_by_run: dict[str, int],
+    ) -> None:
+        """Atualiza o resumo sem contar novamente páginas já confirmadas."""
+        confirmed = summary.succeeded_units + summary.partial_units
+        previous = confirmed_by_run.get(summary.run_id, 0)
+        self._full_confirmed_pages += max(0, confirmed - previous)
+        confirmed_by_run[summary.run_id] = confirmed
+        summaries[summary.run_id] = summary
+        self._emit_full_progress(summary)
+
+    async def _collect_details_for_run(
+        self,
+        run_id: str,
+        detail_summaries: list[DetailRunSummary],
+        detailed_runs: set[str],
+    ) -> None:
+        """Coleta detalhes uma única vez quando a execução principal é concluída."""
+        if not self.include_details or run_id in detailed_runs:
+            return
+        detail_plan = plan_details(self.config, run_id)
+        self.detail_run_id = detail_plan.detail_run_id
+        self.detail_planned.emit(self.detail_run_id)
+        detail_summaries.append(
+            await run_details(
+                self.config,
+                self.detail_run_id,
+                progress=self._detail_progress,
+                activity=self._detail_activity,
+            )
+        )
+        detailed_runs.add(run_id)
 
     async def _run_main_continuously(
         self,
@@ -412,24 +624,29 @@ class SyncTaskThread(QThread):
         *,
         status_updates: bool = False,
         conservative_start: bool = False,
+        config: SyncConfig | None = None,
+        stop_after_failed_batch: bool = False,
     ) -> RunSummary:
+        effective_config = config or self.config
         status = (
             self.activity.emit
-            if status_updates or self.config.max_concurrent > 1
+            if status_updates or effective_config.max_concurrent > 1
             else None
         )
-        if self.config.max_concurrent > 1:
+        if effective_config.max_concurrent > 1:
             return await run_sync_parallel(
-                self.config,
+                effective_config,
                 run_id,
                 initial_concurrency=1 if conservative_start else None,
+                stop_after_failed_batch=stop_after_failed_batch,
                 progress=self._main_progress,
                 activity=self._main_activity,
                 status=status,
             )
         return await run_sync(
-            self.config,
+            effective_config,
             run_id,
+            stop_after_failure=stop_after_failed_batch,
             progress=self._main_progress,
             activity=self._main_activity,
             status=status,
@@ -458,23 +675,13 @@ class SyncTaskThread(QThread):
     async def _plan_with_retry(
         self,
         window: SyncWindow,
-        *,
-        continuous: bool = False,
     ) -> Any:
-        """Planeja um recorte com espera adequada para timeout e HTTP 429.
-
-        Estimativas solicitadas isoladamente continuam com um limite de tentativas
-        para devolver controle ao usuario. A carga completa nao expira por uma
-        indisponibilidade recuperavel: aguarda com backoff ate concluir ou receber
-        o cancelamento de Pausar.
-        """
-        attempt = 0
-        while continuous or attempt < self._PLANNING_ATTEMPTS:
-            attempt += 1
+        """Planeja um recorte com tentativas finitas para não bloquear outros lotes."""
+        for attempt in range(1, self._PLANNING_ATTEMPTS + 1):
             try:
                 return await plan_sync(self.config, window)
             except PNCPError as exc:
-                if not continuous and attempt >= self._PLANNING_ATTEMPTS:
+                if attempt >= self._PLANNING_ATTEMPTS:
                     raise
                 message = str(exc).lower()
                 rate_limited = "too many requests" in message or "429" in message
@@ -488,18 +695,23 @@ class SyncTaskThread(QThread):
                     )
                 )
                 reason = "limite de requisições HTTP 429" if rate_limited else "falha temporária"
-                attempt_label = (
-                    f"{attempt + 1}; a carga continuará tentando"
-                    if continuous
-                    else f"{attempt + 1}/{self._PLANNING_ATTEMPTS}"
-                )
                 self.activity.emit(
                     f"PNCP informou {reason}. Aguardando {delay} s antes da tentativa "
-                    f"{attempt_label}; use Pausar para interromper com segurança."
+                    f"{attempt + 1}/{self._PLANNING_ATTEMPTS}; use Pausar para "
+                    "interromper com segurança."
                 )
                 await asyncio.sleep(delay)
 
         raise RuntimeError("A estimativa encerrou sem resultado e sem exceção identificada.")
+
+    async def _plan_full_window(self, window: SyncWindow) -> Any:
+        """Sonda um lote rapidamente para não bloquear toda a carga nacional."""
+        planning_config = replace(
+            self.config,
+            max_retries=1,
+            timeout_seconds=min(30, self.config.timeout_seconds),
+        )
+        return await plan_sync(planning_config, window)
 
     async def _run_catalog_resources(self) -> None:
         if not self.include_contracts and not self.include_atas:

@@ -36,6 +36,7 @@ async def run_sync_parallel(
     source: SourceProtocol | None = None,
     initial_concurrency: int | None = None,
     max_pages: int | None = None,
+    stop_after_failed_batch: bool = False,
     progress: ProgressCallback | None = None,
     activity: ActivityCallback | None = None,
     status: StatusCallback | None = None,
@@ -56,6 +57,7 @@ async def run_sync_parallel(
             run_id,
             source=source,
             max_pages=max_pages,
+            stop_after_failure=stop_after_failed_batch,
             progress=progress,
             activity=activity,
             status=status,
@@ -247,6 +249,10 @@ async def run_sync_parallel(
                     progress(work_unit, result)
 
             had_failure = batch_successes != len(claimed)
+            rate_limited = any(
+                isinstance(outcome, PNCPError) and _is_rate_limited(outcome)
+                for outcome in outcomes
+            )
             if had_failure:
                 successful_streak = 0
                 if current_concurrency != 1 and status is not None:
@@ -271,16 +277,28 @@ async def run_sync_parallel(
 
             if fatal_failure is not None:
                 raise fatal_failure
+            if stop_after_failed_batch and had_failure:
+                if status is not None:
+                    status(
+                        "Lote adiado após a falha do grupo atual; os checkpoints "
+                        "pendentes irão para o fim do rodízio."
+                    )
+                if rate_limited:
+                    delay = _retry_delay_seconds(PNCPError("HTTP 429"), 1)
+                    if status is not None:
+                        status(
+                            "O PNCP aplicou limite HTTP 429. A carga inteira aguardará "
+                            f"{delay} s antes de consultar outro lote, evitando uma sequência "
+                            "de requisições rejeitadas."
+                        )
+                    await asyncio.sleep(delay)
+                return repository.get_summary(run_id)
             if retry_delays:
                 delay = max(retry_delays)
                 if status is not None:
                     reason = (
                         "limite HTTP 429"
-                        if any(
-                            isinstance(outcome, PNCPError)
-                            and _is_rate_limited(outcome)
-                            for outcome in outcomes
-                        )
+                        if rate_limited
                         else "falha temporária"
                     )
                     status(

@@ -2514,10 +2514,20 @@ class MainWindow(QMainWindow):
             self._sync_worker is not None and self._sync_worker.action == "full_sync"
         )
         if is_full_sync:
-            self._atualizar_estado_sessao_carga_completa(
-                active=has_failure,
-                manual_pause=has_failure,
-            )
+            if self._sync_manual_pause_requested:
+                # Uma conclusão concorrente com o clique não pode apagar a decisão
+                # explícita do usuário.
+                self._atualizar_estado_sessao_carga_completa(
+                    active=True,
+                    manual_pause=True,
+                )
+            else:
+                # A fila contínua só termina com sucesso ou falha definitiva. Falha
+                # terminal exige atenção e não deve reiniciar em todo startup.
+                self._atualizar_estado_sessao_carga_completa(
+                    active=False,
+                    manual_pause=False,
+                )
         # Páginas adiadas não bloqueiam a varredura; ficam disponíveis para uma
         # rodada posterior sem invalidar os checkpoints já confirmados.
         self._sync_can_continue = has_failure or self.sync_carga_completa.isChecked()

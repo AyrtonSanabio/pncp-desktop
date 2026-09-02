@@ -201,11 +201,10 @@ class PypncpSource:
             except RateLimitError:
                 if attempt >= self._config.max_retries:
                     raise
-            except (
-                httpx.TimeoutException,
-                httpx.ConnectError,
-                httpx.RemoteProtocolError,
-            ) as exc:
+            except httpx.TransportError as exc:
+                # Quedas durante leitura, conexão, protocolo ou timeout são falhas
+                # transitórias de transporte. Elas não tornam a página inválida e
+                # precisam chegar ao agendador como PNCPError recuperável.
                 last_transport_error = exc
                 if attempt >= self._config.max_retries:
                     break

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 from datetime import date
 from pathlib import Path
@@ -14,6 +15,8 @@ from pncp_sync.config import SyncConfig
 from pncp_sync.domain.models import CapturedResponse, SourcePage, SyncWindow
 from pncp_sync.persistence.repositories import SyncRepository
 from tests.test_sync_normalization import sample_record
+
+run_sync_module = importlib.import_module("pncp_sync.application.run_sync")
 
 
 def test_http_429_uses_longer_checkpoint_retry_delay() -> None:
@@ -76,6 +79,11 @@ class ErrorSource:
         raise PNCPError(f"timeout controlado na página {page_number}")
 
 
+class RateLimitSource:
+    async def fetch_publications(self, window: SyncWindow, page_number: int) -> SourcePage:
+        raise PNCPError("Too Many Requests")
+
+
 class OneBrokenPageSource(FakeSource):
     def __init__(self, pages: dict[int, SourcePage], broken_page: int) -> None:
         super().__init__(pages)
@@ -93,6 +101,41 @@ def config_for(path: Path) -> SyncConfig:
     # três tentativas aqui para que sejam rápidos; o padrão de produção (oito) é
     # coberto em test_sync_worker.py.
     return SyncConfig(db_path=path, lease_seconds=30, max_retries=3)
+
+
+@pytest.mark.asyncio
+async def test_sequential_sweep_waits_globally_after_rate_limit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = SyncConfig(
+        db_path=tmp_path / "sequential-rate-limit.sqlite3",
+        lease_seconds=30,
+        max_retries=1,
+    )
+    window = SyncWindow(date(2026, 8, 26), date(2026, 8, 26), 6)
+    pages = {
+        1: make_page([sample_record(1)], page_number=1, total_pages=2, total_records=2),
+        2: make_page([sample_record(2)], page_number=2, total_pages=2, total_records=2),
+    }
+    plan = await plan_sync(config, window, source=FakeSource(pages))
+    waits: list[float] = []
+    messages: list[str] = []
+
+    async def record_wait(seconds: float) -> None:
+        waits.append(seconds)
+
+    monkeypatch.setattr(run_sync_module.asyncio, "sleep", record_wait)
+    summary = await run_sync(
+        config,
+        plan.run_id,
+        source=RateLimitSource(),
+        stop_after_failure=True,
+        status=messages.append,
+    )
+
+    assert summary.status == "FAILED"
+    assert waits == [60]
+    assert any("carga inteira aguardará 60 s" in message for message in messages)
 
 
 @pytest.mark.asyncio
@@ -408,7 +451,7 @@ async def test_pagina_defeituosa_e_catalogada_sem_bloquear_as_seguintes(
     assert summary.status == "FAILED"
     assert summary.succeeded_units == 2
     assert summary.failed_units == 1
-    assert source.calls == [1, 2, 2, 2, 3]
+    assert source.calls == [1, 2, 3, 2, 2]
     with SyncRepository(config.db_path) as repository:
         assert repository.count_contratacoes() == 2
         assert repository.connection.execute(
@@ -453,6 +496,104 @@ async def test_falha_recuperavel_esgotada_pode_ser_reaberta_e_concluida(tmp_path
     completed = await run_sync(config, plan.run_id, source=FakeSource(pages))
     assert completed.status == "COMPLETED"
     assert completed.records_inserted == 2
+
+
+@pytest.mark.asyncio
+async def test_paginas_novas_tem_prioridade_sobre_falha_reaberta(tmp_path: Path) -> None:
+    config = config_for(tmp_path / "retry-priority.sqlite3")
+    window = SyncWindow(date(2026, 8, 26), date(2026, 8, 26), 6)
+    pages = {
+        1: make_page([sample_record(1)], page_number=1, total_pages=3, total_records=3),
+        2: make_page([sample_record(2)], page_number=2, total_pages=3, total_records=3),
+        3: make_page([sample_record(3)], page_number=3, total_pages=3, total_records=3),
+    }
+    source = OneBrokenPageSource(pages, broken_page=2)
+    plan = await plan_sync(config, window, source=source)
+    failed = await run_sync(config, plan.run_id, source=source)
+    assert failed.status == "FAILED"
+
+    with SyncRepository(config.db_path) as repository:
+        repository.connection.execute(
+            """UPDATE work_unit
+               SET status='PENDING', attempt_count=0, finished_at=NULL
+               WHERE run_id=? AND page_number=3""",
+            (plan.run_id,),
+        )
+        repository.connection.commit()
+        assert repository.retry_recoverable_units(plan.run_id) == 1
+        reopened = repository.connection.execute(
+            "SELECT status FROM work_unit WHERE run_id=? AND page_number=2",
+            (plan.run_id,),
+        ).fetchone()
+        assert reopened["status"] == "RETRY_WAIT"
+
+        claimed = repository.claim_next_work_unit(
+            plan.run_id,
+            max_attempts=config.max_retries,
+        )
+        assert claimed is not None
+        assert claimed.page_number == 3
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_pendente_no_teto_de_tentativas_nao_fica_encalhado(
+    tmp_path: Path,
+) -> None:
+    config = config_for(tmp_path / "stranded-pending.sqlite3")
+    window = SyncWindow(date(2026, 8, 26), date(2026, 8, 26), 6)
+    pages = {
+        1: make_page([sample_record(1)], page_number=1, total_pages=2, total_records=2),
+        2: make_page([sample_record(2)], page_number=2, total_pages=2, total_records=2),
+    }
+    plan = await plan_sync(config, window, source=FakeSource(pages))
+    await run_sync(config, plan.run_id, source=FakeSource(pages), max_pages=1)
+    with SyncRepository(config.db_path) as repository:
+        repository.connection.execute(
+            """UPDATE work_unit SET status='PENDING', attempt_count=?
+               WHERE run_id=? AND page_number=2""",
+            (config.max_retries, plan.run_id),
+        )
+        repository.connection.execute(
+            "UPDATE ingestion_run SET status='PAUSED' WHERE id=?",
+            (plan.run_id,),
+        )
+        repository.connection.commit()
+
+    completed = await run_sync(config, plan.run_id, source=FakeSource(pages))
+
+    assert completed.status == "COMPLETED"
+    assert completed.records_inserted == 2
+
+
+@pytest.mark.asyncio
+async def test_lease_expirado_no_teto_e_reivindicado_na_mesma_chamada(
+    tmp_path: Path,
+) -> None:
+    config = config_for(tmp_path / "expired-running-at-limit.sqlite3")
+    window = SyncWindow(date(2026, 8, 26), date(2026, 8, 26), 6)
+    pages = {
+        1: make_page([sample_record(1)], page_number=1, total_pages=2, total_records=2),
+        2: make_page([sample_record(2)], page_number=2, total_pages=2, total_records=2),
+    }
+    plan = await plan_sync(config, window, source=FakeSource(pages))
+    await run_sync(config, plan.run_id, source=FakeSource(pages), max_pages=1)
+
+    with SyncRepository(config.db_path) as repository:
+        repository.connection.execute(
+            """UPDATE work_unit
+               SET status='RUNNING', attempt_count=?, lease_until='2000-01-01T00:00:00.000+00:00'
+               WHERE run_id=? AND page_number=2""",
+            (config.max_retries, plan.run_id),
+        )
+        repository.connection.commit()
+
+        claimed = repository.claim_next_work_unit(
+            plan.run_id,
+            max_attempts=config.max_retries,
+        )
+        assert claimed is not None
+        assert claimed.page_number == 2
+        assert claimed.attempt_count == config.max_retries
 
 
 @pytest.mark.parametrize(

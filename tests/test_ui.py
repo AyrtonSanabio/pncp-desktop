@@ -251,6 +251,76 @@ def test_disabled_sync_buttons_explain_why_and_failure_can_resume(tmp_path) -> N
     app.processEvents()
 
 
+def test_full_load_failure_does_not_turn_into_manual_pause(tmp_path) -> None:
+    app = _app()
+    window = MainWindow(tmp_path / "automatic-retry.sqlite3")
+    window._full_sync_session = {"active": True, "manual_pause": False}
+
+    class FullSyncWorker:
+        action = "full_sync"
+
+    window._sync_worker = FullSyncWorker()
+    updates: list[dict[str, bool]] = []
+    window._atualizar_estado_sessao_carga_completa = lambda **values: updates.append(values)
+    failed = RunSummary(
+        run_id="recoverable-run",
+        status="FAILED",
+        planned_units=3,
+        succeeded_units=2,
+        partial_units=0,
+        pending_units=0,
+        failed_units=1,
+        records_received=20,
+        records_inserted=20,
+        records_updated=0,
+        records_unchanged=0,
+        records_rejected=0,
+        bytes_received=1000,
+    )
+
+    window._sync_concluido(failed, None)
+
+    assert updates == [{"active": False, "manual_pause": False}]
+    window._sync_worker = None
+    window.close()
+    app.processEvents()
+
+
+def test_explicit_pause_is_not_erased_by_concurrent_completion(tmp_path) -> None:
+    app = _app()
+    window = MainWindow(tmp_path / "pause-race.sqlite3")
+    window._sync_manual_pause_requested = True
+
+    class FullSyncWorker:
+        action = "full_sync"
+
+    window._sync_worker = FullSyncWorker()
+    updates: list[dict[str, bool]] = []
+    window._atualizar_estado_sessao_carga_completa = lambda **values: updates.append(values)
+    completed = RunSummary(
+        run_id="run",
+        status="COMPLETED",
+        planned_units=1,
+        succeeded_units=1,
+        partial_units=0,
+        pending_units=0,
+        failed_units=0,
+        records_received=1,
+        records_inserted=1,
+        records_updated=0,
+        records_unchanged=0,
+        records_rejected=0,
+        bytes_received=100,
+    )
+
+    window._sync_concluido(completed, None)
+
+    assert updates == [{"active": True, "manual_pause": True}]
+    window._sync_worker = None
+    window.close()
+    app.processEvents()
+
+
 def test_all_modalities_plan_is_aggregated_and_can_start(tmp_path) -> None:
     app = _app()
     window = MainWindow(tmp_path / "all-modalities.sqlite3")
