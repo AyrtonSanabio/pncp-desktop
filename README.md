@@ -97,5 +97,6 @@ O build oficial também executa um teste isolado do executável sem consultar a 
 - [API e dados armazenados](docs/API_E_DADOS.md)
 - [Segurança e responsabilidade](docs/SEGURANCA_E_RESPONSABILIDADE.md)
 - [Desenvolvimento e distribuição](docs/DESENVOLVIMENTO.md)
+- [Auditoria de valores e reprodução de divergências](docs/AUDITORIA_DE_VALORES_PNCP.md)
 
 Fonte dos dados: [Portal Nacional de Contratações Públicas](https://pncp.gov.br/).

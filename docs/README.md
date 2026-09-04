@@ -1,6 +1,7 @@
 # Documentação técnica
 
-Esta documentação descreve o comportamento existente no código atual.
+Esta documentação descreve o comportamento existente no código atual. O relatório de
+auditoria distingue evidências já verificadas do protocolo de investigação proposto.
 
 - [Arquitetura](ARQUITETURA.md): componentes, fluxo de dados e limites entre camadas.
 - [Banco de dados](BANCO_DE_DADOS.md): arquivo principal, tabelas, relações e idempotência.
@@ -10,3 +11,6 @@ Esta documentação descreve o comportamento existente no código atual.
 - [Segurança e responsabilidade](SEGURANCA_E_RESPONSABILIDADE.md): somente leitura,
   validações, privacidade e limites jurídicos.
 - [Desenvolvimento e distribuição](DESENVOLVIMENTO.md): ambiente, testes, build e release.
+- [Auditoria de valores](AUDITORIA_DE_VALORES_PNCP.md): evidências de divergências,
+  reprodução offline e protocolo de investigação por amostragem após a carga principal.
+  Distingue os achados já verificados da auditoria automatizada ainda não implementada.
