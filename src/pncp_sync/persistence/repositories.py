@@ -202,11 +202,12 @@ class SyncRepository:
                     estimated_database_bytes, free_disk_bytes_at_plan,
                     unmodeled_fields_json, created_at, page_size
                 ) VALUES (
-                    ?, 'contratacoes_publicacao', ?, ?, ?, 'PLANNED', ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, 'PLANNED', ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
                     run_id,
+                    window.resource,
                     window.data_inicial.isoformat(),
                     window.data_final.isoformat(),
                     window.modalidade,
@@ -225,10 +226,11 @@ class SyncRepository:
                     INSERT INTO work_unit(
                         run_id, resource, data_inicial, data_final, modalidade,
                         page_number, status, created_at, page_size
-                    ) VALUES (?, 'contratacoes_publicacao', ?, ?, ?, ?, 'PENDING', ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
                     """,
                     (
                         run_id,
+                        window.resource,
                         window.data_inicial.isoformat(),
                         window.data_final.isoformat(),
                         window.modalidade,
@@ -255,10 +257,11 @@ class SyncRepository:
                 INSERT INTO coverage(
                     run_id, resource, data_inicial, data_final, modalidade,
                     planned_pages, updated_at
-                ) VALUES (?, 'contratacoes_publicacao', ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
+                    window.resource,
                     window.data_inicial.isoformat(),
                     window.data_final.isoformat(),
                     window.modalidade,
@@ -269,14 +272,14 @@ class SyncRepository:
         return run_id
 
     def find_reusable_plan(
-        self, window: SyncWindow, *, page_size: int
+        self, window: SyncWindow, *, page_size: int, created_after: str = ""
     ) -> PlanSummary | None:
         """Reabre uma estimativa persistida sem consultar novamente o PNCP."""
         row = self.connection.execute(
             """SELECT r.*, c.planned_pages
                FROM ingestion_run r
                JOIN coverage c ON c.run_id=r.id
-               WHERE r.resource='contratacoes_publicacao'
+               WHERE r.resource=? AND r.created_at>=?
                  AND r.data_inicial=? AND r.data_final=? AND r.modalidade=?
                  AND r.status='PLANNED' AND r.collector_version=?
                  AND r.page_size=?
@@ -286,6 +289,8 @@ class SyncRepository:
                  )
                ORDER BY r.created_at DESC LIMIT 1""",
             (
+                window.resource,
+                created_after,
                 window.data_inicial.isoformat(),
                 window.data_final.isoformat(),
                 window.modalidade,
@@ -340,18 +345,21 @@ class SyncRepository:
             reused=True,
         )
 
-    def find_completed_run(self, window: SyncWindow) -> str | None:
+    def find_completed_run(self, window: SyncWindow, *, created_after: str = "") -> str | None:
         """Retorna cobertura integral já confirmada para o recorte exato."""
         row = self.connection.execute(
             """SELECT r.id
                FROM ingestion_run r
                JOIN coverage c ON c.run_id=r.id
-               WHERE r.resource='contratacoes_publicacao'
+               WHERE r.resource=? AND r.created_at>=?
                  AND r.data_inicial=? AND r.data_final=? AND r.modalidade=?
                  AND r.status IN ('COMPLETED','COMPLETED_WITH_REJECTIONS')
+                 AND (r.resource='contratacoes_publicacao' OR r.status='COMPLETED')
                  AND c.processed_pages=c.planned_pages
                ORDER BY r.finished_at DESC LIMIT 1""",
             (
+                window.resource,
+                created_after,
                 window.data_inicial.isoformat(),
                 window.data_final.isoformat(),
                 window.modalidade,
@@ -359,12 +367,12 @@ class SyncRepository:
         ).fetchone()
         return str(row["id"]) if row else None
 
-    def find_resumable_run(self, window: SyncWindow) -> str | None:
+    def find_resumable_run(self, window: SyncWindow, *, created_after: str = "") -> str | None:
         """Localiza o checkpoint incompleto mais recente do recorte."""
         row = self.connection.execute(
             """SELECT r.id
                FROM ingestion_run r
-               WHERE r.resource='contratacoes_publicacao'
+               WHERE r.resource=? AND r.created_at>=?
                  AND r.data_inicial=? AND r.data_final=? AND r.modalidade=?
                  AND r.status IN ('PLANNED','RUNNING','PAUSED','FAILED')
                  AND EXISTS (
@@ -374,6 +382,8 @@ class SyncRepository:
                  )
                ORDER BY r.created_at DESC LIMIT 1""",
             (
+                window.resource,
+                created_after,
                 window.data_inicial.isoformat(),
                 window.data_final.isoformat(),
                 window.modalidade,
@@ -416,13 +426,14 @@ class SyncRepository:
                 response_url, response_headers_json, content_sha256, content_size,
                 compressed_size, content_gzip, latency_ms, normalizer_version, created_at
             ) VALUES (
-                ?, ?, 'PNCP', 'contratacoes/publicacao', ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, 'PNCP', ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?
             )
             """,
             (
                 run_id,
                 work_unit_id,
+                self.get_window(run_id).endpoint.lstrip("/"),
                 payload_kind,
                 canonical_json(page.request_params),
                 page.response.requested_at,
@@ -488,7 +499,7 @@ class SyncRepository:
 
     def get_window(self, run_id: str) -> SyncWindow:
         row = self.connection.execute(
-            "SELECT data_inicial, data_final, modalidade FROM ingestion_run WHERE id = ?",
+            "SELECT data_inicial, data_final, modalidade, resource FROM ingestion_run WHERE id = ?",
             (run_id,),
         ).fetchone()
         if row is None:
@@ -497,6 +508,7 @@ class SyncRepository:
             date.fromisoformat(row["data_inicial"]),
             date.fromisoformat(row["data_final"]),
             int(row["modalidade"]),
+            resource=row["resource"],
         )
 
     def get_plan_requirements(self, run_id: str) -> dict[str, int]:
@@ -523,6 +535,17 @@ class SyncRepository:
         if row is None:
             raise ValueError(f"Execução não encontrada: {run_id}")
         return int(row["page_size"])
+
+    def get_run_totals(self, run_id: str) -> tuple[int, int]:
+        row = self.connection.execute(
+            "SELECT content_gzip FROM source_payload WHERE run_id=? AND payload_kind='PROBE' "
+            "ORDER BY id LIMIT 1", (run_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("Checkpoint sem resposta de planejamento; cobertura não pode avançar.")
+        content = gzip.decompress(row[0])
+        payload = json.loads(content) if content else {}
+        return int(payload.get("totalPaginas", 0)), int(payload.get("totalRegistros", 0))
 
     def claim_next_work_unit(self, run_id: str, *, max_attempts: int = 3) -> WorkUnit | None:
         now = datetime.now(UTC)
@@ -646,7 +669,8 @@ class SyncRepository:
                 ):
                     max_source_update = source_update
                 existing = cursor.execute(
-                    "SELECT id, record_hash FROM contratacao WHERE numero_controle_pncp = ?",
+                    "SELECT id, record_hash, data_atualizacao_global, data_atualizacao "
+                    "FROM contratacao WHERE numero_controle_pncp = ?",
                     (normalized["numero_controle_pncp"],),
                 ).fetchone()
                 if existing is None:
@@ -663,6 +687,25 @@ class SyncRepository:
                     )
                     inserted += 1
                 elif existing["record_hash"] != normalized["record_hash"]:
+                    incoming_version = self._record_version(normalized)
+                    stored_version = self._record_version(existing)
+                    if stored_version and incoming_version and incoming_version < stored_version:
+                        # Uma resposta atrasada não pode desfazer uma retificação já recebida.
+                        # O payload antigo continua preservado para auditoria.
+                        cursor.execute(
+                            "UPDATE contratacao SET last_seen_at=? WHERE id=?",
+                            (now, existing["id"]),
+                        )
+                        unchanged += 1
+                        continue
+                    if stored_version and not incoming_version:
+                        rejected += 1
+                        self._insert_rejection(
+                            cursor, work_unit=work_unit, payload_id=payload_id,
+                            record_index=index, raw_record=raw_record,
+                            reason="Registro alterado sem data de atualização válida; versão local preservada.",
+                        )
+                        continue
                     row_id = int(existing["id"])
                     previous_hash = str(existing["record_hash"])
                     self._update_contratacao(cursor, row_id, normalized, now)
@@ -723,6 +766,17 @@ class SyncRepository:
         return PersistResult(inserted, updated, unchanged, rejected, payload_id)
 
     @staticmethod
+    def _record_version(record: Any) -> datetime | None:
+        value = record["data_atualizacao_global"] or record["data_atualizacao"]
+        if not value:
+            return None
+        version = datetime.fromisoformat(value)
+        if version.tzinfo is None:
+            # Datas sem offset do PNCP representam horário de Brasília.
+            version = version.replace(tzinfo=UTC) + timedelta(hours=3)
+        return version.astimezone(UTC)
+
+    @staticmethod
     def _record_change(
         cursor: sqlite3.Cursor,
         run_id: str,
@@ -748,8 +802,8 @@ class SyncRepository:
                 """
                 INSERT OR IGNORE INTO work_unit(
                     run_id, resource, data_inicial, data_final, modalidade,
-                    page_number, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?)
+                        page_number, status, created_at, page_size
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
                 """,
                 (
                     work_unit.run_id,
@@ -759,6 +813,7 @@ class SyncRepository:
                     work_unit.modalidade,
                     page_number,
                     now,
+                    work_unit.page_size,
                 ),
             )
         cursor.execute(
@@ -980,6 +1035,16 @@ class SyncRepository:
                 )
             return recovered
 
+    def retry_failed_units_explicitly(self, run_id: str) -> int:
+        """Uma nova tentativa solicitada pelo usuário, sem apagar o catálogo de erros."""
+        with self._transaction() as cursor:
+            cursor.execute(
+                """UPDATE work_unit SET status='RETRY_WAIT',attempt_count=0,
+                   lease_until=NULL,finished_at=NULL WHERE run_id=? AND status='FAILED'""",
+                (run_id,),
+            )
+            return cursor.rowcount
+
     def retry_recoverable_units(self, run_id: str) -> int:
         """Reabre somente falhas cuja ocorrência mais recente foi marcada como recuperável."""
         with self._transaction() as cursor:
@@ -1100,7 +1165,7 @@ class SyncRepository:
                 (status, finished_at, run_id),
             )
             # Ausência só é evidência após cobertura integral, sem páginas parciais.
-            if status == "COMPLETED":
+            if status == "COMPLETED" and self.get_window(run_id).resource == "contratacoes_publicacao":
                 run = cursor.execute(
                     "SELECT data_inicial, data_final, modalidade, started_at FROM ingestion_run WHERE id = ?",
                     (run_id,),

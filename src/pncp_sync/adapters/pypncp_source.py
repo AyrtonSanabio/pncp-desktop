@@ -4,6 +4,8 @@ import asyncio
 import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
+from math import ceil, isfinite
 from time import perf_counter
 from typing import Any, Protocol
 
@@ -89,7 +91,7 @@ class PypncpSource:
             timeout=httpx.Timeout(self._config.timeout_seconds)
         ) as http_client:
             response = await self._request_with_retry(
-                http_client, "/contratacoes/publicacao", params=params
+                http_client, window.endpoint, params=params
             )
 
         if response.status_code == 204:
@@ -194,13 +196,12 @@ class PypncpSource:
                     try:
                         self._raise_on_error(response)
                     except RateLimitError:
-                        if attempt >= self._config.max_retries:
-                            raise
+                        raise
                     else:
                         return response
             except RateLimitError:
-                if attempt >= self._config.max_retries:
-                    raise
+                # O agendador aplica a espera global; não repetir internamente.
+                raise
             except httpx.TransportError as exc:
                 # Quedas durante leitura, conexão, protocolo ou timeout são falhas
                 # transitórias de transporte. Elas não tornam a página inválida e
@@ -231,7 +232,17 @@ class PypncpSource:
         if response.status_code == 404:
             raise NotFoundError(message)
         if response.status_code == 429:
-            raise RateLimitError(message or "Too Many Requests (HTTP 429)")
+            error = RateLimitError(f"HTTP 429: {message}")
+            raw = response.headers.get("Retry-After", "")
+            try:
+                seconds = float(raw)
+            except ValueError:
+                try:
+                    seconds = (parsedate_to_datetime(raw) - datetime.now(UTC)).total_seconds()
+                except (ValueError, TypeError, OverflowError):
+                    seconds = 60
+            error.retry_after_seconds = max(60, ceil(seconds)) if isfinite(seconds) else 60
+            raise error
         if response.status_code >= 500:
             raise ServerError(
                 f"Erro interno do servidor ({response.status_code}): {message}"

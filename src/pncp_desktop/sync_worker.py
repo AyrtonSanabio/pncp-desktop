@@ -5,6 +5,7 @@ import contextlib
 import traceback
 from collections import deque
 from dataclasses import replace
+from datetime import date
 from typing import Any
 
 from pypncp import PNCPError
@@ -12,14 +13,21 @@ from PySide6.QtCore import QThread, Signal
 
 from pncp_sync.adapters.pypncp_source import SourceError
 from pncp_sync.application.catalog_sync import CatalogSync
+from pncp_sync.application.incremental import (
+    prepare_incremental,
+    session_windows,
+    set_session_status,
+)
 from pncp_sync.application.plan_details import plan_details
 from pncp_sync.application.plan_sync import plan_sync
 from pncp_sync.application.run_details import run_details
-from pncp_sync.application.run_sync import run_sync
-from pncp_sync.application.run_sync_parallel import run_sync_parallel
+from pncp_sync.application.run_sync import _is_recoverable, run_sync
+from pncp_sync.application.run_sync_parallel import ConcurrencyState, run_sync_parallel
 from pncp_sync.config import SyncConfig
 from pncp_sync.domain.models import (
+    UPDATES,
     BatchPlanSummary,
+    DetailPlanSummary,
     DetailRunSummary,
     FullSyncProgress,
     RunSummary,
@@ -54,11 +62,15 @@ class SyncTaskThread(QThread):
         run_ids: tuple[str, ...] | None = None,
         detail_run_id: str | None = None,
         include_details: bool = True,
+        details_recent_active_only: bool = False,
         include_contracts: bool = False,
         include_atas: bool = False,
         estimated_total_pages: int | None = None,
         estimated_total_records: int | None = None,
         replace_plan_id: str | None = None,
+        modalidades: tuple[int, ...] = (),
+        target_date: date | None = None,
+        update_to_today: bool = False,
         parent: Any = None,
     ) -> None:
         super().__init__(parent)
@@ -70,11 +82,21 @@ class SyncTaskThread(QThread):
         self.run_ids = run_ids or (() if run_id is None else (run_id,))
         self.detail_run_id = detail_run_id
         self.include_details = include_details
+        self.details_recent_active_only = details_recent_active_only
         self.include_contracts = include_contracts
         self.include_atas = include_atas
         self.estimated_total_pages = estimated_total_pages
         self.estimated_total_records = estimated_total_records
         self.replace_plan_id = replace_plan_id
+        self.modalidades = modalidades
+        self.target_date = target_date
+        self.update_to_today = update_to_today
+        self._incremental_created_after = ""
+        self._concurrency_state = ConcurrencyState(
+            config.max_concurrent, min(2, config.max_concurrent)
+        )
+        self._empty_failed_sweeps = 0
+        self._outage_waits = 0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task[Any] | None = None
         self._planned_count = 0
@@ -97,7 +119,15 @@ class SyncTaskThread(QThread):
             main, details = self._summaries()
             self.paused.emit(main, details)
         except Exception as exc:
-            if self.action in {"plan", "plan_all", "plan_sample"}:
+            if self.action == "incremental":
+                user_message = f"Atualização incremental não concluída: {exc}"
+                try:
+                    if self._incremental_created_after:
+                        set_session_status(self.config, active=True, manual_pause=True)
+                except Exception:
+                    # Preserva o diagnóstico original se o próprio banco/checkpoint falhou.
+                    user_message += " Não foi possível registrar a pausa; preserve o banco."
+            elif self.action in {"plan", "plan_all", "plan_sample"}:
                 if isinstance(exc, SourceError):
                     user_message = (
                         "O PNCP respondeu, mas o conteúdo não estava no formato esperado. "
@@ -176,6 +206,38 @@ class SyncTaskThread(QThread):
             self.run_id = summary.run_id
             self.planned.emit(summary)
             return
+        if self.action == "incremental":
+            session = prepare_incremental(
+                self.config, self.modalidades, today=self.target_date,
+                extend_to_today=self.update_to_today,
+                allow_incomplete_history=self.update_to_today,
+            )
+            self.windows = session_windows(session)
+            self.config = replace(self.config, publication_page_size=session["page_size"])
+            self._incremental_created_after = session["created_at"]
+            self.include_details = self.include_contracts = self.include_atas = False
+            self.activity.emit(
+                f"Atualização incremental: {len(self.windows)} lotes de publicações e "
+                "alterações globais. A carga histórica não será reiniciada."
+            )
+            await self._run_full_sync()
+            return
+        if self.action == "recover_failures":
+            from pncp_sync.persistence.progress_report import progress_report
+
+            report = progress_report(self.config.db_path)
+            self.run_ids = tuple(report["failed_run_ids"])
+            summaries = {}
+            confirmed = {}
+            with SyncRepository(self.config.db_path) as repository:
+                for run_id in self.run_ids:
+                    repository.retry_failed_units_explicitly(run_id)
+                    summary = repository.get_summary(run_id)
+                    summaries[run_id] = summary
+                    confirmed[run_id] = summary.succeeded_units + summary.partial_units
+            await self._retry_deferred_work([], list(self.run_ids), summaries, confirmed, [], set())
+            self.completed.emit(self._aggregate_runs(tuple(summaries.values())), None)
+            return
         if self.action == "full_sync":
             await self._run_full_sync()
             return
@@ -192,7 +254,7 @@ class SyncTaskThread(QThread):
                 if not main_summary.status.startswith("COMPLETED"):
                     break
                 if main_summary.status.startswith("COMPLETED") and self.include_details:
-                    detail_plan = plan_details(self.config, current_run_id)
+                    detail_plan = self._plan_details(current_run_id)
                     self.detail_run_id = detail_plan.detail_run_id
                     self.detail_planned.emit(self.detail_run_id)
                     detail_summaries.append(
@@ -218,7 +280,7 @@ class SyncTaskThread(QThread):
         detail_summary = None
         if main_summary.status.startswith("COMPLETED") and self.include_details:
             if not self.detail_run_id:
-                detail_plan = plan_details(self.config, self.run_id)
+                detail_plan = self._plan_details(self.run_id)
                 self.detail_run_id = detail_plan.detail_run_id
                 self.detail_planned.emit(self.detail_run_id)
             detail_summary = await run_details(
@@ -269,13 +331,18 @@ class SyncTaskThread(QThread):
         for index, window in enumerate(self.windows, start=1):
             self._full_current_index = index
             self._full_current_window = window
+            label = "Atualização incremental" if self.action == "incremental" else "Carga completa"
             self.activity.emit(
-                f"Carga completa: lote {index}/{len(self.windows)} — "
+                f"{label}: "
+                f"{'retificações' if window.resource == UPDATES else 'publicações'}, "
+                f"lote {index}/{len(self.windows)} — "
                 f"{window.data_inicial:%d/%m/%Y} a {window.data_final:%d/%m/%Y}, "
                 f"modalidade {window.modalidade}."
             )
             with SyncRepository(self.config.db_path) as repository:
-                completed_run = repository.find_completed_run(window)
+                completed_run = repository.find_completed_run(
+                    window, **self._incremental_scope()
+                )
             if completed_run:
                 with SyncRepository(self.config.db_path) as repository:
                     summary = repository.get_summary(completed_run)
@@ -287,7 +354,9 @@ class SyncTaskThread(QThread):
                 self._emit_full_progress()
                 continue
             with SyncRepository(self.config.db_path) as repository:
-                resumable_run = repository.find_resumable_run(window)
+                resumable_run = repository.find_resumable_run(
+                    window, **self._incremental_scope()
+                )
                 if resumable_run:
                     repository.reclassify_false_period_limit_errors(resumable_run)
                     repository.retry_recoverable_units(resumable_run)
@@ -363,12 +432,30 @@ class SyncTaskThread(QThread):
         if aggregate.status == "PAUSED":
             self.paused.emit(aggregate, aggregate_details)
         else:
+            if self.action == "incremental":
+                # Falhas definitivas/rejeições exigem uma nova leitura explícita do
+                # intervalo. Sua cobertura não avançou; um novo ciclo não as pula.
+                set_session_status(self.config, active=False)
             if aggregate.status.startswith("COMPLETED"):
                 await self._run_catalog_resources()
             self.completed.emit(aggregate, aggregate_details)
 
     async def _run_main_sweep(self, run_id: str) -> RunSummary:
         """Executa uma rodada finita e deixa falhas recuperáveis para outro momento."""
+        with SyncRepository(self.config.db_path) as repository:
+            before = repository.get_summary(run_id)
+        if self._empty_failed_sweeps >= 3:
+            self._outage_waits += 1
+            delay = min(
+                self.config.continuous_retry_base_seconds
+                * 2 ** min(10, self._outage_waits - 1),
+                self.config.continuous_retry_max_seconds,
+            )
+            await self._wait_before_retry(
+                delay, reason="três lotes seguidos sem confirmar páginas",
+                reopened=before.failed_units + before.pending_units, cycle=self._outage_waits,
+            )
+            self._empty_failed_sweeps = 0
         with SyncRepository(self.config.db_path) as repository:
             corrected = repository.reclassify_false_period_limit_errors(run_id)
             reopened = repository.retry_recoverable_units(run_id)
@@ -385,13 +472,19 @@ class SyncTaskThread(QThread):
         # catalogado e a página volta somente no próximo ciclo do rodízio; assim
         # um único 504 não monopoliza oito tentativas nem impede páginas saudáveis.
         sweep_config = replace(self.config, max_retries=1)
-        return await self._run_main_sync(
+        result = await self._run_main_sync(
             run_id,
             status_updates=True,
-            conservative_start=bool(reopened),
             config=sweep_config,
             stop_after_failed_batch=True,
         )
+        progressed = result.succeeded_units > before.succeeded_units
+        failed = bool(result.failed_units or result.pending_units)
+        if progressed:
+            self._empty_failed_sweeps = self._outage_waits = 0
+        elif failed and result.status != "PAUSED":
+            self._empty_failed_sweeps += 1
+        return result
 
     async def _retry_deferred_work(
         self,
@@ -536,7 +629,7 @@ class SyncTaskThread(QThread):
         """Coleta detalhes uma única vez quando a execução principal é concluída."""
         if not self.include_details or run_id in detailed_runs:
             return
-        detail_plan = plan_details(self.config, run_id)
+        detail_plan = self._plan_details(run_id)
         self.detail_run_id = detail_plan.detail_run_id
         self.detail_planned.emit(self.detail_run_id)
         detail_summaries.append(
@@ -548,6 +641,19 @@ class SyncTaskThread(QThread):
             )
         )
         detailed_runs.add(run_id)
+
+    def _plan_details(self, run_id: str) -> DetailPlanSummary:
+        detail_plan = plan_details(
+            self.config,
+            run_id,
+            recent_active_only=self.details_recent_active_only,
+        )
+        if detail_plan.planned_contracts == 0 and self.details_recent_active_only:
+            self.activity.emit(
+                "Este lote não possui licitações divulgadas, ainda abertas e publicadas "
+                "nos últimos 12 meses; nenhuma consulta de itens foi criada."
+            )
+        return detail_plan
 
     async def _run_main_continuously(
         self,
@@ -561,7 +667,6 @@ class SyncTaskThread(QThread):
         """
         consecutive_failures = 0
         previous_done = -1
-        conservative_start = False
 
         with SyncRepository(self.config.db_path) as repository:
             corrected_at_start = repository.reclassify_false_period_limit_errors(run_id)
@@ -581,7 +686,6 @@ class SyncTaskThread(QThread):
             summary = await self._run_main_sync(
                 run_id,
                 status_updates=True,
-                conservative_start=conservative_start,
             )
             if summary.status.startswith("COMPLETED"):
                 return summary
@@ -614,16 +718,14 @@ class SyncTaskThread(QThread):
                 reopened=reopened,
                 cycle=consecutive_failures,
             )
-            # Depois que a API falha, cada novo ciclo recomeça com uma única
-            # requisição. O motor paralelo volta a subir gradualmente após sucessos.
-            conservative_start = True
+            # O controlador conserva o nível entre rodadas; uma página defeituosa
+            # não reinicia toda a carga com uma única requisição.
 
     async def _run_main_sync(
         self,
         run_id: str,
         *,
         status_updates: bool = False,
-        conservative_start: bool = False,
         config: SyncConfig | None = None,
         stop_after_failed_batch: bool = False,
     ) -> RunSummary:
@@ -637,7 +739,7 @@ class SyncTaskThread(QThread):
             return await run_sync_parallel(
                 effective_config,
                 run_id,
-                initial_concurrency=1 if conservative_start else None,
+                concurrency_state=self._concurrency_state,
                 stop_after_failed_batch=stop_after_failed_batch,
                 progress=self._main_progress,
                 activity=self._main_activity,
@@ -711,7 +813,28 @@ class SyncTaskThread(QThread):
             max_retries=1,
             timeout_seconds=min(30, self.config.timeout_seconds),
         )
-        return await plan_sync(planning_config, window)
+        try:
+            return await plan_sync(planning_config, window, **self._incremental_scope())
+        except PNCPError as exc:
+            if self.action == "incremental" and not _is_recoverable(exc):
+                raise SourceError(
+                    f"Endpoint incremental indisponível ou não autorizado: {exc}"
+                ) from exc
+            if self.action == "incremental" and (
+                "429" in str(exc) or "too many requests" in str(exc).casefold()
+            ):
+                self.activity.emit(
+                    "PNCP limitou as consultas; aguardando 60 s antes do próximo lote."
+                )
+                await asyncio.sleep(60)
+            raise
+
+    def _incremental_scope(self) -> dict[str, str]:
+        # Não reutiliza o resultado da sobreposição de um ciclo anterior.
+        return (
+            {"created_after": self._incremental_created_after}
+            if self.action == "incremental" else {}
+        )
 
     async def _run_catalog_resources(self) -> None:
         if not self.include_contracts and not self.include_atas:
@@ -797,14 +920,14 @@ class SyncTaskThread(QThread):
     def _main_progress(self, *args: Any) -> None:
         if not self.run_id:
             return
-        if self.action == "full_sync" and len(args) >= 2:
+        if self.action in {"full_sync", "incremental"} and len(args) >= 2:
             inserted = int(getattr(args[1], "inserted", 0))
             if self._full_stored_records is not None:
                 self._full_stored_records += inserted
         with SyncRepository(self.config.db_path) as repository:
             summary = repository.get_summary(self.run_id)
             self.progress.emit("contratacoes", summary)
-            if self.action == "full_sync":
+            if self.action in {"full_sync", "incremental"}:
                 self._emit_full_progress(summary)
 
     def _emit_full_progress(self, summary: RunSummary | None = None) -> None:
@@ -843,8 +966,9 @@ class SyncTaskThread(QThread):
         )
 
     def _main_activity(self, work_unit: Any) -> None:
+        label = "retificações" if work_unit.resource == UPDATES else "publicações"
         self.activity.emit(
-            f"Baixando contratações — página {work_unit.page_number} "
+            f"Baixando contratações ({label}) — página {work_unit.page_number} "
             f"({work_unit.data_inicial:%d/%m/%Y} a {work_unit.data_final:%d/%m/%Y})"
         )
 

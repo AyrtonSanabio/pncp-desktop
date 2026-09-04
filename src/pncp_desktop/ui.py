@@ -56,6 +56,8 @@ from pncp_desktop.models import (
 )
 from pncp_desktop.services import ErroConsulta, ServicoConsultaContratos
 from pncp_desktop.sync_worker import SyncTaskThread
+from pncp_sync.application.incremental import PREFERENCE as INCREMENTAL_PREFERENCE
+from pncp_sync.application.incremental import set_session_status
 from pncp_sync.config import SyncConfig
 from pncp_sync.domain.models import (
     BatchPlanSummary,
@@ -526,6 +528,8 @@ class MainWindow(QMainWindow):
         self._sync_last_resource = ""
         self._full_sync_progress: FullSyncProgress | None = None
         self._full_sync_session: dict[str, Any] | None = None
+        self._sync_incremental_mode = False
+        self._sync_recovery_mode = False
         self._local_page = 1
         self._local_result_rows: list[dict[str, Any]] = []
         self._local_result_page: Page | None = None
@@ -538,7 +542,12 @@ class MainWindow(QMainWindow):
         full_session = self._restaurar_sessao_carga_completa()
         recovered = self._restaurar_execucoes_interrompidas()
         can_schedule = os.environ.get("QT_QPA_PLATFORM") != "offscreen"
-        if full_session is not None:
+        if (
+            full_session is not None and full_session.get("manual_pause", False)
+            and self._restore_incremental_session(can_schedule)
+        ):
+            pass
+        elif full_session is not None:
             self._sync_can_continue = True
             self.botao_continuar.setEnabled(True)
             if full_session.get("manual_pause", False):
@@ -552,9 +561,27 @@ class MainWindow(QMainWindow):
                     "liberada(s)). A retomada automática começará em instantes."
                 )
                 QTimer.singleShot(1200, self._retomar_carga_completa_automaticamente)
+        elif self._restore_incremental_session(can_schedule):
+            pass
         elif self.sync_automatico.isChecked() and can_schedule:
             self._auto_sync_pending = True
             QTimer.singleShot(1200, self.atualizar_desde_ultima_execucao)
+
+    def _restore_incremental_session(self, can_schedule: bool) -> bool:
+        state = self._local_database.get_preference(INCREMENTAL_PREFERENCE, {})
+        session = state.get("session") if isinstance(state, dict) else None
+        if not isinstance(session, dict) or not session.get("active"):
+            return False
+        self._sync_incremental_mode = True
+        self._sync_can_continue = True
+        self.botao_continuar.setEnabled(True)
+        self.sync_status_label.setText(
+            "Atualização incremental pendente. Os checkpoints foram preservados; "
+            "use Continuar para retomar."
+        )
+        if can_schedule and not session.get("manual_pause", False):
+            QTimer.singleShot(1200, self.atualizar_desde_ultima_execucao)
+        return True
 
     def _restaurar_execucoes_interrompidas(self) -> int:
         """Expõe checkpoints pendentes assim que o banco principal é reaberto."""
@@ -589,6 +616,9 @@ class MainWindow(QMainWindow):
         self.sync_data_inicial.setDate(QDate(start.year, start.month, start.day))
         self.sync_data_final.setDate(QDate(end.year, end.month, end.day))
         self.incluir_detalhes.setChecked(bool(saved.get("include_details", False)))
+        self.somente_detalhes_vigentes.setChecked(
+            bool(saved.get("details_recent_active_only", False))
+        )
         self.incluir_contratos.setChecked(bool(saved.get("include_contracts", False)))
         self.incluir_atas.setChecked(bool(saved.get("include_atas", False)))
         concurrency = saved.get("max_concurrent", 1)
@@ -619,6 +649,7 @@ class MainWindow(QMainWindow):
             "scope_start": min(item.data_inicial for item in windows).isoformat(),
             "scope_end": max(item.data_final for item in windows).isoformat(),
             "include_details": self.incluir_detalhes.isChecked(),
+            "details_recent_active_only": self.somente_detalhes_vigentes.isChecked(),
             "include_contracts": self.incluir_contratos.isChecked(),
             "include_atas": self.incluir_atas.isChecked(),
             "max_concurrent": int(self.sync_concorrencia.currentData() or 1),
@@ -961,8 +992,9 @@ class MainWindow(QMainWindow):
             "e são tentadas novamente até você usar Pausar. Se a carga completa for interrompida "
             "por queda ou reinício, o escopo salvo é retomado ao abrir o aplicativo. A barra usa "
             "registros armazenados sobre o total projetado; lotes e páginas são métricas "
-            "separadas. Em Downloads simultâneos, 1 preserva o caminho conservador e 2 ou 4 "
-            "ativam a rede adaptativa, que volta para 1 ao detectar falhas.",
+            "separadas. Em Downloads simultâneos, 1 preserva o caminho conservador e 2, 4 ou 8 "
+            "ativam a rede adaptativa, que reduz gradualmente após falhas repetidas. "
+            "O limite de 8 é experimental; falhas isoladas não reduzem a concorrência.",
         )
         layout.addWidget(estimate)
 
@@ -1014,7 +1046,10 @@ class MainWindow(QMainWindow):
                 return
 
     def _criar_aba_sincronizacao(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
         page = QWidget()
+        scroll.setWidget(page)
         layout = QVBoxLayout(page)
         layout.setContentsMargins(28, 24, 28, 24)
         layout.setSpacing(16)
@@ -1066,6 +1101,23 @@ class MainWindow(QMainWindow):
         self.incluir_detalhes.setToolTip(
             "Depois das contratações, consulta itens e resultados publicados pelo PNCP."
         )
+        self.somente_detalhes_vigentes = QCheckBox(
+            "Somente vigentes dos últimos 12 meses"
+        )
+        self.somente_detalhes_vigentes.setChecked(
+            self._settings.value("details_recent_active_only", False, type=bool)
+        )
+        self.somente_detalhes_vigentes.setToolTip(
+            "Limita os itens a contratações publicadas nos últimos 365 dias, em situação "
+            "Divulgada no PNCP e cujo prazo para propostas ainda não terminou. "
+            "Licitações sem data de encerramento ficam fora por segurança."
+        )
+        self.incluir_detalhes.toggled.connect(self._atualizar_filtro_detalhes)
+        self.somente_detalhes_vigentes.toggled.connect(
+            lambda checked: self._settings.setValue(
+                "details_recent_active_only", checked
+            )
+        )
         self.incluir_contratos = QCheckBox("Contratos e empenhos")
         self.incluir_contratos.setToolTip(
             "Sincroniza dados estruturados de contratos e empenhos publicados no período."
@@ -1086,16 +1138,19 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.incluir_detalhes, 2, 3)
         grid.addWidget(self.incluir_contratos, 2, 4)
         grid.addWidget(self.incluir_atas, 2, 5)
+        grid.addWidget(self.somente_detalhes_vigentes, 3, 3, 1, 3)
         self.sync_concorrencia = QComboBox()
         self.sync_concorrencia.addItem("1 — conservador", 1)
         self.sync_concorrencia.addItem("2 — equilibrado", 2)
         self.sync_concorrencia.addItem("4 — acelerado experimental", 4)
+        self.sync_concorrencia.addItem("8 — acelerado experimental", 8)
         saved_concurrency = self._settings.value("sync_concurrency", 1, type=int)
         concurrency_index = self.sync_concorrencia.findData(saved_concurrency)
         self.sync_concorrencia.setCurrentIndex(max(0, concurrency_index))
         self.sync_concorrencia.setToolTip(
             "Quantidade máxima de páginas baixadas simultaneamente. O modo acelerado "
-            "reduz automaticamente para uma página quando o PNCP apresenta erros."
+            "mantém o limite em falhas isoladas e reduz gradualmente após falhas repetidas. "
+            "Oito é um teto experimental, não garantia de maior velocidade."
         )
         self.sync_concorrencia.currentIndexChanged.connect(
             lambda: self._settings.setValue(
@@ -1129,18 +1184,21 @@ class MainWindow(QMainWindow):
         concurrency_layout.addWidget(page_size_label)
         concurrency_layout.addWidget(self.sync_tamanho_pagina)
         concurrency_layout.addStretch(1)
-        self.botao_atualizar_desde_ultima = QPushButton("Atualizar desde a última execução")
+        self.botao_atualizar_desde_ultima = QPushButton("Atualizar até hoje: novas e retificadas")
         self.botao_atualizar_desde_ultima.setObjectName("secundario")
         self.botao_atualizar_desde_ultima.setToolTip(
-            "Usa a data final da última sincronização concluída desta modalidade, "
-            "com um dia de sobreposição para capturar retificações."
+            "Busca novas publicações e alterações globais em todas as modalidades até a data "
+            "do clique. Preserva lacunas históricas; não significa que a carga antiga terminou. "
+            "Repete uma janela de segurança sem duplicar registros."
         )
-        self.botao_atualizar_desde_ultima.clicked.connect(self.atualizar_desde_ultima_execucao)
+        self.botao_atualizar_desde_ultima.clicked.connect(
+            lambda: self.atualizar_desde_ultima_execucao(capture_today=True)
+        )
         self.sync_automatico = QCheckBox("Atualizar automaticamente ao abrir")
         self.sync_automatico.setChecked(self._settings.value("sync_on_startup", False, type=bool))
         self.sync_automatico.setToolTip(
-            "Ao abrir o programa, prepara a atualização incremental da modalidade selecionada. "
-            "A sincronização só começa depois da estimativa e das validações."
+            "Ao abrir o programa, inicia a atualização de novas e retificadas após validar "
+            "a cobertura inicial. Não baixa itens, fornecedores ou PDFs."
         )
         self.sync_automatico.toggled.connect(
             lambda enabled: self._settings.setValue("sync_on_startup", enabled)
@@ -1173,10 +1231,25 @@ class MainWindow(QMainWindow):
         ):
             botoes.addWidget(button)
         botoes.addStretch(1)
-        grid.addLayout(concurrency_layout, 3, 0, 1, 6)
-        grid.addLayout(botoes, 4, 0, 1, 6)
-        grid.addWidget(self.sync_carga_completa, 5, 0, 1, 4)
-        grid.addWidget(self.sync_automatico, 6, 0, 1, 3)
+        grid.addLayout(concurrency_layout, 4, 0, 1, 6)
+        grid.addLayout(botoes, 5, 0, 1, 6)
+        grid.addWidget(self.sync_carga_completa, 6, 0, 1, 4)
+        grid.addWidget(self.sync_automatico, 7, 0, 1, 3)
+        self.botao_recalcular = QPushButton("Recalcular projeção e pendências")
+        self.botao_recalcular.clicked.connect(
+            lambda: self._queue_database_task("recalculate_progress")
+        )
+        self.botao_recuperar_falhas = QPushButton("Recuperar páginas com falha")
+        self.botao_recuperar_falhas.setToolTip(
+            "Retoma os lotes com falhas da sessão histórica, sem repetir páginas confirmadas. "
+            "Falhas definitivas recebem uma nova tentativa; temporárias continuam no rodízio."
+        )
+        self.botao_recuperar_falhas.clicked.connect(self.recuperar_falhas)
+        repair_controls = QHBoxLayout()
+        repair_controls.addWidget(self.botao_recalcular)
+        repair_controls.addWidget(self.botao_recuperar_falhas)
+        grid.addLayout(repair_controls, 8, 0, 1, 6)
+        self._atualizar_filtro_detalhes()
         grid.setColumnStretch(3, 1)
         grid.setColumnStretch(4, 1)
         layout.addWidget(filters)
@@ -1226,6 +1299,17 @@ class MainWindow(QMainWindow):
         self.sync_estimativa_detalhes.setObjectName("muted")
         self.sync_metricas = QLabel("Nenhuma execução planejada.")
         self.sync_metricas.setObjectName("muted")
+        self.sync_itens_resumo = QLabel("Itens e fornecedores: coleta ainda não iniciada.")
+        self.sync_itens_resumo.setWordWrap(True)
+        self.sync_itens_progresso = QProgressBar()
+        self.sync_itens_progresso.setRange(0, 1)
+        self.sync_itens_progresso.setValue(0)
+        self.sync_itens_progresso.setFormat("Itens e resultados — aguardando coleta")
+        self.sync_itens_progresso.setMinimumHeight(24)
+        self.sync_itens_progresso.setToolTip(
+            "Percentual das unidades conhecidas confirmadas sem rejeições. "
+            "Novas páginas e resultados podem aumentar o total durante a coleta."
+        )
         alerts = QHBoxLayout()
         self.sync_alertas = QLabel("Erros e validações ainda não verificados.")
         self.sync_alertas.setObjectName("muted")
@@ -1238,9 +1322,14 @@ class MainWindow(QMainWindow):
         status_layout.addWidget(self.sync_atividade)
         status_layout.addWidget(self.sync_progresso)
         status_layout.addWidget(self.sync_progresso_resumo)
+        self.sync_pendencias_exatas = QLabel("Recalcule para consultar as pendências dos planos atuais.")
+        self.sync_pendencias_exatas.setWordWrap(True)
+        status_layout.addWidget(self.sync_pendencias_exatas)
         status_layout.addLayout(estimate_grid)
         status_layout.addWidget(self.sync_estimativa_detalhes)
         status_layout.addWidget(self.sync_metricas)
+        status_layout.addWidget(self.sync_itens_resumo)
+        status_layout.addWidget(self.sync_itens_progresso)
         status_layout.addLayout(alerts)
         layout.addWidget(status)
 
@@ -1256,7 +1345,7 @@ class MainWindow(QMainWindow):
         self.sync_data_final.dateChanged.connect(self._sync_filters_changed)
         self.sync_modalidade.currentIndexChanged.connect(self._sync_filters_changed)
         self._update_sync_action_feedback()
-        return page
+        return scroll
 
     def _alternar_carga_completa(self, enabled: bool) -> None:
         """Aplica filtros explícitos e visíveis para o backfill integral."""
@@ -1358,6 +1447,14 @@ class MainWindow(QMainWindow):
         filters = QGridLayout()
         self.local_busca = QLineEdit()
         self.local_busca.setPlaceholderText("Objeto ou descrição (inclui sinônimos cadastrados)")
+        self.local_identificador = QLineEdit(placeholderText="Identificador PNCP completo")
+        self.local_identificador.setMaxLength(200)
+        self.local_identificador.setClearButtonEnabled(True)
+        self.local_identificador.setToolTip(
+            "Cole o identificador completo, como 12345678000190-1-000001/2026. "
+            "Busca exata no banco local; os demais filtros continuam valendo. "
+            "Não é o número do edital ou o CNPJ isolado."
+        )
         self.local_orgao = QLineEdit(placeholderText="Nome do órgão")
         self.local_orgao_cnpj = QLineEdit(placeholderText="CNPJ do órgão")
         self.local_municipio = QLineEdit(placeholderText="Município")
@@ -1397,6 +1494,7 @@ class MainWindow(QMainWindow):
         for position, widget in enumerate(
             (
                 self.local_busca,
+                self.local_identificador,
                 self.local_orgao,
                 self.local_orgao_cnpj,
                 self.local_municipio,
@@ -1412,6 +1510,7 @@ class MainWindow(QMainWindow):
         ):
             filters.addWidget(widget, position // 4, position % 4)
         self.local_busca.returnPressed.connect(self.pesquisar_banco_local)
+        self.local_identificador.returnPressed.connect(self.pesquisar_banco_local)
         search_layout.addLayout(filters)
         controls = QHBoxLayout()
         self.botao_buscar_local = QPushButton("Pesquisar")
@@ -1528,7 +1627,6 @@ class MainWindow(QMainWindow):
         maintenance_buttons = QHBoxLayout()
         for label, slot in (
             ("Verificar integridade", self.verificar_integridade),
-            ("Criar backup…", self.criar_backup),
             ("Manutenção segura…", self.executar_manutencao),
             ("Medir desempenho", lambda: self._queue_database_task("performance_report")),
         ):
@@ -1536,6 +1634,25 @@ class MainWindow(QMainWindow):
             button.setObjectName("secundario")
             button.clicked.connect(slot)
             maintenance_buttons.addWidget(button)
+        self.botao_backup = QPushButton("Criar backup…")
+        self.botao_backup.setObjectName("secundario")
+        self.botao_backup.clicked.connect(self.criar_backup)
+        self.botao_cancelar_backup = QPushButton("Cancelar backup")
+        self.botao_cancelar_backup.clicked.connect(self.cancelar_backup)
+        self.botao_cancelar_backup.setEnabled(False)
+        backup_controls = QHBoxLayout()
+        backup_controls.addWidget(self.botao_backup)
+        backup_controls.addWidget(self.botao_cancelar_backup)
+        self.backup_progresso = QProgressBar()
+        self.backup_progresso.setVisible(False)
+        backup_controls.addWidget(self.backup_progresso, 1)
+        backup_note = QLabel(
+            "Backup manual: salva uma cópia completa e verificada, incluindo checkpoints. "
+            "Escolha preferencialmente outro disco. Cópias anteriores não são sobrescritas. "
+            "Durante a cópia, disco e consultas podem ficar mais lentos."
+        )
+        backup_note.setWordWrap(True)
+        backup_note.setObjectName("muted")
         paused_note = QLabel(
             "A busca vetorial está temporariamente fora da interface. Esta etapa do projeto "
             "prioriza integridade, validação e população completa do banco principal."
@@ -1546,6 +1663,8 @@ class MainWindow(QMainWindow):
         self.manutencao_status.setObjectName("muted")
         maintenance_layout.addWidget(legal)
         maintenance_layout.addLayout(maintenance_buttons)
+        maintenance_layout.addWidget(backup_note)
+        maintenance_layout.addLayout(backup_controls)
         maintenance_layout.addWidget(paused_note)
         maintenance_layout.addWidget(self.manutencao_status)
         maintenance_layout.addStretch(1)
@@ -1619,13 +1738,33 @@ class MainWindow(QMainWindow):
         )
         worker.completed.connect(self._database_task_completed)
         worker.failed.connect(self._database_task_failed)
+        worker.progress.connect(self._backup_progress)
         worker.finished.connect(self._database_task_finished)
         self._database_worker = worker
         self._set_database_busy(True, action)
         worker.start()
 
     def _database_task_completed(self, action: str, result: object) -> None:
-        if action == "snapshot":
+        if action == "recalculate_progress":
+            pages = result["pages"]
+            projection = (
+                formatar_inteiro(result["projected_records"])
+                if result["projected_records"] is not None else "indisponível"
+            )
+            self.sync_pendencias_exatas.setText(
+                f"Snapshot: {result['remaining_pages']} páginas não confirmadas, "
+                f"{pages.get('FAILED', 0)} com falha, "
+                f"{pages.get('RETRY_WAIT', 0)} aguardando retry. "
+                f"{result['unknown_windows']} lotes sem total conhecido. "
+                f"Nova projeção: {projection} registros; "
+                "não é uma contagem exata de registros únicos faltantes."
+            )
+            if self._sync_worker is not None:
+                self._sync_worker.estimated_total_records = result["projected_records"]
+                self._sync_worker.estimated_total_pages = result["planned_pages"]
+            if isinstance(self._sync_plan, BatchPlanSummary) and self._sync_plan.is_approximate:
+                self._sync_plan = None
+        elif action == "snapshot":
             self._render_database_snapshot(result)
         elif action == "advanced_search":
             self._render_advanced_search(result)
@@ -1687,7 +1826,12 @@ class MainWindow(QMainWindow):
             self._render_semantic_results(result)
         elif action == "quick_check":
             self.manutencao_status.setText(f"Integridade: {result}")
-        elif action in {"create_backup", "safe_maintenance"}:
+        elif action == "create_backup":
+            self.backup_progresso.setRange(0, 100)
+            self.backup_progresso.setValue(100)
+            self.manutencao_status.setText(f"Backup concluído e verificado: {result}")
+            self.manutencao_status.setToolTip(str(result))
+        elif action == "safe_maintenance":
             self.manutencao_status.setText(f"Operação concluída: {result}")
         elif action == "import_new_database":
             self._local_dirty = True
@@ -1700,6 +1844,12 @@ class MainWindow(QMainWindow):
             )
 
     def _database_task_failed(self, action: str, detail: str) -> None:
+        if action == "create_backup":
+            self.backup_progresso.setVisible(False)
+            self.manutencao_status.setText(f"Backup não concluído. {detail}")
+            if not detail.startswith("BackupCancelled:"):
+                QMessageBox.warning(self, "Backup não concluído", detail)
+            return
         readable = {
             "snapshot": "Não foi possível carregar o banco local.",
             "advanced_search_all": "Não foi possível preparar a exportação completa.",
@@ -1733,6 +1883,13 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, lambda: self._queue_database_task(action, **arguments))
 
     def _set_database_busy(self, busy: bool, action: str) -> None:
+        self.botao_recalcular.setEnabled(not busy)
+        self.botao_backup.setEnabled(not busy)
+        self.botao_backup.setToolTip(
+            "Aguarde a operação de banco atual terminar." if busy else
+            "Cria uma cópia completa sem modificar o banco original."
+        )
+        self.botao_cancelar_backup.setEnabled(busy and action == "create_backup")
         self.botao_buscar_local.setEnabled(not busy)
         self.botao_atualizar_local.setEnabled(not busy)
         self.botao_diagnosticos.setEnabled(not busy)
@@ -1750,6 +1907,7 @@ class MainWindow(QMainWindow):
             return
         filters = {
             "text": self.local_busca.text().strip(),
+            "identificador": self.local_identificador.text().strip(),
             "orgao": self.local_orgao.text().strip(),
             "orgao_cnpj": self.local_orgao_cnpj.text().strip(),
             "municipio": self.local_municipio.text().strip(),
@@ -1773,6 +1931,7 @@ class MainWindow(QMainWindow):
         filters = data.get("filters", data)
         self.local_busca.setText(str(filters.get("text") or ""))
         for widget, key in (
+            (self.local_identificador, "identificador"),
             (self.local_orgao, "orgao"),
             (self.local_orgao_cnpj, "orgao_cnpj"),
             (self.local_municipio, "municipio"),
@@ -1883,11 +2042,35 @@ class MainWindow(QMainWindow):
         self._queue_database_task("quick_check")
 
     def criar_backup(self) -> None:
+        if self._database_worker is not None and self._database_worker.isRunning():
+            self.manutencao_status.setText("Aguarde a operação de banco atual antes de criar o backup.")
+            return
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        suggested = self._db_path.with_name(f"{self._db_path.stem}-backup-{stamp}.sqlite3")
         destino, _ = QFileDialog.getSaveFileName(
-            self, "Criar backup", "pncp-backup.sqlite3", "SQLite (*.sqlite3)"
+            self, "Criar backup completo", str(suggested), "SQLite (*.sqlite3)"
         )
         if destino:
+            self.backup_progresso.setVisible(True)
+            self.backup_progresso.setRange(0, 0)
+            self.manutencao_status.setText(f"Preparando backup em: {destino}")
             self._queue_database_task("create_backup", destination=Path(destino))
+
+    def cancelar_backup(self) -> None:
+        if self._database_worker is not None and self._database_worker.action == "create_backup":
+            self._database_worker.cancel_backup()
+            self.botao_cancelar_backup.setEnabled(False)
+            self.manutencao_status.setText("Cancelando o backup com segurança…")
+
+    def _backup_progress(self, stage: str, done: int, total: int) -> None:
+        self.backup_progresso.setVisible(True)
+        if total > 0:
+            self.backup_progresso.setRange(0, total)
+            self.backup_progresso.setValue(done)
+            self.manutencao_status.setText(f"{stage}: {done:,} de {total:,}. Ainda não concluído.")
+        else:
+            self.backup_progresso.setRange(0, 0)
+            self.manutencao_status.setText(stage + ". Aguarde a confirmação final.")
 
     def importar_banco_teste(self) -> None:
         origem, _ = QFileDialog.getOpenFileName(
@@ -1921,20 +2104,53 @@ class MainWindow(QMainWindow):
         if destino:
             self._queue_database_task("safe_maintenance", backup_path=Path(destino))
 
-    def atualizar_desde_ultima_execucao(self) -> None:
+    def atualizar_desde_ultima_execucao(self, *, capture_today: bool = False) -> None:
         if self._sync_worker is not None and self._sync_worker.isRunning():
+            self.sync_status_label.setText("Aguarde a sincronização atual ou use Pausar antes de atualizar.")
             return
         modalidade = self.sync_modalidade.currentData()
-        if modalidade is None:
-            self.sync_status_label.setText(
-                "Localizando a marca segura comum a todas as modalidades…"
-            )
-            self._queue_database_task("latest_completed_date_all")
-        else:
-            self.sync_status_label.setText(
-                "Localizando a última execução concluída desta modalidade…"
-            )
-            self._queue_database_task("latest_completed_date", modalidade=int(modalidade))
+        codes = tuple(c for c, _ in MODALIDADES) if capture_today or modalidade is None else (
+            int(modalidade),
+        )
+        self._sync_recovery_mode = False
+        self._sync_incremental_mode = True
+        self._auto_sync_pending = False
+        self._sync_manual_pause_requested = False
+        self._sync_run_id = None
+        self._sync_run_ids = ()
+        self._sync_plan = None
+        self._sync_can_continue = False
+        self._set_sync_busy(True)
+        self._sync_started_monotonic = time.monotonic()
+        self._sync_last_resource = ""
+        self.sync_progresso.setRange(0, 0)
+        self.sync_status_label.setText("Validando cobertura e preparando novas publicações e retificações…")
+        self.sync_atividade.setText("Os filtros de datas da carga histórica não alteram os checkpoints incrementais.")
+        worker = SyncTaskThread(
+            self._sync_config(), action="incremental", modalidades=codes,
+            target_date=date.today() if capture_today else None,
+            update_to_today=capture_today,
+            include_details=False, parent=self,
+        )
+        self._connect_sync_worker(worker)
+        self._sync_worker = worker
+        worker.start()
+
+    def recuperar_falhas(self) -> None:
+        if self._sync_worker is not None and self._sync_worker.isRunning():
+            self.sync_status_label.setText("Use Pausar antes de iniciar uma recuperação separada.")
+            return
+        self._sync_incremental_mode = False
+        self._sync_recovery_mode = True
+        self._sync_can_continue = True
+        self._sync_manual_pause_requested = False
+        self.sync_status_label.setText("Recuperando lotes com falhas; checkpoints confirmados serão mantidos.")
+        self._set_sync_busy(True)
+        worker = SyncTaskThread(self._sync_config(), action="recover_failures",
+                                include_details=False, parent=self)
+        self._connect_sync_worker(worker)
+        self._sync_worker = worker
+        worker.start()
 
     def _apply_latest_completed_date(self, value: object) -> None:
         if value is None:
@@ -2054,6 +2270,7 @@ class MainWindow(QMainWindow):
     def estimar_sincronizacao(self) -> None:
         if self._sync_worker is not None and self._sync_worker.isRunning():
             return
+        self._sync_incremental_mode = False
         try:
             windows = self._sync_windows()
             for window in windows:
@@ -2099,6 +2316,7 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def iniciar_sincronizacao(self) -> None:
+        self._sync_recovery_mode = False
         if self._sync_worker is not None and self._sync_worker.isRunning():
             return
         if self.sync_carga_completa.isChecked():
@@ -2112,6 +2330,8 @@ class MainWindow(QMainWindow):
         self._executar_sincronizacao()
 
     def _executar_carga_completa(self) -> None:
+        self._sync_recovery_mode = False
+        self._sync_incremental_mode = False
         windows = self._sync_windows()
         estimate = self._full_sync_estimate(windows)
         estimated_total_pages = estimate.get("total_pages")
@@ -2144,6 +2364,7 @@ class MainWindow(QMainWindow):
             action="full_sync",
             windows=windows,
             include_details=self.incluir_detalhes.isChecked(),
+            details_recent_active_only=self.somente_detalhes_vigentes.isChecked(),
             include_contracts=self.incluir_contratos.isChecked(),
             include_atas=self.incluir_atas.isChecked(),
             estimated_total_pages=estimated_total_pages,
@@ -2180,6 +2401,12 @@ class MainWindow(QMainWindow):
         return {"total_pages": total_pages, "total_records": total_records}
 
     def continuar_sincronizacao(self) -> None:
+        if self._sync_recovery_mode:
+            self.recuperar_falhas()
+            return
+        if self._sync_incremental_mode:
+            self.atualizar_desde_ultima_execucao()
+            return
         if self.sync_carga_completa.isChecked():
             if self._sync_worker is None or not self._sync_worker.isRunning():
                 self._executar_carga_completa()
@@ -2198,6 +2425,7 @@ class MainWindow(QMainWindow):
             self.sync_status_label.setText("Não há execução pendente para esta modalidade.")
 
     def _executar_sincronizacao(self) -> None:
+        self._sync_incremental_mode = False
         self._sync_plan = None
         self._sync_can_continue = False
         self._set_sync_busy(True)
@@ -2211,6 +2439,7 @@ class MainWindow(QMainWindow):
             run_ids=self._sync_run_ids,
             detail_run_id=self._detail_run_id,
             include_details=self.incluir_detalhes.isChecked(),
+            details_recent_active_only=self.somente_detalhes_vigentes.isChecked(),
             include_contracts=self.incluir_contratos.isChecked(),
             include_atas=self.incluir_atas.isChecked(),
             parent=self,
@@ -2371,6 +2600,24 @@ class MainWindow(QMainWindow):
     def _detalhes_planejados(self, detail_run_id: str) -> None:
         self._detail_run_id = detail_run_id
         self.sync_status_label.setText("Contratações concluídas; baixando itens e fornecedores…")
+        self.sync_itens_progresso.setRange(0, 0)
+        self.sync_itens_resumo.setText("Itens e fornecedores: preparando o lote atual…")
+
+    def _atualizar_progresso_itens(self, summary: DetailRunSummary) -> None:
+        total = summary.planned_units
+        self.sync_itens_progresso.setRange(0, max(1, total))
+        confirmed = summary.succeeded_units
+        if total == 0 and summary.status == "COMPLETED":
+            confirmed = 1
+        self.sync_itens_progresso.setValue(min(confirmed, max(1, total)))
+        self.sync_itens_progresso.setFormat("Itens e resultados — %p% das unidades conhecidas")
+        self.sync_itens_resumo.setText(
+            f"Lote de itens: {summary.succeeded_units}/{total} unidades confirmadas • "
+            f"{summary.pending_units} pendentes • {summary.failed_units} com falha • "
+            f"{summary.partial_units} com rejeições • {summary.item_records} itens • "
+            f"{summary.result_records} resultados. Estado: {summary.status}. "
+            "O total pode crescer ao descobrir outras páginas e resultados; não inclui PDFs."
+        )
 
     def _sync_atividade_alterada(self, description: str) -> None:
         self.sync_atividade.setText(description)
@@ -2404,8 +2651,7 @@ class MainWindow(QMainWindow):
         else:
             done = summary.succeeded_units + summary.partial_units
             total = max(1, summary.planned_units)
-            self.sync_progresso.setRange(0, total)
-            self.sync_progresso.setValue(min(done, total))
+            self._atualizar_progresso_itens(summary)
             self.sync_metricas.setText(
                 f"Detalhes: {done}/{total} unidades • {summary.item_records} itens • "
                 f"{summary.result_records} resultados • {formatar_bytes(summary.bytes_received)} • "
@@ -2414,6 +2660,20 @@ class MainWindow(QMainWindow):
 
     def _sync_progresso_carga_completa(self, progress: FullSyncProgress) -> None:
         """Separa o percentual estimado por registros das métricas exatas de execução."""
+        if self._sync_recovery_mode:
+            self.sync_progresso_resumo.setVisible(True)
+            self.sync_progresso_resumo.setText(
+                "Recuperando lotes com falhas. Páginas confirmadas não são repetidas; "
+                "esta operação não certifica a conclusão de todo o histórico."
+            )
+            return
+        if self._sync_incremental_mode:
+            self.sync_progresso_resumo.setVisible(True)
+            self.sync_progresso_resumo.setText(
+                f"Atualização incremental: {progress.completed_windows}/{progress.total_windows} "
+                "lotes percorridos. Falhas permanecem pendentes; só cobertura integral avança a data."
+            )
+            return
         self._full_sync_progress = progress
         records_percentage = progress.record_percentage
         if records_percentage is None:
@@ -2531,6 +2791,14 @@ class MainWindow(QMainWindow):
         # Páginas adiadas não bloqueiam a varredura; ficam disponíveis para uma
         # rodada posterior sem invalidar os checkpoints já confirmados.
         self._sync_can_continue = has_failure or self.sync_carga_completa.isChecked()
+        if self._sync_incremental_mode:
+            self._sync_can_continue = main.status != "COMPLETED"
+            if self._sync_manual_pause_requested:
+                try:
+                    set_session_status(self._sync_config(), active=True, manual_pause=True)
+                    self._sync_can_continue = True
+                except Exception as exc:
+                    self.sync_alertas.setText(f"Não foi possível preservar a pausa incremental: {exc}")
         has_rejection = main.records_rejected > 0 or (
             details is not None and details.rejected_records > 0
         )
@@ -2543,6 +2811,11 @@ class MainWindow(QMainWindow):
         else:
             prefix = "Sincronização concluída."
         self._render_sync_result(main, details, prefix)
+        if self._sync_recovery_mode:
+            self.sync_status_label.setText(
+                f"Recuperação de lotes com falhas encerrada: {main.status}. "
+                "Consulte as pendências globais em Recalcular."
+            )
         if has_deferred_pages:
             self.sync_atividade.setText(
                 f"A varredura continuou e preservou os dados confirmados. "
@@ -2556,11 +2829,26 @@ class MainWindow(QMainWindow):
             )
         else:
             self.sync_atividade.setText("Download concluído; dados confirmados no banco local.")
+        if self._sync_incremental_mode and main.status != "COMPLETED":
+            self.sync_atividade.setText(
+                "Atualização incompleta: datas dos intervalos com falhas ou rejeições não "
+                "avançaram. Revise Erros e validações antes de continuar."
+            )
         self._local_dirty = True
         if self.abas.tabText(self.abas.currentIndex()) == "Banco local":
             self.carregar_banco_local()
 
     def _sync_pausado(self, main: RunSummary | None, details: DetailRunSummary | None) -> None:
+        if self._sync_incremental_mode and getattr(
+            self._sync_worker, "_incremental_created_after", ""
+        ):
+            try:
+                set_session_status(
+                    self._sync_config(), active=True,
+                    manual_pause=self._sync_manual_pause_requested,
+                )
+            except Exception as exc:
+                self.sync_alertas.setText(f"Não foi possível salvar a pausa incremental: {exc}")
         if (
             self._sync_manual_pause_requested
             and self._sync_worker is not None
@@ -2578,8 +2866,11 @@ class MainWindow(QMainWindow):
             self.sync_status_label.setText("Estimativa cancelada.")
             self.sync_atividade.setText("Estimativa cancelada; nenhum download foi iniciado.")
         self._sync_can_continue = (
-            self._sync_run_id is not None or self.sync_carga_completa.isChecked()
+            self._sync_incremental_mode or self._sync_run_id is not None or self.sync_carga_completa.isChecked()
         )
+        if self._sync_incremental_mode and main is None:
+            self.sync_status_label.setText("Atualização incremental pausada. Use Continuar para retomar.")
+            self.sync_atividade.setText("A sessão e os checkpoints confirmados foram preservados.")
         self.botao_continuar.setEnabled(self._sync_can_continue)
         self._update_sync_action_feedback()
 
@@ -2591,6 +2882,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         detail_text = ""
         if details is not None:
+            self._atualizar_progresso_itens(details)
             detail_text = (
                 f" • detalhes: {details.status} • {details.item_records} itens • "
                 f"{details.result_records} resultados"
@@ -2628,7 +2920,7 @@ class MainWindow(QMainWindow):
         self._sync_can_continue = False
         self.sync_status_label.setText(mensagem)
         self.sync_status_label.setToolTip(detalhe)
-        if self._sync_run_id is None:
+        if self._sync_run_id is None and not self._sync_incremental_mode:
             self.sync_estimativa_tempo.setText("Não calculado: o PNCP não respondeu corretamente")
             self.sync_estimativa_respostas.setText("Nenhuma estimativa confirmada")
             self.sync_estimativa_registros.setText("Nenhuma estimativa confirmada")
@@ -2650,7 +2942,7 @@ class MainWindow(QMainWindow):
         dialog.exec()
         # Se já existe um plano, a falha pode ser retomada após a mensagem.
         self._sync_can_continue = (
-            self._sync_run_id is not None or self.sync_carga_completa.isChecked()
+            self._sync_incremental_mode or self._sync_run_id is not None or self.sync_carga_completa.isChecked()
         )
         self.botao_continuar.setEnabled(self._sync_can_continue)
         self._update_sync_action_feedback()
@@ -2686,16 +2978,30 @@ class MainWindow(QMainWindow):
         self.sync_data_final.setEnabled(not busy and not full_load)
         self.sync_modalidade.setEnabled(not busy and not full_load)
         self.incluir_detalhes.setEnabled(not busy)
+        self.somente_detalhes_vigentes.setEnabled(
+            not busy and self.incluir_detalhes.isChecked()
+        )
         self.incluir_contratos.setEnabled(not busy)
         self.incluir_atas.setEnabled(not busy)
         self.sync_concorrencia.setEnabled(not busy)
         self.sync_tamanho_pagina.setEnabled(not busy)
         self.botao_atualizar_desde_ultima.setEnabled(not busy)
+        self.botao_recuperar_falhas.setEnabled(not busy)
+        self.botao_recuperar_falhas.setToolTip(
+            "Aguarde a tarefa atual terminar ou use Pausar."
+            if busy else "Retoma lotes com falha; não repete páginas confirmadas."
+        )
         self.sync_automatico.setEnabled(not busy)
         self.sync_carga_completa.setEnabled(not busy)
         database_busy = self._database_worker is not None and self._database_worker.isRunning()
         self.botao_escolher_banco.setEnabled(not busy and not database_busy)
         self._update_sync_action_feedback()
+
+    def _atualizar_filtro_detalhes(self) -> None:
+        busy = self._sync_worker is not None and self._sync_worker.isRunning()
+        self.somente_detalhes_vigentes.setEnabled(
+            not busy and self.incluir_detalhes.isChecked()
+        )
 
     def _update_sync_action_feedback(self) -> None:
         busy = self._sync_worker is not None and self._sync_worker.isRunning()
@@ -2773,26 +3079,14 @@ class MainWindow(QMainWindow):
         self._local_loaded_path = self._db_path
 
     def pesquisar_banco_local(self) -> None:
-        filters = {
-            "orgao": self.local_orgao.text().strip(),
-            "orgao_cnpj": self.local_orgao_cnpj.text().strip(),
-            "municipio": self.local_municipio.text().strip(),
-            "fornecedor": self.local_fornecedor.text().strip(),
-            "modalidade": self.local_modalidade.currentData(),
-            "situacao": self.local_situacao.text().strip(),
-            "valor_min": self.local_valor_min.value() or None,
-            "valor_max": self.local_valor_max.value() or None,
-            "data_inicial": None
-            if self.local_data_inicial.date() == self.local_data_inicial.minimumDate()
-            else self.local_data_inicial.date().toPython().isoformat(),
-            "data_final": None
-            if self.local_data_final.date() == self.local_data_final.minimumDate()
-            else self.local_data_final.date().toPython().isoformat(),
-        }
+        self._local_page = 1
+        self._executar_pesquisa_local()
+
+    def _executar_pesquisa_local(self) -> None:
         self._queue_database_task(
             "advanced_search",
             text=self.local_busca.text(),
-            filters=filters,
+            filters=self._filtros_banco_local(),
             page=getattr(self, "_local_page", 1),
             page_size=50,
             sort=self.local_ordenacao.currentData(),
@@ -2804,6 +3098,10 @@ class MainWindow(QMainWindow):
         self._local_result_page = result
         self._local_rows = result.rows
         self._render_database_rows(result.rows)
+        self.local_status.setText(
+            f"{result.total} resultado(s) no banco local. "
+            "Os filtros são combinados; registro ausente pode não ter sido sincronizado."
+        )
         self.local_pagina_label.setText(
             f"Página {result.page} de {max(1, result.pages)} • {result.total} resultado(s)"
         )
@@ -2859,6 +3157,7 @@ class MainWindow(QMainWindow):
 
     def _filtros_banco_local(self) -> dict[str, Any]:
         return {
+            "identificador": self.local_identificador.text().strip(),
             "orgao": self.local_orgao.text().strip(),
             "orgao_cnpj": self.local_orgao_cnpj.text().strip(),
             "municipio": self.local_municipio.text().strip(),
@@ -2920,11 +3219,11 @@ class MainWindow(QMainWindow):
 
     def pagina_local_anterior(self) -> None:
         self._local_page = max(1, getattr(self, "_local_page", 1) - 1)
-        self.pesquisar_banco_local()
+        self._executar_pesquisa_local()
 
     def pagina_local_proxima(self) -> None:
         self._local_page = getattr(self, "_local_page", 1) + 1
-        self.pesquisar_banco_local()
+        self._executar_pesquisa_local()
 
     def abrir_detalhe_local(self, row: int, _: int) -> None:
         cell = self.tabela_local.item(row, 0)
@@ -3139,6 +3438,8 @@ class MainWindow(QMainWindow):
                 self.sync_status_label.setText("Aguardando o encerramento seguro da sincronização…")
                 event.ignore()
                 return
+        if self._database_worker is not None and self._database_worker.isRunning():
+            self._database_worker.cancel_backup()
         if (
             self._database_worker is not None
             and self._database_worker.isRunning()

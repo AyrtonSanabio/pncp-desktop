@@ -16,16 +16,16 @@ no PNCP.
 - confirma cada página em uma transação SQLite e retoma do primeiro checkpoint ausente;
 - permite escolher de 10 a 500 registros por página em novas execuções sem alterar
   cargas que já começaram;
-- oferece rede sequencial ou até quatro downloads simultâneos com redução automática após erros;
+- oferece rede sequencial ou até oito downloads simultâneos experimentais, com redução gradual após falhas repetidas;
 - repete falhas temporárias de qualquer carga principal, com espera progressiva e cancelável;
 - preserva a sessão da carga nacional e a retoma automaticamente após queda ou reinício;
 - preserva a resposta JSON original comprimida e os dados normalizados;
 - evita duplicação pelo identificador PNCP e detecta registros novos ou alterados;
-- pesquisa o banco local por texto, órgão, CNPJ, município, fornecedor, modalidade,
+- pesquisa o banco local por identificador PNCP exato, texto, órgão, CNPJ, município, fornecedor, modalidade,
   situação, valor e período;
 - mostra detalhes, itens, resultados/fornecedores, histórico de sincronizações e análises;
 - exporta resultados filtrados para CSV;
-- cria backups e verifica a integridade do banco.
+- cria backups completos em segundo plano, confirma sua integridade e permite cancelar a cópia.
 
 PDFs e outros documentos não são baixados automaticamente.
 

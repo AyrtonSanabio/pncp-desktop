@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -61,6 +62,22 @@ def _fts_query(value: str) -> str:
 
 
 class LocalDatabase:
+    def recalculate_progress(self) -> dict[str, Any]:
+        from pncp_sync.persistence.progress_report import progress_report
+
+        report = progress_report(self.db_path)
+        if report["projected_records"] is not None:
+            self.set_preference("sync.full_estimate.v1", {
+                "total_records": report["projected_records"],
+                "total_pages": report["planned_pages"],
+                "total_windows": report["total_windows"],
+                "sample_size": report["total_windows"] - report["unknown_windows"],
+                "scope_start": report["scope_start"], "scope_end": report["scope_end"],
+                "generated_at": report["generated_at"], "method": "stored_plans",
+                "unknown_windows": report["unknown_windows"],
+            })
+        return report
+
     def __init__(self, db_path: Path) -> None:
         self.db_path = Path(db_path).expanduser().resolve()
         self._ready = False
@@ -120,7 +137,8 @@ class LocalDatabase:
         with self._connect() as connection:
             row = connection.execute(
                 """SELECT r.id FROM ingestion_run r
-                   WHERE r.modalidade=? AND r.status IN ('PLANNED','RUNNING','PAUSED','FAILED')
+                   WHERE r.resource='contratacoes_publicacao'
+                     AND r.modalidade=? AND r.status IN ('PLANNED','RUNNING','PAUSED','FAILED')
                       AND EXISTS (SELECT 1 FROM work_unit w WHERE w.run_id=r.id AND w.status IN ('PENDING','RETRY_WAIT','RUNNING','FAILED'))
                    ORDER BY r.created_at DESC LIMIT 1""", (modalidade,)
             ).fetchone()
@@ -137,10 +155,11 @@ class LocalDatabase:
                 """SELECT r.id FROM ingestion_run r
                    JOIN (
                        SELECT modalidade,MAX(created_at) created_at FROM ingestion_run
-                       WHERE status IN ('PLANNED','RUNNING','PAUSED','FAILED')
+                       WHERE resource='contratacoes_publicacao'
+                         AND status IN ('PLANNED','RUNNING','PAUSED','FAILED')
                        GROUP BY modalidade
                    ) latest ON latest.modalidade=r.modalidade AND latest.created_at=r.created_at
-                   WHERE EXISTS (
+                   WHERE r.resource='contratacoes_publicacao' AND EXISTS (
                        SELECT 1 FROM work_unit w WHERE w.run_id=r.id
                          AND w.status IN ('PENDING','RETRY_WAIT','RUNNING','FAILED')
                    ) ORDER BY r.modalidade"""
@@ -199,12 +218,17 @@ class LocalDatabase:
         with self._connect() as connection:
             return DataServices(connection).refresh_insights(limit=limit)
 
-    def create_backup(self, destination: Path | None = None) -> Path:
-        self.ensure_ready()
+    def create_backup(
+        self,
+        destination: Path | None = None,
+        *,
+        progress: Callable[[str, int, int], None] | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> Path:
         if destination is None:
-            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
             destination = self.db_path.with_name(f"{self.db_path.stem}-backup-{stamp}.sqlite3")
-        return backup_database(self.db_path, destination)
+        return backup_database(self.db_path, destination, progress=progress, cancelled=cancelled)
 
     def quick_check(self) -> dict[str, Any]:
         with self._connect() as connection:
@@ -277,6 +301,7 @@ class LocalDatabase:
                 SELECT MAX(data_final)
                 FROM ingestion_run
                 WHERE modalidade = ?
+                  AND resource='contratacoes_publicacao'
                   AND status IN ('COMPLETED', 'COMPLETED_WITH_REJECTIONS')
                 """,
                 (modalidade,),
@@ -290,7 +315,8 @@ class LocalDatabase:
                 """SELECT MIN(last_date) FROM (
                        SELECT modalidade,MAX(data_final) last_date
                        FROM ingestion_run
-                       WHERE status IN ('COMPLETED','COMPLETED_WITH_REJECTIONS')
+                       WHERE resource='contratacoes_publicacao'
+                         AND status IN ('COMPLETED','COMPLETED_WITH_REJECTIONS')
                        GROUP BY modalidade
                    )"""
             ).fetchone()

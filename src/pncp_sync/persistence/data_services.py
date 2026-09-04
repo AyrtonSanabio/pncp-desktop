@@ -10,8 +10,9 @@ import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
+
+from pncp_sync.persistence.backup import backup_database as backup_database
 
 
 def _now() -> str:
@@ -330,6 +331,7 @@ class DataServices:
                 params.append(" AND ".join(f'"{token}"' for token in _tokens(term)))
             where.append("(" + " OR ".join(groups) + ")")
         mapping = {
+            "identificador": "c.numero_controle_pncp = ?",
             "orgao": "c.orgao_razao_social LIKE ?",
             "municipio": "c.municipio_nome LIKE ?",
             "modalidade": "c.modalidade_id = ?",
@@ -339,6 +341,10 @@ class DataServices:
         for key, sql in mapping.items():
             value = filters.get(key)
             if value not in (None, ""):
+                if key == "identificador":
+                    value = str(value).strip()
+                    if not value or len(value) > 200:
+                        raise ValueError("Informe o identificador PNCP completo, com até 200 caracteres.")
                 if key == "orgao_cnpj":
                     digits = "".join(character for character in str(value) if character.isdigit())
                     value = digits or value
@@ -634,15 +640,3 @@ class DataServices:
             "SELECT value_json FROM app_preference WHERE key=?", (key,)
         ).fetchone()
         return json.loads(row[0]) if row else default
-
-
-def backup_database(source: Path, target: Path) -> Path:
-    source, target = Path(source), Path(target)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if target.exists():
-        raise FileExistsError(f"O backup já existe: {target}")
-    with sqlite3.connect(source) as src, sqlite3.connect(target) as dst:
-        src.backup(dst)
-        if dst.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-            raise RuntimeError("O backup criado não passou na verificação de integridade.")
-    return target

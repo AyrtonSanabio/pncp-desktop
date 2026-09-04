@@ -31,6 +31,11 @@ bloquear a troca de abas.
 Contém configuração, modelos de domínio, adaptadores da API, normalizadores, casos de uso
 e repositórios. Não depende dos componentes visuais para executar uma sincronização.
 
+`application/incremental.py` calcula intervalos seguros e persiste a sessão incremental.
+`SyncWindow.resource` distingue carga histórica, novas publicações e atualizações globais.
+O worker da interface coordena as janelas com o mesmo motor de páginas, retries e checkpoints;
+os dados finais continuam na mesma tabela `contratacao`, não em um segundo banco.
+
 ## Fluxo de uma página
 
 1. uma unidade `work_unit` é marcada como `RUNNING` com número máximo de tentativas;
@@ -54,12 +59,14 @@ continua validando cada contratação com o modelo público do `pypncp`.
 ## Concorrência e memória
 
 A carga principal mantém dois motores. O sequencial é usado no modo conservador. O motor
-acelerado pode manter até 2 ou 4 downloads de páginas em andamento, mas processa e confirma
+acelerado pode manter até 2, 4 ou 8 downloads de páginas em andamento, mas processa e confirma
 os resultados um por vez. Assim, SQLite continua com um único fluxo gravador e os checkpoints
 mantêm a mesma transação do modo conservador.
 
 A concorrência é adaptativa: começa abaixo do teto, aumenta somente depois de páginas
-confirmadas e volta imediatamente para 1 após falha HTTP. O número de respostas mantidas em
+confirmadas e reduz um nível após falhas temporárias repetidas em páginas distintas.
+Falhas isoladas não reduzem o nível; HTTP 429 impõe espera global e redução de um nível.
+O estado adaptativo é compartilhado entre os lotes da mesma tarefa. O número de respostas mantidas em
 memória fica limitado ao teto selecionado, sem relação com o volume nacional. SQLite usa
 `busy_timeout`, chaves estrangeiras e modo WAL configurado pelos repositórios.
 

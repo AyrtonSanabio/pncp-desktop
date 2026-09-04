@@ -14,13 +14,14 @@ async def plan_sync(
     window: SyncWindow,
     *,
     source: SourceProtocol | None = None,
+    created_after: str = "",
 ) -> PlanSummary:
     """Consulta uma página, estima a carga e persiste unidades ainda não executadas."""
     window.validate(max_days=config.max_window_days)
     config.ensure_storage_directory()
     with SyncRepository(config.db_path, lease_seconds=config.lease_seconds) as repository:
         reusable = repository.find_reusable_plan(
-            window, page_size=config.publication_page_size
+            window, page_size=config.publication_page_size, created_after=created_after
         )
     if reusable is not None:
         return reusable

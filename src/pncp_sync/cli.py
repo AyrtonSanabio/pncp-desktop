@@ -14,6 +14,7 @@ from typing import Any
 
 from pncp_sync.application.plan_details import plan_details
 from pncp_sync.application.plan_sync import plan_sync
+from pncp_sync.application.recent_details import prepare_recent_details, run_recent_details
 from pncp_sync.application.run_details import run_details
 from pncp_sync.application.run_sync import run_sync
 from pncp_sync.config import SyncConfig
@@ -111,6 +112,19 @@ def build_parser() -> argparse.ArgumentParser:
     plan_details_parser.add_argument("--numero-controle")
     plan_details_parser.add_argument("--limit", type=int)
     plan_details_parser.add_argument("--page-size", type=int, default=50)
+    plan_details_parser.add_argument(
+        "--somente-vigentes-ultimo-ano",
+        action="store_true",
+        help="Seleciona publicações dos últimos 365 dias ainda abertas para propostas.",
+    )
+
+    commands.add_parser(
+        "plan-recent-details", help="Seleciona vigentes dos últimos 365 dias no banco inteiro."
+    )
+    recent = commands.add_parser(
+        "run-recent-details", help="Retoma a coleta dos itens recentes com retry persistente."
+    )
+    recent.add_argument("--max-rounds", type=int)
 
     run_details_parser = commands.add_parser(
         "run-details", help="Coleta itens e resultados de um plano."
@@ -211,9 +225,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 numero_controle=args.numero_controle,
                 limit=args.limit,
                 page_size=args.page_size,
+                recent_active_only=args.somente_vigentes_ultimo_ano,
             )
             print(_json(asdict(summary)))
             return 0
+        if args.command == "plan-recent-details":
+            print(_json(prepare_recent_details(config)))
+            return 0
+        if args.command == "run-recent-details":
+            result = asyncio.run(run_recent_details(
+                config, max_rounds=args.max_rounds, progress=_detail_progress
+            ))
+            print(_json(result))
+            return 0 if result["status"] in {"COMPLETED", "PAUSED"} else 2
         if args.command in {"run-details", "resume-details"}:
             summary = asyncio.run(
                 run_details(

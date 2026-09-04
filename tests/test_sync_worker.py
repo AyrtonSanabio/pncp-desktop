@@ -133,7 +133,7 @@ async def test_main_sync_keeps_retrying_recoverable_failure(monkeypatch, tmp_pat
     assert result.status == "COMPLETED"
     assert run_calls == 3
     assert waits == [(2, 1), (4, 2)]
-    assert conservative_starts == [False, True, True]
+    assert conservative_starts == [False, False, False]
 
 
 @pytest.mark.asyncio
@@ -166,6 +166,9 @@ async def test_full_sync_sweep_does_not_retry_same_run_forever(
         def reclassify_false_period_limit_errors(self, _run_id: str) -> int:
             return 0
 
+        def get_summary(self, _run_id: str) -> RunSummary:
+            return _summary("FAILED", done=2, failed=1)
+
         def retry_recoverable_units(self, _run_id: str) -> int:
             return 1
 
@@ -179,7 +182,80 @@ async def test_full_sync_sweep_does_not_retry_same_run_forever(
     result = await worker._run_main_sweep("problematic-run")
 
     assert result.status == "FAILED"
-    assert calls == [("problematic-run", 1, True, True)]
+    assert calls == [("problematic-run", 1, False, True)]
+
+
+@pytest.mark.asyncio
+async def test_outage_wait_does_not_force_single_download_between_runs(monkeypatch, tmp_path):
+    class Repository:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def get_summary(self, run_id):
+            return _summary("FAILED", done=0, failed=1, run_id=run_id)
+
+        def reclassify_false_period_limit_errors(self, run_id):
+            return 0
+
+        def retry_recoverable_units(self, run_id):
+            return 0
+
+    conservative = []
+    waits = []
+
+    async def execute(run_id, **kwargs):
+        conservative.append(kwargs.get("conservative_start", False))
+        if len(conservative) in (4, 8):
+            return _summary("COMPLETED", done=3, run_id=run_id)
+        return _summary("FAILED", done=0, failed=1, run_id=run_id)
+
+    async def wait(seconds, **kwargs):
+        waits.append(seconds)
+        assert kwargs["reopened"] == 3
+
+    monkeypatch.setattr(sync_worker, "SyncRepository", Repository)
+    worker = SyncTaskThread(SyncConfig(
+        db_path=tmp_path / "outage.sqlite3", max_concurrent=4,
+        continuous_retry_base_seconds=2, continuous_retry_max_seconds=8,
+    ), action="full_sync")
+    monkeypatch.setattr(worker, "_run_main_sync", execute)
+    monkeypatch.setattr(worker, "_wait_before_retry", wait)
+    for i in range(8):
+        await worker._run_main_sweep(str(i))
+    assert waits == [2, 2]
+    assert conservative == [False] * 8
+    assert worker._empty_failed_sweeps == worker._outage_waits == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_reuses_adaptive_state_across_runs(monkeypatch, tmp_path):
+    states = []
+
+    async def execute(config, run_id, **kwargs):
+        state = kwargs['concurrency_state']
+        states.append(state)
+        if run_id == 'first':
+            state.current = 8
+            state.observe({('first', 2)}, 7)
+            assert state.current == 8
+        else:
+            assert state.current == 8
+            state.observe({('second', 3)}, 0)
+            assert state.current == 7
+        return _summary('FAILED', done=1, failed=1, run_id=run_id)
+
+    monkeypatch.setattr(sync_worker, 'run_sync_parallel', execute)
+    worker = SyncTaskThread(SyncConfig(db_path=tmp_path/'state.sqlite3', max_concurrent=8),
+                            action='full_sync')
+    await worker._run_main_sync('first')
+    await worker._run_main_sync('second')
+    assert states[0] is states[1]
 
 
 @pytest.mark.asyncio

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import json
 import sqlite3
-from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -123,11 +123,42 @@ _RESULT_COLUMNS = (
 )
 
 
+def _pncp_timestamp(value: object) -> float | None:
+    """Normaliza o horário do PNCP; datas sem fuso são interpretadas em Brasília."""
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except (ValueError, OverflowError):
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        parsed = parsed.replace(tzinfo=timezone(timedelta(hours=-3)))
+    try:
+        return parsed.timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _recent_active_selection(reference: datetime) -> tuple[str, tuple[Any, ...]]:
+    if reference.tzinfo is None or reference.utcoffset() is None:
+        raise ValueError("O instante de referência dos itens precisa possuir fuso horário.")
+    today = reference.astimezone(timezone(timedelta(hours=-3))).date()
+    return (
+        """data_publicacao_pncp >= ? AND data_publicacao_pncp < ?
+           AND situacao_compra_id = 1
+           AND pncp_timestamp(data_encerramento_proposta) >= ?""",
+        ((today - timedelta(days=365)).isoformat(),
+         (today + timedelta(days=1)).isoformat(), reference.timestamp()),
+    )
+
+
 class DetailRepository(SyncRepository):
     """Persistência dos itens e resultados, isolada da carga de contratações."""
 
-    def __init__(self, db_path: Path, *, lease_seconds: int = 300) -> None:
-        super().__init__(db_path, lease_seconds=lease_seconds)
+    def __enter__(self) -> DetailRepository:
+        super().__enter__()
+        self.connection.create_function("pncp_timestamp", 1, _pncp_timestamp, deterministic=True)
+        return self
 
     def create_detail_plan(
         self,
@@ -136,6 +167,8 @@ class DetailRepository(SyncRepository):
         numero_controle: str | None = None,
         limit: int | None = None,
         page_size: int = 50,
+        recent_active_only: bool = False,
+        reference_time: datetime | None = None,
     ) -> DetailPlanSummary:
         if page_size < 1 or page_size > 500:
             raise ValueError("O tamanho da página deve ficar entre 1 e 500.")
@@ -167,6 +200,10 @@ class DetailRepository(SyncRepository):
             source_run["data_final"],
             source_run["modalidade"],
         ]
+        if recent_active_only:
+            predicate, bounds = _recent_active_selection(reference_time or datetime.now(UTC))
+            sql += " AND " + predicate
+            params.extend(bounds)
         if numero_controle:
             sql += " AND numero_controle_pncp = ?"
             params.append(numero_controle)
@@ -175,9 +212,6 @@ class DetailRepository(SyncRepository):
             sql += " LIMIT ?"
             params.append(limit)
         purchases = self.connection.execute(sql, params).fetchall()
-        if not purchases:
-            raise ValueError("Nenhuma contratação elegível foi encontrada para o detalhe.")
-
         detail_run_id = str(uuid4())
         now = utc_now_iso()
         with self._transaction() as cursor:
@@ -223,8 +257,83 @@ class DetailRepository(SyncRepository):
             page_size=page_size,
         )
 
+    def prepare_recent_details(
+        self, *, reference_time: datetime | None = None, page_size: int = 50
+    ) -> dict[str, Any]:
+        """Congela uma seleção global local, com planos e checkpoint no mesmo commit."""
+        key = "sync.recent_details.v1"
+        if not 1 <= page_size <= 500:
+            raise ValueError("O tamanho da página deve ficar entre 1 e 500.")
+        reference = reference_time or datetime.now(UTC)
+        predicate, bounds = _recent_active_selection(reference)
+        with self._transaction() as cursor:
+            saved = cursor.execute(
+                "SELECT value_json FROM app_preference WHERE key=?", (key,)
+            ).fetchone()
+            if saved is not None:
+                session = json.loads(saved[0])
+                if not isinstance(session, dict) or not isinstance(session.get("run_ids"), list):
+                    raise ValueError("Checkpoint de itens recentes inválido; dados preservados.")
+                for run_id in session["run_ids"]:
+                    found = cursor.execute(
+                        "SELECT 1 FROM detail_run WHERE id=?", (run_id,)
+                    ).fetchone()
+                    if found is None:
+                        raise ValueError(
+                            "Plano de itens ausente; checkpoint preservado para diagnóstico."
+                        )
+                return session
+            # A seleção fica no SQLite, sem materializar milhões de registros em Python.
+            cursor.execute("DROP TABLE IF EXISTS temp.recent_detail_selection")
+            cursor.execute(
+                """CREATE TEMP TABLE recent_detail_selection AS
+                   SELECT c.id AS contratacao_id, p.run_id AS source_run_id
+                   FROM contratacao c JOIN source_payload p ON p.id=c.source_payload_id
+                   WHERE orgao_cnpj IS NOT NULL AND ano_compra IS NOT NULL
+                     AND sequencial_compra IS NOT NULL AND """ + predicate,
+                bounds,
+            )
+            groups = cursor.execute(
+                """SELECT source_run_id,COUNT(*) FROM recent_detail_selection
+                   GROUP BY source_run_id ORDER BY source_run_id"""
+            ).fetchall()
+            now = utc_now_iso()
+            run_ids = []
+            for source_run_id, count in groups:
+                run_id = str(uuid4())
+                cursor.execute(
+                    """INSERT INTO detail_run(id,source_run_id,status,page_size,
+                       planned_contracts,collector_version,created_at)
+                       VALUES (?,?,'PLANNED',?,?,?,?)""",
+                    (run_id, source_run_id, page_size, count, __version__, now),
+                )
+                cursor.execute(
+                    """INSERT INTO detail_work_unit(detail_run_id,contratacao_id,resource,
+                       item_number,page_number,page_size,status,created_at)
+                       SELECT ?,contratacao_id,'ITEMS',0,1,?,'PENDING',?
+                       FROM recent_detail_selection WHERE source_run_id=?""",
+                    (run_id, page_size, now, source_run_id),
+                )
+                cursor.execute(
+                    "INSERT INTO detail_coverage(detail_run_id,planned_contracts,updated_at) "
+                    "VALUES(?,?,?)",
+                    (run_id, count, now),
+                )
+                run_ids.append(run_id)
+            session = {
+                "reference_time": reference.isoformat(), "created_at": now,
+                "run_ids": run_ids, "planned_contracts": sum(group[1] for group in groups),
+                "page_size": page_size,
+            }
+            cursor.execute(
+                "INSERT INTO app_preference(key,value_json,updated_at) VALUES(?,?,?)",
+                (key, json.dumps(session), now),
+            )
+            cursor.execute("DROP TABLE temp.recent_detail_selection")
+        return session
+
     def claim_next_detail(
-        self, detail_run_id: str, *, max_attempts: int = 3
+        self, detail_run_id: str, *, max_attempts: int | None = 3
     ) -> DetailWorkUnit | None:
         now = datetime.now(UTC)
         now_text = now.isoformat(timespec="milliseconds")
@@ -234,8 +343,10 @@ class DetailRepository(SyncRepository):
         with self._transaction() as cursor:
             cursor.execute(
                 """
-                UPDATE detail_work_unit SET status = 'PENDING', lease_until = NULL
-                WHERE detail_run_id = ? AND status = 'RUNNING' AND lease_until < ?
+                UPDATE detail_work_unit SET status = 'PENDING', lease_until = NULL,
+                    attempt_count = MAX(0, attempt_count - 1)
+                WHERE detail_run_id = ? AND status = 'RUNNING'
+                  AND (lease_until IS NULL OR lease_until < ?)
                 """,
                 (detail_run_id, now_text),
             )
@@ -247,12 +358,14 @@ class DetailRepository(SyncRepository):
                 JOIN contratacao c ON c.id = w.contratacao_id
                 WHERE w.detail_run_id = ?
                   AND w.status IN ('PENDING', 'RETRY_WAIT')
-                  AND w.attempt_count < ?
-                ORDER BY CASE w.resource WHEN 'ITEMS' THEN 0 ELSE 1 END,
+                  AND (? IS NULL OR w.attempt_count < ?)
+                  AND (w.lease_until IS NULL OR w.lease_until <= ?)
+                ORDER BY CASE w.status WHEN 'PENDING' THEN 0 ELSE 1 END,
+                         CASE w.resource WHEN 'ITEMS' THEN 0 ELSE 1 END,
                          w.contratacao_id, w.page_number, w.item_number
                 LIMIT 1
                 """,
-                (detail_run_id, max_attempts),
+                (detail_run_id, max_attempts, max_attempts, now_text),
             ).fetchone()
             if row is None:
                 return None
@@ -660,7 +773,8 @@ class DetailRepository(SyncRepository):
             cursor.execute(
                 """
                 UPDATE detail_work_unit
-                SET status = 'PENDING', lease_until = NULL, finished_at = NULL
+                SET status = 'PENDING', lease_until = NULL, finished_at = NULL,
+                    attempt_count = MAX(0, attempt_count - 1)
                 WHERE id = ? AND status = 'RUNNING'
                 """,
                 (work_unit.id,),
@@ -678,20 +792,29 @@ class DetailRepository(SyncRepository):
         message: str,
         detail: str,
         recoverable: bool,
-        max_attempts: int = 3,
+        max_attempts: int | None = 3,
+        retry_delay_seconds: float = 0,
     ) -> None:
         status = (
-            "RETRY_WAIT" if recoverable and work_unit.attempt_count < max_attempts else "FAILED"
+            "RETRY_WAIT" if recoverable and (
+                max_attempts is None or work_unit.attempt_count < max_attempts
+            ) else "FAILED"
         )
         now = utc_now_iso()
+        retry_at = (
+            (datetime.now(UTC) + timedelta(seconds=retry_delay_seconds)).isoformat(
+                timespec="milliseconds"
+            )
+            if status == "RETRY_WAIT" and retry_delay_seconds else None
+        )
         with self._transaction() as cursor:
             cursor.execute(
                 """
                 UPDATE detail_work_unit
-                SET status = ?, lease_until = NULL, finished_at = ?
+                SET status = ?, lease_until = ?, finished_at = ?
                 WHERE id = ? AND status = 'RUNNING'
                 """,
-                (status, now, work_unit.id),
+                (status, retry_at, now, work_unit.id),
             )
             cursor.execute(
                 """

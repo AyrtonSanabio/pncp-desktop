@@ -34,8 +34,8 @@ class SyncConfig:
             raise ValueError("O timeout deve ser positivo.")
         if self.max_retries < 1:
             raise ValueError("O número de tentativas deve ser positivo.")
-        if self.max_concurrent < 1 or self.max_concurrent > 4:
-            raise ValueError("A concorrência deve ficar entre 1 e 4.")
+        if self.max_concurrent < 1 or self.max_concurrent > 8:
+            raise ValueError("A concorrência deve ficar entre 1 e 8.")
         if not 1 <= self.publication_page_size <= 500:
             raise ValueError("O tamanho da página deve ficar entre 1 e 500.")
         if self.max_window_days < 1:

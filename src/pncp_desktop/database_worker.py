@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from threading import Event
 from typing import Any
 
 from PySide6.QtCore import QThread, Signal
@@ -10,6 +11,7 @@ from pncp_desktop.local_database import LocalDatabase
 class DatabaseTaskThread(QThread):
     completed = Signal(str, object)
     failed = Signal(str, str)
+    progress = Signal(str, int, int)
 
     def __init__(
         self,
@@ -23,10 +25,16 @@ class DatabaseTaskThread(QThread):
         self.database = database
         self.action = action
         self.arguments = arguments or {}
+        self._cancelled = Event()
+
+    def cancel_backup(self) -> None:
+        if self.action == "create_backup":
+            self._cancelled.set()
 
     def run(self) -> None:
         try:
             actions = {
+                "recalculate_progress": "recalculate_progress",
                 "snapshot": "snapshot",
                 "advanced_search": "advanced_search",
                 "advanced_search_all": "advanced_search_all",
@@ -59,7 +67,10 @@ class DatabaseTaskThread(QThread):
                 raise RuntimeError(
                     f"O banco desta versão ainda não oferece a operação {self.action}."
                 )
-            result = method(**self.arguments)
+            arguments = dict(self.arguments)
+            if self.action == "create_backup":
+                arguments.update(progress=self.progress.emit, cancelled=self._cancelled.is_set)
+            result = method(**arguments)
         except Exception as exc:
             self.failed.emit(self.action, f"{type(exc).__name__}: {exc}")
             return

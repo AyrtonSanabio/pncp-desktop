@@ -4,6 +4,10 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Any
 
+PUBLICATIONS = "contratacoes_publicacao"
+NEW_PUBLICATIONS = "contratacoes_publicacao_incremental"
+UPDATES = "contratacoes_atualizacao"
+
 
 def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds")
@@ -14,8 +18,11 @@ class SyncWindow:
     data_inicial: date
     data_final: date
     modalidade: int
+    resource: str = PUBLICATIONS
 
     def validate(self, *, max_days: int) -> None:
+        if self.resource not in {PUBLICATIONS, NEW_PUBLICATIONS, UPDATES}:
+            raise ValueError("Recurso de sincronização desconhecido.")
         if self.data_inicial > self.data_final:
             raise ValueError("A data inicial não pode ser posterior à data final.")
         days = (self.data_final - self.data_inicial).days + 1
@@ -26,7 +33,16 @@ class SyncWindow:
 
     @property
     def key(self) -> str:
-        return f"{self.data_inicial.isoformat()}:{self.data_final.isoformat()}:{self.modalidade}"
+        return (
+            f"{self.resource}:{self.data_inicial.isoformat()}:"
+            f"{self.data_final.isoformat()}:{self.modalidade}"
+        )
+
+    @property
+    def endpoint(self) -> str:
+        if self.resource == UPDATES:
+            return "/contratacoes/atualizacao"
+        return "/contratacoes/publicacao"
 
 
 @dataclass(frozen=True, slots=True)

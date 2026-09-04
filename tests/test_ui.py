@@ -93,6 +93,52 @@ def test_local_rows_keep_cnpj_and_object_in_their_columns(tmp_path) -> None:
     app.processEvents()
 
 
+def test_local_search_has_exact_pncp_identifier_filter(tmp_path) -> None:
+    app = _app()
+    window = MainWindow(tmp_path / "identifier.sqlite3")
+    queued = []
+    window._queue_database_task = lambda action, **kwargs: queued.append((action, kwargs))
+    window._local_page = 4
+    window.local_identificador.setText("12345678000190-1-000001/2026")
+
+    window.pesquisar_banco_local()
+
+    assert window._local_page == 1
+    assert queued[-1][0] == "advanced_search"
+    assert queued[-1][1]["filters"]["identificador"] == (
+        "12345678000190-1-000001/2026"
+    )
+    assert "identificador completo" in window.local_identificador.toolTip().casefold()
+    window.pagina_local_proxima()
+    assert queued[-1][1]["page"] == 2
+    window.close()
+    app.processEvents()
+
+
+def test_backup_button_completes_in_background_and_reports_verified_path(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QFileDialog
+
+    app = _app()
+    window = MainWindow(tmp_path / "backup-ui.sqlite3")
+    destination = tmp_path / "verified-copy.sqlite3"
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName", lambda *args: (str(destination), "SQLite (*.sqlite3)")
+    )
+    window.botao_backup.click()
+    assert not window.botao_backup.isEnabled()
+    assert window.botao_cancelar_backup.isEnabled()
+    assert window._database_worker.wait(5000)
+    app.processEvents()
+    assert destination.exists()
+    assert "Backup concluído e verificado" in window.manutencao_status.text()
+    assert str(destination) in window.manutencao_status.text()
+    assert window.backup_progresso.value() == 100
+    assert window.botao_backup.isEnabled()
+    assert not window.botao_cancelar_backup.isEnabled()
+    window.close()
+    app.processEvents()
+
+
 def test_detail_dialog_has_general_extra_and_items_tabs() -> None:
     app = _app()
     detail = {"contratacao": {"numero_controle_pncp": "123"}, "itens": []}
@@ -144,6 +190,108 @@ def test_incremental_update_overlaps_last_completed_day(tmp_path) -> None:
     assert window.sync_data_final.date().toPython() == date.today()
     assert estimated.is_set()
     window.close()
+
+
+def test_incremental_button_starts_dedicated_worker_without_estimation(tmp_path, monkeypatch):
+    from pncp_desktop.sync_worker import SyncTaskThread
+
+    app = _app()
+    window = MainWindow(tmp_path / "incremental-ui.sqlite3")
+    started = []
+    monkeypatch.setattr(SyncTaskThread, "start", lambda self: started.append(self.action))
+    window.botao_atualizar_desde_ultima.click()
+    assert started == ["incremental"]
+    assert window._sync_worker.modalidades == tuple(range(1, 16))
+    assert window._sync_worker.target_date == date.today()
+    assert window._sync_worker.update_to_today is True
+    assert window._sync_worker.include_details is False
+    assert window._sync_incremental_mode is True
+    assert window.botao_pausar.isEnabled()
+    assert not window.botao_atualizar_desde_ultima.isEnabled()
+    window._sync_finalizado()
+    window.close()
+    app.processEvents()
+
+
+def test_incremental_manual_pause_survives_restart_and_completion_race(tmp_path):
+    from pncp_sync.application.incremental import PREFERENCE
+    from pncp_sync.domain.models import UPDATES, utc_now_iso
+    from tests.test_sync_worker import _summary
+
+    app = _app()
+    path = tmp_path / "incremental-pause.sqlite3"
+    window = MainWindow(path)
+    window._local_database.set_preference(PREFERENCE, {
+        "baselines": {},
+        "session": {
+            "active": True, "manual_pause": False, "created_at": utc_now_iso(),
+            "page_size": 50, "windows": [
+                {"start": "2026-09-02", "end": "2026-09-03",
+                 "modalidade": 6, "resource": UPDATES},
+            ],
+        },
+    })
+    window._sync_incremental_mode = True
+    window._sync_manual_pause_requested = True
+    window._sync_concluido(_summary("COMPLETED", done=3), None)
+    state = window._local_database.get_preference(PREFERENCE, {})
+    assert state["session"]["manual_pause"] is True
+    assert state["session"]["active"] is True
+    window.close()
+    app.processEvents()
+    reopened = MainWindow(path)
+    assert reopened._sync_incremental_mode is True
+    assert reopened.botao_continuar.isEnabled()
+    assert reopened._sync_worker is None
+    reopened.close()
+    app.processEvents()
+
+
+def test_recovery_button_runs_separately_and_is_disabled_while_syncing(tmp_path, monkeypatch):
+    from pncp_desktop.sync_worker import SyncTaskThread
+
+    app = _app()
+    window = MainWindow(tmp_path / "recovery-button.sqlite3")
+    started = []
+    monkeypatch.setattr(SyncTaskThread, "start", lambda self: started.append(self.action))
+    window._set_sync_busy(True)
+    assert not window.botao_recuperar_falhas.isEnabled()
+    window.botao_recuperar_falhas.click()
+    assert started == []
+    window._set_sync_busy(False)
+    window.botao_recuperar_falhas.click()
+    assert started == ["recover_failures"]
+    assert window._sync_worker.include_details is False
+    assert window._sync_recovery_mode
+    window._sync_finalizado()
+    window.close()
+    app.processEvents()
+
+
+def test_paused_history_does_not_hide_incremental_session_after_restart(tmp_path):
+    from pncp_sync.application.incremental import PREFERENCE
+    from pncp_sync.domain.models import UPDATES, utc_now_iso
+
+    app = _app()
+    path = tmp_path / "two-sessions.sqlite3"
+    first = MainWindow(path)
+    first._local_database.set_preference("sync.full_session.v1", {
+        "active": True, "manual_pause": True,
+        "scope_start": "2021-01-01", "scope_end": "2026-08-28",
+    })
+    first._local_database.set_preference(PREFERENCE, {
+        "baselines": {}, "session": {"active": True, "manual_pause": False,
+            "created_at": utc_now_iso(), "page_size": 50, "windows": [
+                {"start": "2026-09-03", "end": "2026-09-04", "modalidade": 6,
+                 "resource": UPDATES},
+            ]},
+    })
+    first.close()
+    second = MainWindow(path)
+    assert second._sync_incremental_mode
+    assert second._local_database.get_preference("sync.full_session.v1")["manual_pause"]
+    second.close()
+    app.processEvents()
 
 
 def test_diagnostics_dialog_exposes_errors_rejections_and_model_validation() -> None:
@@ -425,6 +573,9 @@ def test_sync_concurrency_is_opt_in_and_can_reach_four(tmp_path) -> None:
         window.sync_concorrencia.setCurrentIndex(window.sync_concorrencia.findData(4))
         assert window._sync_config().max_concurrent == 4
         assert "experimental" in window.sync_concorrencia.currentText()
+        window.sync_concorrencia.setCurrentIndex(window.sync_concorrencia.findData(8))
+        assert window._sync_config().max_concurrent == 8
+        assert "experimental" in window.sync_concorrencia.currentText()
     finally:
         window.close()
         if previous is None:
@@ -520,6 +671,84 @@ def test_full_load_session_survives_restart_and_respects_manual_pause(
         else:
             settings.setValue("sync_concurrency", previous)
         settings.sync()
+        app.processEvents()
+
+
+def test_recent_detail_option_keeps_original_option_and_disables_while_busy(tmp_path):
+    app = _app()
+    settings = QSettings("AyrtonSanabio", "PNCPDesktop")
+    previous = settings.value("details_recent_active_only", None)
+    window = MainWindow(tmp_path / "recent-option.sqlite3")
+    try:
+        window.incluir_detalhes.setChecked(False)
+        assert not window.somente_detalhes_vigentes.isEnabled()
+        window.incluir_detalhes.setChecked(True)
+        assert window.somente_detalhes_vigentes.isEnabled()
+        window.somente_detalhes_vigentes.setChecked(True)
+        window._set_sync_busy(True)
+        assert not window.somente_detalhes_vigentes.isEnabled()
+        window._set_sync_busy(False)
+        assert window.somente_detalhes_vigentes.isEnabled()
+        assert window.incluir_detalhes.isChecked()
+        assert window.somente_detalhes_vigentes.isChecked()
+    finally:
+        window.close()
+        if previous is None:
+            settings.remove("details_recent_active_only")
+        else:
+            settings.setValue("details_recent_active_only", previous)
+        settings.sync()
+        app.processEvents()
+
+
+def test_item_progress_is_separate_and_does_not_count_failures_as_complete(tmp_path):
+    from dataclasses import fields, replace
+
+    from pncp_sync.domain.models import DetailRunSummary
+
+    app = _app()
+    window = MainWindow(tmp_path / "item-progress.sqlite3")
+    try:
+        values = {field.name: 0 for field in fields(DetailRunSummary)}
+        values.update(detail_run_id="test", status="FAILED", planned_units=10,
+                      succeeded_units=3, pending_units=5, failed_units=1, partial_units=1,
+                      item_records=50, result_records=4)
+        summary = DetailRunSummary(**values)
+        window.sync_progresso.setRange(0, 100)
+        window.sync_progresso.setValue(40)
+        window._sync_progresso("detalhes", summary)
+        assert window.sync_progresso.value() == 40
+        assert window.sync_itens_progresso.value() == 3
+        assert window.sync_itens_progresso.maximum() == 10
+        assert "5 pendentes" in window.sync_itens_resumo.text()
+        assert "1 com falha" in window.sync_itens_resumo.text()
+        assert "50 itens" in window.sync_itens_resumo.text()
+        window._atualizar_progresso_itens(replace(summary, planned_units=20))
+        assert window.sync_itens_progresso.maximum() == 20
+        assert window.sync_itens_progresso.value() == 3
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_sync_controls_remain_readable_in_small_window(tmp_path) -> None:
+    from PySide6.QtWidgets import QScrollArea
+
+    app = _app()
+    window = MainWindow(tmp_path / "small-window.sqlite3")
+    try:
+        window.resize(1280, 720)
+        window.abas.setCurrentIndex(2)
+        window.show()
+        app.processEvents()
+        scroll = window.abas.widget(2)
+        assert isinstance(scroll, QScrollArea)
+        for button in (window.botao_sincronizar, window.botao_recalcular,
+                       window.botao_recuperar_falhas):
+            assert button.height() >= button.sizeHint().height()
+        assert scroll.verticalScrollBar().maximum() > 0
+    finally:
+        window.close()
         app.processEvents()
 
 

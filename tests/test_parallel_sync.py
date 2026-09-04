@@ -38,6 +38,35 @@ class ConcurrentSource:
             self.active -= 1
 
 
+def test_concurrency_requires_repeated_distinct_failures_and_recovers():
+    state = parallel_module.ConcurrencyState(8, 4)
+    assert not state.observe({("a", 2)}, 3)
+    assert state.current == 4
+    assert not state.observe({("a", 2)}, 0)
+    assert state.current == 4  # A mesma página não prova sobrecarga geral.
+    assert state.observe({("b", 3)}, 0)
+    assert state.current == 3
+    state.observe({("c", 4)}, 0)
+    state.observe({("d", 5)}, 0)
+    assert state.current == 2
+    state.observe(set(), 8)
+    assert state.current == 3
+    state.observe({("e", 6)}, 0, rate_limited=True)
+    assert state.current == 2
+
+
+def test_retry_after_is_preserved():
+    import httpx
+    from pypncp import RateLimitError
+
+    from pncp_sync.adapters.pypncp_source import PypncpSource
+    from pncp_sync.application.run_sync import _retry_delay_seconds
+
+    with pytest.raises(RateLimitError) as caught:
+        PypncpSource._raise_on_error(httpx.Response(429, headers={"Retry-After": "120"}))
+    assert _retry_delay_seconds(caught.value, 1) == 120
+
+
 class FailOnceSource:
     def __init__(self, pages: dict[int, SourcePage]) -> None:
         self.pages = pages
@@ -140,6 +169,31 @@ async def test_parallel_runner_ramps_to_four_and_keeps_individual_checkpoints(
 
 
 @pytest.mark.asyncio
+async def test_eight_is_reached_without_duplicate_records(tmp_path):
+    source = ConcurrentSource(_pages(90))
+    config = _config(tmp_path / "eight.sqlite3", concurrency=8)
+    plan = await plan_sync(config, SyncWindow(date(2026, 8, 1), date(2026, 8, 1), 6),
+                           source=source)
+    state = parallel_module.ConcurrencyState(8)
+    await run_sync_parallel(config, plan.run_id, source=source,
+                            concurrency_state=state, max_pages=24)
+    saved_level = state.current
+    assert saved_level > 2
+    summary = await run_sync_parallel(config, plan.run_id, source=source,
+                                      concurrency_state=state)
+    assert source.max_active == 8
+    assert summary.records_inserted == 90
+    assert summary.succeeded_units == 90
+    assert max(Counter(source.calls).values()) == 1
+
+
+def test_concurrency_limit_eight(tmp_path):
+    assert _config(tmp_path / "valid.sqlite3", concurrency=8).max_concurrent == 8
+    with pytest.raises(ValueError):
+        _config(tmp_path / "invalid.sqlite3", concurrency=9)
+
+
+@pytest.mark.asyncio
 async def test_parallel_recovery_starts_with_one_and_ramps_only_after_successes(
     tmp_path: Path,
 ) -> None:
@@ -165,7 +219,7 @@ async def test_parallel_recovery_starts_with_one_and_ramps_only_after_successes(
 
 
 @pytest.mark.asyncio
-async def test_parallel_runner_drops_to_one_and_retries_without_gaps(
+async def test_parallel_runner_keeps_concurrency_after_isolated_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     pages = _pages(6)
@@ -190,7 +244,7 @@ async def test_parallel_runner_drops_to_one_and_retries_without_gaps(
     assert summary.succeeded_units == 6
     assert summary.failed_units == 0
     assert source.calls[2] == 2
-    assert any("reduzida automaticamente para 1" in message for message in messages)
+    assert not any("reduzida" in message for message in messages)
     with SyncRepository(config.db_path) as repository:
         assert repository.count_contratacoes() == 6
         assert repository.verify(plan.run_id)["ok"] is True
@@ -253,9 +307,9 @@ async def test_parallel_stops_after_failed_batch_without_limiting_healthy_runs(
         stop_after_failed_batch=True,
     )
 
-    assert source.calls == [1, 2]
+    assert source.calls == [1, 2, 3, 4, 5, 6]
     assert summary.failed_units == 1
-    assert summary.pending_units == 4
+    assert summary.pending_units == 0
     assert summary.status == "FAILED"
 
 

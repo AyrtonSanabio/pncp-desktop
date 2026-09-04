@@ -5,6 +5,7 @@
 O caminho principal usa os endpoints públicos do PNCP por meio do `pypncp`:
 
 - consulta de contratações por data de publicação e modalidade;
+- consulta de contratações por data de atualização global (`/contratacoes/atualizacao`);
 - itens de uma contratação;
 - resultados de itens e fornecedores;
 - contratos/empenhos;
@@ -12,6 +13,11 @@ O caminho principal usa os endpoints públicos do PNCP por meio do `pypncp`:
 
 As URLs configuradas usam HTTPS. A resposta HTTP original é capturada antes da normalização
 para que campos não representados pelo modelo Python não sejam perdidos.
+
+Os endpoints de publicação e atualização global são chamados diretamente com HTTPX e
+validados com os modelos do pypncp. A atualização global pertence à contratação principal;
+ela não baixa automaticamente os detalhes de itens e fornecedores. O comportamento de
+cursores, sobreposição e retomada está em [Sincronização e recuperação](SINCRONIZACAO_E_RECUPERACAO.md#atualização-incremental-novas-e-retificadas).
 
 ## Dados de contratação
 

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
 
 from pncp_desktop.local_database import LocalDatabase
+from pncp_sync.persistence.backup import BackupCancelled
 from pncp_sync.persistence.data_services import DataServices
 from pncp_sync.persistence.repositories import SyncRepository
 from pncp_sync.persistence.schema import MIGRATION_V1, MIGRATION_V2
@@ -14,7 +16,7 @@ from pncp_sync.persistence.schema import MIGRATION_V1, MIGRATION_V2
 def _database_with_contract(path: Path) -> LocalDatabase:
     database = LocalDatabase(path)
     database.ensure_ready()
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         now = "2026-08-20T00:00:00+00:00"
         connection.execute(
             """INSERT INTO ingestion_run(
@@ -105,6 +107,12 @@ def test_advanced_search_saved_query_synonyms_and_documents(tmp_path: Path) -> N
         )
         assert page.total == 1
         assert page.rows[0]["numero_controle_pncp"] == "PNCP-1"
+        exact = service.advanced_search(filters={"identificador": "  PNCP-1  "})
+        assert exact.total == 1
+        assert service.advanced_search(filters={"identificador": "PNCP-10"}).total == 0
+        assert service.advanced_search(
+            filters={"identificador": "PNCP-1", "municipio": "Outra cidade"}
+        ).total == 0
         query_id = service.save_query("Oportunidades TI", {"municipio": "Recife"})
         assert query_id > 0
         assert service.saved_queries()[0]["filters"] == {"municipio": "Recife"}
@@ -134,6 +142,45 @@ def test_economic_semantic_index_and_backup(tmp_path: Path) -> None:
     assert database.quick_check()["ok"]
     with pytest.raises(FileExistsError):
         database.create_backup(backup)
+
+
+def test_backup_reports_progress_can_be_cancelled_and_never_replaces_source(
+    tmp_path: Path,
+) -> None:
+    database = _database_with_contract(tmp_path / "main.sqlite3")
+    source_before = database.db_path.read_bytes()
+    target = tmp_path / "copy.sqlite3"
+    progress: list[tuple[str, int, int]] = []
+
+    copy = database.create_backup(
+        target, progress=lambda stage, done, total: progress.append((stage, done, total))
+    )
+
+    assert copy == target
+    assert any(stage == "Copiando páginas do banco" for stage, _, _ in progress)
+    assert any(stage == "Verificando integridade da cópia" for stage, _, _ in progress)
+    assert database.db_path.read_bytes() == source_before
+    with sqlite3.connect(copy) as connection:
+        assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert connection.execute("SELECT COUNT(*) FROM contratacao").fetchone()[0] == 1
+
+    cancelled_target = tmp_path / "cancelled.sqlite3"
+    cancel = False
+
+    def request_cancel(_stage: str, _done: int, _total: int) -> None:
+        nonlocal cancel
+        cancel = True
+
+    with pytest.raises(BackupCancelled):
+        database.create_backup(
+            cancelled_target, progress=request_cancel, cancelled=lambda: cancel
+        )
+    assert not cancelled_target.exists()
+    assert not list(tmp_path.glob("*.partial"))
+    assert database.db_path.read_bytes() == source_before
+
+    with pytest.raises(ValueError):
+        database.create_backup(database.db_path)
 
 
 def test_import_new_database_is_idempotent_and_creates_backup(tmp_path: Path) -> None:

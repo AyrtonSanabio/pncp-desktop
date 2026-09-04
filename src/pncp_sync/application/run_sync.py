@@ -11,12 +11,26 @@ from pypncp import AuthError, NotFoundError, PNCPError, ValidationError
 
 from pncp_sync.adapters.pypncp_source import PypncpSource, SourceError, SourceProtocol
 from pncp_sync.config import SyncConfig
-from pncp_sync.domain.models import RunSummary, SyncWindow, WorkUnit
+from pncp_sync.domain.models import PUBLICATIONS, RunSummary, SourcePage, SyncWindow, WorkUnit
 from pncp_sync.persistence.repositories import PersistResult, SyncRepository
 
 ProgressCallback = Callable[[WorkUnit, PersistResult], Any]
 ActivityCallback = Callable[[WorkUnit], Any]
 StatusCallback = Callable[[str], Any]
+
+
+def _validate_incremental_page(page: SourcePage, expected: tuple[int, int] | None) -> None:
+    if expected is None:
+        return
+    if (page.total_pages, page.total_records) != expected:
+        raise SourceError(
+            "A paginação incremental mudou durante a consulta. A data não será avançada; "
+            "execute uma nova atualização para reler o intervalo."
+        )
+    if page.total_records and not page.records:
+        raise SourceError(
+            "Página incremental vazia com registros pendentes; cobertura não confirmada."
+        )
 
 
 def _normalized_error_message(exc: PNCPError) -> str:
@@ -54,7 +68,7 @@ def _is_rate_limited(exc: PNCPError) -> bool:
 def _retry_delay_seconds(exc: PNCPError, attempt_count: int) -> int:
     """Respeita uma pausa longa quando o PNCP aplica limitação HTTP 429."""
     if _is_rate_limited(exc):
-        return 60
+        return max(60, getattr(exc, "retry_after_seconds", 60))
     return min(2 ** max(0, attempt_count - 1), 30)
 
 
@@ -78,6 +92,9 @@ async def run_sync(
             replace(config, publication_page_size=run_page_size)
         )
         window = repository.get_window(run_id)
+        expected_totals = (
+            repository.get_run_totals(run_id) if window.resource != PUBLICATIONS else None
+        )
         window.validate(max_days=config.max_window_days)
         requirements = repository.get_plan_requirements(run_id)
         free_disk = shutil.disk_usage(config.db_path.parent).free
@@ -106,6 +123,7 @@ async def run_sync(
                             work_unit.data_inicial,
                             work_unit.data_final,
                             work_unit.modalidade,
+                            resource=work_unit.resource,
                         ),
                         work_unit.page_number,
                     )
@@ -116,6 +134,7 @@ async def run_sync(
                     raise SourceError(
                         f"Esperada página {work_unit.page_number}, recebida {page.page_number}."
                     )
+                _validate_incremental_page(page, expected_totals)
                 result = repository.persist_page(
                     work_unit,
                     page,

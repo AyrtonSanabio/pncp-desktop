@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from pypncp import PNCPError
 
@@ -14,13 +14,45 @@ from pncp_sync.application.run_sync import (
     _is_rate_limited,
     _is_recoverable,
     _retry_delay_seconds,
+    _validate_incremental_page,
     run_sync,
 )
 from pncp_sync.config import SyncConfig
-from pncp_sync.domain.models import RunSummary, SourcePage, SyncWindow, WorkUnit
+from pncp_sync.domain.models import PUBLICATIONS, RunSummary, SourcePage, SyncWindow, WorkUnit
 from pncp_sync.persistence.repositories import PersistResult, SyncRepository
 
 _SUCCESSFUL_PAGES_TO_RAMP = 8
+
+
+@dataclass
+class ConcurrencyState:
+    """Estado adaptativo compartilhado entre lotes de uma mesma carga."""
+
+    limit: int
+    current: int = 2
+    successes: int = 0
+    failed_batches: int = 0
+    failed_pages: set[tuple[str, int]] = field(default_factory=set)
+
+    def observe(self, failures: set[tuple[str, int]], successes: int,
+                *, rate_limited: bool = False) -> bool:
+        previous = self.current
+        if failures:
+            self.successes = 0
+            self.failed_batches += 1
+            self.failed_pages.update(failures)
+            if rate_limited or (self.failed_batches >= 2 and len(self.failed_pages) >= 2):
+                self.current = max(1, self.current - 1)
+                self.failed_batches = 0
+                self.failed_pages.clear()
+        else:
+            self.failed_batches = 0
+            self.failed_pages.clear()
+            self.successes += successes
+            if self.successes >= _SUCCESSFUL_PAGES_TO_RAMP:
+                self.current = min(self.limit, self.current + 1)
+                self.successes = 0
+        return previous != self.current
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +67,7 @@ async def run_sync_parallel(
     *,
     source: SourceProtocol | None = None,
     initial_concurrency: int | None = None,
+    concurrency_state: ConcurrencyState | None = None,
     max_pages: int | None = None,
     stop_after_failed_batch: bool = False,
     progress: ProgressCallback | None = None,
@@ -71,7 +104,9 @@ async def run_sync_parallel(
         if initial_concurrency is not None
         else min(2, target_concurrency)
     )
-    successful_streak = 0
+    controller = concurrency_state or ConcurrencyState(target_concurrency, current_concurrency)
+    if controller.limit != target_concurrency or not 1 <= controller.current <= target_concurrency:
+        raise ValueError("Estado de concorrência incompatível com o limite configurado.")
     processed = 0
 
     with SyncRepository(config.db_path, lease_seconds=config.lease_seconds) as repository:
@@ -80,6 +115,9 @@ async def run_sync_parallel(
             replace(config, publication_page_size=run_page_size)
         )
         window = repository.get_window(run_id)
+        expected_totals = (
+            repository.get_run_totals(run_id) if window.resource != PUBLICATIONS else None
+        )
         window.validate(max_days=config.max_window_days)
         requirements = repository.get_plan_requirements(run_id)
         free_disk = shutil.disk_usage(config.db_path.parent).free
@@ -90,7 +128,7 @@ async def run_sync_parallel(
             )
 
         while max_pages is None or processed < max_pages:
-            capacity = current_concurrency
+            capacity = controller.current
             if max_pages is not None:
                 capacity = min(capacity, max_pages - processed)
 
@@ -133,6 +171,7 @@ async def run_sync_parallel(
                         work_unit.data_inicial,
                         work_unit.data_final,
                         work_unit.modalidade,
+                        resource=work_unit.resource,
                     ),
                     work_unit.page_number,
                 )
@@ -213,6 +252,7 @@ async def run_sync_parallel(
                             f"Esperada página {work_unit.page_number}, "
                             f"recebida {page.page_number}."
                         )
+                    _validate_incremental_page(page, expected_totals)
                     result: PersistResult = repository.persist_page(
                         work_unit,
                         page,
@@ -253,38 +293,35 @@ async def run_sync_parallel(
                 isinstance(outcome, PNCPError) and _is_rate_limited(outcome)
                 for outcome in outcomes
             )
-            if had_failure:
-                successful_streak = 0
-                if current_concurrency != 1 and status is not None:
-                    status(
-                        "O PNCP apresentou falha; concorrência reduzida automaticamente "
-                        "para 1 até a conexão estabilizar."
-                    )
-                current_concurrency = 1
-            else:
-                successful_streak += batch_successes
-                if (
-                    current_concurrency < target_concurrency
-                    and successful_streak >= _SUCCESSFUL_PAGES_TO_RAMP
-                ):
-                    current_concurrency += 1
-                    successful_streak = 0
-                    if status is not None:
-                        status(
-                            "Conexão estável: concorrência aumentada para "
-                            f"{current_concurrency}/{target_concurrency}."
-                        )
+            network_failures = {
+                (run_id, unit.page_number)
+                for (unit, _), outcome in zip(claimed, outcomes, strict=True)
+                if isinstance(outcome, PNCPError) and _is_recoverable(outcome)
+            }
+            previous_concurrency = controller.current
+            changed = controller.observe(network_failures, batch_successes,
+                                         rate_limited=rate_limited)
+            reduced = controller.current < previous_concurrency
+            if changed and status is not None:
+                direction = "reduzida" if reduced else "aumentada"
+                status(f"Concorrência: concorrência {direction} para "
+                       f"{controller.current}/{target_concurrency}.")
 
             if fatal_failure is not None:
                 raise fatal_failure
-            if stop_after_failed_batch and had_failure:
+            if stop_after_failed_batch and had_failure and (
+                batch_successes == 0 or rate_limited or reduced
+            ):
                 if status is not None:
                     status(
                         "Lote adiado após a falha do grupo atual; os checkpoints "
                         "pendentes irão para o fim do rodízio."
                     )
                 if rate_limited:
-                    delay = _retry_delay_seconds(PNCPError("HTTP 429"), 1)
+                    delay = max(
+                        _retry_delay_seconds(outcome, 1) for outcome in outcomes
+                        if isinstance(outcome, PNCPError) and _is_rate_limited(outcome)
+                    )
                     if status is not None:
                         status(
                             "O PNCP aplicou limite HTTP 429. A carga inteira aguardará "
@@ -293,8 +330,13 @@ async def run_sync_parallel(
                         )
                     await asyncio.sleep(delay)
                 return repository.get_summary(run_id)
-            if retry_delays:
-                delay = max(retry_delays)
+            if rate_limited or (retry_delays and batch_successes == 0):
+                delay = max(retry_delays or [60])
+                if rate_limited:
+                    delay = max(delay, *(
+                        _retry_delay_seconds(outcome, 1) for outcome in outcomes
+                        if isinstance(outcome, PNCPError) and _is_rate_limited(outcome)
+                    ))
                 if status is not None:
                     reason = (
                         "limite HTTP 429"
@@ -303,7 +345,7 @@ async def run_sync_parallel(
                     )
                     status(
                         f"Modo acelerado suspenso por {reason}; nova tentativa em "
-                        f"{delay} s com uma página por vez."
+                        f"{delay} s; limite atual de {controller.current} página(s)."
                     )
                 await asyncio.sleep(delay)
 
