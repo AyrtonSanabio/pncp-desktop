@@ -946,6 +946,8 @@ class SyncTaskThread(QThread):
         if self._full_stored_records is None:
             with SyncRepository(self.config.db_path) as repository:
                 self._full_stored_records = repository.count_contratacoes()
+        with SyncRepository(self.config.db_path) as repository:
+            queue = repository.get_global_work_unit_status_counts()
         stored_records = self._full_stored_records
         self.full_progress.emit(
             FullSyncProgress(
@@ -962,6 +964,10 @@ class SyncTaskThread(QThread):
                 estimated_total_records=self.estimated_total_records,
                 records_received=records,
                 bytes_received=received,
+                global_running_pages=queue["RUNNING"],
+                global_pending_pages=queue["PENDING"],
+                global_retry_wait_pages=queue["RETRY_WAIT"],
+                global_failed_pages=queue["FAILED"],
             )
         )
 

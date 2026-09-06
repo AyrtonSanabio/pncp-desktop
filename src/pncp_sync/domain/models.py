@@ -68,6 +68,10 @@ class FullSyncProgress:
     estimated_total_records: int | None = None
     records_received: int = 0
     bytes_received: int = 0
+    global_running_pages: int = 0
+    global_pending_pages: int = 0
+    global_retry_wait_pages: int = 0
+    global_failed_pages: int = 0
 
     @property
     def remaining_windows(self) -> int:

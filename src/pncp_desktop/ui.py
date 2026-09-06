@@ -1257,7 +1257,7 @@ class MainWindow(QMainWindow):
         status = QFrame(objectName="statusFrame")
         status_layout = QVBoxLayout(status)
         status_layout.setContentsMargins(16, 12, 16, 12)
-        self.sync_status_label = QLabel("Estime uma janela para preparar uma sincronização.")
+        self.sync_status_label = QLabel("Pronto para sincronizar. A estimativa é opcional.")
         self.sync_status_label.setObjectName("statusTexto")
         self.sync_atividade = QLabel("Nenhum download em andamento.")
         self.sync_atividade.setObjectName("muted")
@@ -1271,6 +1271,16 @@ class MainWindow(QMainWindow):
         self.sync_progresso_resumo.setObjectName("statusTexto")
         self.sync_progresso_resumo.setWordWrap(True)
         self.sync_progresso_resumo.setVisible(False)
+        self.sync_registros_resumo = QLabel(
+            "Registros no banco: aguardando leitura • Quantidade restante: aguardando projeção"
+        )
+        self.sync_registros_resumo.setWordWrap(True)
+        self.sync_registros_resumo.setStyleSheet(
+            "font-size: 14px; font-weight: 700; color: #244f70;"
+        )
+        self.sync_registros_resumo.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
         estimate_grid = QGridLayout()
         estimate_grid.setHorizontalSpacing(24)
         estimate_grid.setVerticalSpacing(6)
@@ -1280,17 +1290,23 @@ class MainWindow(QMainWindow):
         self.sync_estimativa_armazenamento = QLabel("Ainda não calculado")
         for row, (label, field) in enumerate(
             (
-                ("Tempo estimado da carga principal", self.sync_estimativa_tempo),
-                ("Respostas e arquivos", self.sync_estimativa_respostas),
-                ("Registros encontrados", self.sync_estimativa_registros),
-                ("Download e banco", self.sync_estimativa_armazenamento),
+                ("Previsão de duração", self.sync_estimativa_tempo),
+                ("Páginas e respostas", self.sync_estimativa_respostas),
+                ("Registros previstos", self.sync_estimativa_registros),
+                ("Armazenamento previsto", self.sync_estimativa_armazenamento),
             )
         ):
             name = QLabel(label)
             name.setStyleSheet("font-weight: 700; color: #244f70;")
+            field.setWordWrap(True)
             field.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            estimate_grid.addWidget(name, row, 0)
-            estimate_grid.addWidget(field, row, 1)
+            card = QFrame(objectName="cartao")
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(14, 12, 14, 12)
+            card_layout.addWidget(name)
+            card_layout.addWidget(field)
+            estimate_grid.addWidget(card, row // 2, row % 2)
+        estimate_grid.setColumnStretch(0, 1)
         estimate_grid.setColumnStretch(1, 1)
         self.sync_estimativa_detalhes = QLabel(
             "Itens e fornecedores ainda não foram incluídos numa estimativa."
@@ -1318,19 +1334,46 @@ class MainWindow(QMainWindow):
         self.botao_diagnosticos.clicked.connect(self.ver_diagnosticos)
         alerts.addWidget(self.sync_alertas, 1)
         alerts.addWidget(self.botao_diagnosticos)
+        def section(title: str) -> QLabel:
+            heading = QLabel(title)
+            heading.setStyleSheet("font-size: 14px; font-weight: 700; color: #244f70;")
+            heading.setContentsMargins(0, 10, 0, 2)
+            return heading
+
+        for field in (self.sync_status_label, self.sync_atividade,
+                      self.sync_metricas, self.sync_alertas):
+            field.setWordWrap(True)
+            field.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        status_layout.setSpacing(10)
+        status_layout.addWidget(section("Andamento da sincronização"))
         status_layout.addWidget(self.sync_status_label)
         status_layout.addWidget(self.sync_atividade)
         status_layout.addWidget(self.sync_progresso)
+        status_layout.addWidget(self.sync_registros_resumo)
         status_layout.addWidget(self.sync_progresso_resumo)
+        status_layout.addWidget(self.sync_metricas)
+        status_layout.addWidget(section("Pendências e recuperação"))
         self.sync_pendencias_exatas = QLabel("Recalcule para consultar as pendências dos planos atuais.")
         self.sync_pendencias_exatas.setWordWrap(True)
+        self.sync_fila_status = QLabel("Fila ao vivo: aguardando a sincronização iniciar.")
+        self.sync_fila_status.setObjectName("statusTexto")
+        self.sync_fila_status.setWordWrap(True)
+        status_layout.addWidget(self.sync_fila_status)
         status_layout.addWidget(self.sync_pendencias_exatas)
+        status_layout.addLayout(alerts)
+        status_layout.addWidget(section("Planejamento da carga"))
         status_layout.addLayout(estimate_grid)
+        estimate_help = QLabel(
+            "As previsões podem mudar conforme a API responde. "
+            "Páginas recebidas podem conter registros que já existem no banco."
+        )
+        estimate_help.setWordWrap(True)
+        estimate_help.setObjectName("muted")
+        status_layout.addWidget(estimate_help)
+        status_layout.addWidget(section("Itens e fornecedores"))
         status_layout.addWidget(self.sync_estimativa_detalhes)
-        status_layout.addWidget(self.sync_metricas)
         status_layout.addWidget(self.sync_itens_resumo)
         status_layout.addWidget(self.sync_itens_progresso)
-        status_layout.addLayout(alerts)
         layout.addWidget(status)
 
         explanation = QLabel(
@@ -2660,6 +2703,29 @@ class MainWindow(QMainWindow):
 
     def _sync_progresso_carga_completa(self, progress: FullSyncProgress) -> None:
         """Separa o percentual estimado por registros das métricas exatas de execução."""
+        queue_parts = []
+        if progress.global_running_pages:
+            queue_parts.append(f"{progress.global_running_pages} baixando agora")
+        if progress.global_pending_pages:
+            queue_parts.append(f"{progress.global_pending_pages} pendentes")
+        if progress.global_retry_wait_pages:
+            queue_parts.append(f"{progress.global_retry_wait_pages} aguardando retry")
+        if progress.global_failed_pages:
+            queue_parts.append(f"{progress.global_failed_pages} com falha")
+        self.sync_fila_status.setText(
+            "Fila ao vivo: " + " • ".join(queue_parts)
+            if queue_parts else "Fila ao vivo: nenhuma página pendente."
+        )
+        remaining = progress.estimated_records_remaining
+        remaining_text = (
+            f"aprox. {formatar_inteiro(remaining)} faltam"
+            if remaining is not None
+            else "quantidade restante sendo calculada"
+        )
+        self.sync_registros_resumo.setText(
+            f"Registros no banco: {formatar_inteiro(progress.stored_records)} • "
+            f"{remaining_text}"
+        )
         if self._sync_recovery_mode:
             self.sync_progresso_resumo.setVisible(True)
             self.sync_progresso_resumo.setText(
@@ -2678,14 +2744,10 @@ class MainWindow(QMainWindow):
         records_percentage = progress.record_percentage
         if records_percentage is None:
             self.sync_progresso.setRange(0, 1000)
-            self.sync_progresso.setValue(0)
+            operational_percentage = max(0.0, min(100.0, progress.window_percentage))
+            self.sync_progresso.setValue(round(operational_percentage * 10))
             self.sync_progresso.setFormat(
-                "Carga completa — estime o total de registros para calcular %"
-            )
-            records_text = (
-                f"Registros únicos no banco: {formatar_inteiro(progress.stored_records)}; "
-                "total ainda sem "
-                "estimativa. Use Estimar para criar uma projeção por amostragem"
+                f"Carga completa — {operational_percentage:.2f}% dos lotes".replace(".", ",")
             )
         else:
             displayed_percentage = max(0.0, min(100.0, records_percentage))
@@ -2696,65 +2758,45 @@ class MainWindow(QMainWindow):
                     ".", ","
                 )
             )
-            if records_percentage > 100:
-                records_text = (
-                    "Registros únicos no banco: "
-                    f"{formatar_inteiro(progress.stored_records)}; a projeção de "
-                    f"{formatar_inteiro(progress.estimated_total_records or 0)} foi superada "
-                    "e deve ser recalculada"
-                )
-            else:
-                records_text = (
-                    "Registros únicos no banco: "
-                    f"{formatar_inteiro(progress.stored_records)}/aprox. "
-                    f"{formatar_inteiro(progress.estimated_total_records or 0)}; cerca de "
-                    f"{formatar_inteiro(progress.estimated_records_remaining or 0)} "
-                    "faltam pela amostra"
-                )
         self.sync_progresso.setVisible(True)
         self.sync_progresso_resumo.setVisible(True)
 
-        window_text = ""
+        window_text = "Lote atual ainda não iniciado."
         if progress.current_window_index is not None and progress.current_window is not None:
             window = progress.current_window
             window_text = (
-                f" • lote atual {progress.current_window_index}: "
-                f"{window.data_inicial:%d/%m/%Y} a {window.data_final:%d/%m/%Y}, "
-                f"modalidade {window.modalidade}"
+                f"Lote atual: {progress.current_window_index} de {progress.total_windows} • "
+                f"Período: {window.data_inicial:%d/%m/%Y} a {window.data_final:%d/%m/%Y} • "
+                f"Modalidade: {window.modalidade}."
             )
         if progress.current_pages_total:
             page_text = (
-                f" • páginas/respostas do lote: {progress.current_pages_done}/"
-                f"{progress.current_pages_total} confirmadas; "
-                f"{progress.current_pages_remaining} faltam"
+                f" Páginas deste lote: {progress.current_pages_done} de "
+                f"{progress.current_pages_total}; {progress.current_pages_remaining} faltam."
             )
         elif (
             progress.current_window_index is not None
             and progress.current_window_index > progress.completed_windows
         ):
-            page_text = " • quantidade de páginas do lote sendo consultada"
+            page_text = " Consultando quantas páginas existem neste lote."
         else:
             page_text = ""
         failure_text = (
-            f" • {progress.current_failed_pages} página(s) aguardando nova tentativa"
+            f" {progress.current_failed_pages} página(s) aguardando nova tentativa."
             if progress.current_failed_pages
             else ""
         )
         estimated_remaining = progress.estimated_pages_remaining
         global_pages_text = (
-            f" • aprox. {estimated_remaining} respostas faltam no total pela amostra"
+            f" Aproximadamente {estimated_remaining} páginas faltam no total."
             if estimated_remaining is not None
-            else " • o total global de respostas será descoberto lote a lote"
+            else ""
         )
         self.sync_progresso_resumo.setText(
-            f"{records_text}. Lotes: {progress.completed_windows}/"
-            f"{progress.total_windows} percorridos "
-            f"({progress.window_percentage:.1f}% operacional); "
-            f"{progress.remaining_windows} faltam percorrer{window_text}{page_text}"
+            f"{window_text} {progress.remaining_windows} lote(s) ainda faltam."
+            f"{page_text}"
             f"{failure_text}"
-            f"{global_pages_text}. "
-            "O percentual da barra usa registros estimados; lotes e páginas são mostrados "
-            "separadamente. As respostas ficam compactadas dentro do SQLite."
+            f"{global_pages_text}"
         )
 
     @staticmethod

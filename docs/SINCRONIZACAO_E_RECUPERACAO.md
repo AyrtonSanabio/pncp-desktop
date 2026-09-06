@@ -296,3 +296,17 @@ e adiadas com espera progressiva persistida no SQLite, sem teto de três rodadas
 unidades continuam. Falhas definitivas e rejeições permanecem visíveis e não são anunciadas
 como conclusão integral. Fechar ou interromper preserva commits; executar o mesmo comando
 retoma as unidades pendentes. Não há um serviço do sistema que abra o aplicativo sozinho.
+# Organização das informações na interface
+
+A área de informações da aba Sincronização separa andamento, pendências e recuperação,
+planejamento da carga e coleta de itens e fornecedores. As previsões de duração,
+registros, páginas e armazenamento aparecem em quatro cartões. Elas são estimativas
+e podem mudar conforme chegam respostas da API; registros recebidos podem já existir.
+O resumo principal mostra os registros no banco, quantos ainda faltam quando há uma
+estimativa válida, o lote e o período atuais, a modalidade, páginas restantes e porcentagem.
+Se a estimativa ficar menor que a quantidade já armazenada, ela é descartada e o restante
+passa a ser projetado pelo ritmo médio dos lotes efetivamente percorridos.
+O lote, período, modalidade, páginas restantes e porcentagem permanecem visíveis durante
+a carga. Os avisos de falha e o acesso ao diagnóstico também ficam nessa área principal.
+O resumo "Fila ao vivo" apresenta as contagens globais de páginas baixando, pendentes,
+aguardando retry e com falha, atualizadas junto com o progresso.

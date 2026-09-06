@@ -547,6 +547,17 @@ class SyncRepository:
         payload = json.loads(content) if content else {}
         return int(payload.get("totalPaginas", 0)), int(payload.get("totalRegistros", 0))
 
+    def get_global_work_unit_status_counts(self) -> dict[str, int]:
+        """Conta a fila principal inteira para o acompanhamento da interface."""
+        rows = self.connection.execute(
+            "SELECT status,COUNT(*) AS total FROM work_unit GROUP BY status"
+        ).fetchall()
+        counts = {str(row["status"]): int(row["total"]) for row in rows}
+        return {
+            status: counts.get(status, 0)
+            for status in ("RUNNING", "PENDING", "RETRY_WAIT", "FAILED")
+        }
+
     def claim_next_work_unit(self, run_id: str, *, max_attempts: int = 3) -> WorkUnit | None:
         now = datetime.now(UTC)
         lease_until = (now + timedelta(seconds=self.lease_seconds)).isoformat(

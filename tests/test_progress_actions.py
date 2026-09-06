@@ -34,6 +34,19 @@ async def test_recalculate_uses_stored_totals_and_preserves_records(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_global_work_unit_status_counts_exposes_live_queue(tmp_path):
+    config = SyncConfig(db_path=tmp_path / "queue.sqlite3")
+    run_id = await create_source_run(config)
+    with SyncRepository(config.db_path) as repo, repo.connection:
+        unit_id = repo.connection.execute(
+            "SELECT id FROM work_unit WHERE run_id=?", (run_id,)
+        ).fetchone()[0]
+        repo.connection.execute("UPDATE work_unit SET status='RETRY_WAIT' WHERE id=?", (unit_id,))
+        counts = repo.get_global_work_unit_status_counts()
+    assert counts == {"RUNNING": 0, "PENDING": 0, "RETRY_WAIT": 1, "FAILED": 0}
+
+
+@pytest.mark.asyncio
 async def test_update_to_today_preserves_historical_gaps_and_extends_session(tmp_path):
     config = SyncConfig(db_path=tmp_path / "today.sqlite3")
     run_id = await initial(config)

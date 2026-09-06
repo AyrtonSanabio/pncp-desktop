@@ -542,6 +542,10 @@ def test_full_load_progress_shows_global_percentage_and_remaining_pages(tmp_path
         estimated_total_records=1_000_000,
         records_received=170,
         bytes_received=372_800,
+        global_running_pages=3,
+        global_pending_pages=211,
+        global_retry_wait_pages=166,
+        global_failed_pages=1,
     )
 
     window._sync_progresso_carga_completa(progress)
@@ -549,14 +553,37 @@ def test_full_load_progress_shows_global_percentage_and_remaining_pages(tmp_path
     assert window.sync_progresso.maximum() == 1000
     assert window.sync_progresso.value() == 1
     assert "0,10% estimado" in window.sync_progresso.format()
-    assert "1.000/aprox. 1.000.000" in window.sync_progresso_resumo.text()
-    assert "999.000 faltam" in window.sync_progresso_resumo.text()
-    assert "11.2% operacional" in window.sync_progresso_resumo.text()
-    assert "112/1005" in window.sync_progresso_resumo.text()
-    assert "893 faltam" in window.sync_progresso_resumo.text()
+    assert "Registros no banco: 1.000" in window.sync_registros_resumo.text()
+    assert "aprox. 999.000 faltam" in window.sync_registros_resumo.text()
+    assert "Lote atual: 113 de 1005" in window.sync_progresso_resumo.text()
+    assert "Período: 06/08/2021 a 05/09/2021" in window.sync_progresso_resumo.text()
+    assert "893 lote(s) ainda faltam" in window.sync_progresso_resumo.text()
     assert "46 faltam" in window.sync_progresso_resumo.text()
-    assert "126010 respostas faltam" in window.sync_progresso_resumo.text()
-    assert "SQLite" in window.sync_progresso_resumo.text()
+    assert "126010 páginas faltam" in window.sync_progresso_resumo.text()
+    assert "3 baixando agora" in window.sync_fila_status.text()
+    assert "211 pendentes" in window.sync_fila_status.text()
+    assert "166 aguardando retry" in window.sync_fila_status.text()
+    assert "1 com falha" in window.sync_fila_status.text()
+    window.close()
+    app.processEvents()
+
+
+def test_full_load_progress_does_not_show_an_outdated_estimate(tmp_path) -> None:
+    app = _app()
+    window = MainWindow(tmp_path / "surpassed-estimate.sqlite3")
+    progress = FullSyncProgress(
+        total_windows=1005,
+        completed_windows=500,
+        stored_records=1_802_421,
+    )
+
+    window._sync_progresso_carga_completa(progress)
+
+    text = window.sync_registros_resumo.text()
+    assert "1.802.421" in text
+    assert "quantidade restante sendo calculada" in text
+    assert "Projeção anterior" not in text
+    assert "49,75% dos lotes" in window.sync_progresso.format()
     window.close()
     app.processEvents()
 
