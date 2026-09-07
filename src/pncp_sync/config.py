@@ -22,7 +22,10 @@ class SyncConfig:
     lease_seconds: int = 300
     max_response_bytes: int = 25 * 1024 * 1024
     continuous_retry_base_seconds: int = 60
-    continuous_retry_max_seconds: int = 15 * 60
+    # Na fase de recuperação a maior parte da fila já está catalogada. Cinco
+    # minutos preservam uma pausa responsável durante indisponibilidade, sem
+    # deixar a aplicação ociosa por quinze minutos entre sondagens.
+    continuous_retry_max_seconds: int = 5 * 60
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "db_path", Path(self.db_path).expanduser().resolve())

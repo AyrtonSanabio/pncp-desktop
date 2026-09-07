@@ -138,7 +138,7 @@ interface.
 
 O controlador conserva o nível adaptativo entre lotes, sem redução por falha isolada. Três
 varreduras seguidas sem confirmar páginas acionam uma espera cancelável antes do próximo
-lote (60 segundos inicialmente, com crescimento até 15 minutos). Uma página confirmada
+lote (60 segundos inicialmente, com crescimento até 5 minutos). Uma página confirmada
 zera essa sequência de indisponibilidade. O rodízio e os checkpoints são preservados;
 essa espera não equivale a uma pausa manual nem resolve indisponibilidade do servidor PNCP.
 

@@ -72,7 +72,7 @@ memória fica limitado ao teto selecionado, sem relação com o volume nacional.
 
 Falhas recuperáveis passam por duas camadas. Primeiro, a unidade usa tentativas curtas. Se
 elas se esgotarem, o worker reabre apenas unidades cujo último diagnóstico é recuperável,
-aguarda de 1 a 15 minutos e reinicia a rede com concorrência 1. O mesmo ciclo atende cargas
+aguarda de 1 a 5 minutos e reinicia a rede com concorrência 1. O mesmo ciclo atende cargas
 novas, o botão Continuar e a carga nacional.
 
 A intenção da carga nacional também é persistida em `app_preference`: intervalo, recursos
