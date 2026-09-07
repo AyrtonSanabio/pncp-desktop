@@ -36,7 +36,8 @@ def test_default_page_retry_budget_is_not_fragile(tmp_path) -> None:
     config = SyncConfig(db_path=tmp_path / "retries.sqlite3")
 
     assert config.max_retries == 8
-    assert config.continuous_retry_max_seconds == 5 * 60
+    assert config.continuous_retry_base_seconds == 15
+    assert config.continuous_retry_max_seconds == 15
 
 
 @pytest.mark.asyncio
