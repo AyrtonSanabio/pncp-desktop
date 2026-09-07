@@ -497,7 +497,15 @@ class SyncTaskThread(QThread):
     ) -> None:
         """Revisita planejamentos e páginas em rodadas sem inanição."""
         windows = deque(dict.fromkeys(deferred_windows))
-        runs = deque(dict.fromkeys(deferred_runs))
+        # Inclui também execuções antigas que não estavam na lista construída
+        # nesta passagem. Uma modalidade pode ter uma execução posterior
+        # concluída e, ainda assim, conservar páginas pendentes numa janela
+        # histórica anterior. Sem esta leitura global, essas páginas poderiam
+        # ficar fora do rodízio até uma intervenção manual.
+        with SyncRepository(self.config.db_path) as repository:
+            list_recoverable = getattr(repository, "list_recoverable_run_ids", None)
+            globally_recoverable = list_recoverable() if callable(list_recoverable) else ()
+        runs = deque(dict.fromkeys((*deferred_runs, *globally_recoverable)))
         queue: deque[tuple[str, SyncWindow | str]] = deque()
         # Intercala desde a primeira rodada e prioriza páginas já catalogadas.
         while windows or runs:

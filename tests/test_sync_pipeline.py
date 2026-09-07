@@ -536,6 +536,58 @@ async def test_paginas_novas_tem_prioridade_sobre_falha_reaberta(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_global_recovery_includes_old_pending_run_after_newer_run_completes(
+    tmp_path: Path,
+) -> None:
+    """Uma janela antiga pendente não pode sumir atrás de uma execução mais nova."""
+    config = config_for(tmp_path / "global-recovery.sqlite3")
+    pages = {
+        1: make_page([sample_record(1)], page_number=1, total_pages=1, total_records=1),
+    }
+    old_window = SyncWindow(date(2026, 8, 1), date(2026, 8, 1), 6)
+    newer_window = SyncWindow(date(2026, 8, 2), date(2026, 8, 2), 6)
+    old_plan = await plan_sync(config, old_window, source=FakeSource(pages))
+    newer_plan = await plan_sync(config, newer_window, source=FakeSource(pages))
+    await run_sync(config, newer_plan.run_id, source=FakeSource(pages))
+
+    with SyncRepository(config.db_path) as repository:
+        repository.connection.execute(
+            "UPDATE ingestion_run SET status='FAILED' WHERE id=?", (old_plan.run_id,)
+        )
+        repository.connection.commit()
+        assert old_plan.run_id in repository.list_recoverable_run_ids()
+        assert newer_plan.run_id not in repository.list_recoverable_run_ids()
+
+
+@pytest.mark.asyncio
+async def test_claim_records_start_of_each_attempt_for_liveness_diagnostics(
+    tmp_path: Path,
+) -> None:
+    config = config_for(tmp_path / "attempt-start.sqlite3")
+    pages = {
+        1: make_page([sample_record(1)], page_number=1, total_pages=1, total_records=1),
+    }
+    plan = await plan_sync(
+        config, SyncWindow(date(2026, 8, 26), date(2026, 8, 26), 6), source=FakeSource(pages)
+    )
+    with SyncRepository(config.db_path) as repository:
+        first = repository.claim_next_work_unit(plan.run_id)
+        assert first is not None
+        repository.connection.execute(
+            """UPDATE work_unit SET status='PENDING', attempt_count=0,
+               started_at='2000-01-01T00:00:00+00:00' WHERE id=?""",
+            (first.id,),
+        )
+        repository.connection.commit()
+        second = repository.claim_next_work_unit(plan.run_id)
+        assert second is not None
+        started_at = repository.connection.execute(
+            "SELECT started_at FROM work_unit WHERE id=?", (second.id,)
+        ).fetchone()["started_at"]
+        assert started_at != "2000-01-01T00:00:00+00:00"
+
+
+@pytest.mark.asyncio
 async def test_checkpoint_pendente_no_teto_de_tentativas_nao_fica_encalhado(
     tmp_path: Path,
 ) -> None:

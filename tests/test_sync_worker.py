@@ -287,6 +287,9 @@ async def test_deferred_recovery_uses_round_robin_instead_of_starving_other_runs
         def count_recoverable_failed_units(self, run_id: str) -> int:
             return remaining_failures[run_id]
 
+        def get_global_work_unit_status_counts(self) -> dict[str, int]:
+            return {"RUNNING": 0, "PENDING": 0, "RETRY_WAIT": 0, "FAILED": 0}
+
     waits: list[int] = []
 
     async def fake_wait(seconds: int, **_kwargs) -> None:
@@ -354,6 +357,9 @@ async def test_deferred_planning_does_not_block_existing_run(
         def count_recoverable_failed_units(self, _run_id: str) -> int:
             return 0
 
+        def get_global_work_unit_status_counts(self) -> dict[str, int]:
+            return {"RUNNING": 0, "PENDING": 0, "RETRY_WAIT": 0, "FAILED": 0}
+
     async def fake_wait(*_args, **_kwargs) -> None:
         return None
 
@@ -404,6 +410,9 @@ async def test_deferred_window_reusing_queued_run_is_not_downloaded_twice(
 
         def count_recoverable_failed_units(self, _run_id: str) -> int:
             return 0
+
+        def get_global_work_unit_status_counts(self) -> dict[str, int]:
+            return {"RUNNING": 0, "PENDING": 0, "RETRY_WAIT": 0, "FAILED": 0}
 
     monkeypatch.setattr(sync_worker, "SyncRepository", FakeRepository)
     worker = SyncTaskThread(

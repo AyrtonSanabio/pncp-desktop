@@ -558,6 +558,35 @@ class SyncRepository:
             for status in ("RUNNING", "PENDING", "RETRY_WAIT", "FAILED")
         }
 
+    def list_recoverable_run_ids(self) -> tuple[str, ...]:
+        """Lista toda execução que ainda possui trabalho automaticamente retomável.
+
+        A seleção não se limita à execução mais nova de uma modalidade. Isso é
+        importante na carga nacional: uma execução posterior pode já ter sido
+        concluída enquanto uma janela histórica anterior continua com páginas
+        pendentes. Essas páginas não podem ficar invisíveis para o rodízio.
+        """
+        rows = self.connection.execute(
+            """
+            SELECT DISTINCT r.id
+            FROM ingestion_run AS r
+            JOIN work_unit AS w ON w.run_id = r.id
+            WHERE w.status IN ('PENDING', 'RETRY_WAIT')
+               OR (
+                    w.status = 'FAILED'
+                    AND COALESCE((
+                        SELECT e.recoverable
+                        FROM ingestion_error AS e
+                        WHERE e.work_unit_id = w.id
+                        ORDER BY e.id DESC
+                        LIMIT 1
+                    ), 0) = 1
+               )
+            ORDER BY r.created_at, r.id
+            """
+        ).fetchall()
+        return tuple(str(row["id"]) for row in rows)
+
     def claim_next_work_unit(self, run_id: str, *, max_attempts: int = 3) -> WorkUnit | None:
         now = datetime.now(UTC)
         lease_until = (now + timedelta(seconds=self.lease_seconds)).isoformat(
@@ -602,7 +631,7 @@ class SyncRepository:
                 """
                 UPDATE work_unit
                 SET status = 'RUNNING', attempt_count = attempt_count + 1,
-                    lease_until = ?, started_at = COALESCE(started_at, ?)
+                    lease_until = ?, started_at = ?
                 WHERE id = ? AND status IN ('PENDING', 'RETRY_WAIT')
                 """,
                 (lease_until, now_text, row["id"]),
