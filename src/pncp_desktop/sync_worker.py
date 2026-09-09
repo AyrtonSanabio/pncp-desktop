@@ -161,6 +161,15 @@ class SyncTaskThread(QThread):
             loop.close()
 
     async def _execute(self) -> None:
+        if self.action == "run_unplanned":
+            if not self.windows:
+                raise ValueError("Informe o período e a modalidade da sincronização.")
+            plans = [await self._plan_with_retry(window) for window in self.windows]
+            self.run_ids = tuple(plan.run_id for plan in plans)
+            self.run_id = self.run_ids[0]
+            self.action = "run_all"
+            await self._execute()
+            return
         if self.action in {"plan", "plan_all", "plan_sample"}:
             if self.action in {"plan_all", "plan_sample"}:
                 if not self.windows:

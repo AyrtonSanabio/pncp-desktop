@@ -55,6 +55,7 @@ from pncp_desktop.models import (
     formatar_valor,
 )
 from pncp_desktop.services import ErroConsulta, ServicoConsultaContratos
+from pncp_desktop.sync_dashboard import SyncDashboard
 from pncp_desktop.sync_worker import SyncTaskThread
 from pncp_sync.application.incremental import PREFERENCE as INCREMENTAL_PREFERENCE
 from pncp_sync.application.incremental import set_session_status
@@ -973,30 +974,21 @@ class MainWindow(QMainWindow):
             "2. Escolha uma modalidade pelo nome; Pregão eletrônico costuma ter exemplos "
             "variados.\n"
             "3. Desmarque “Baixar itens e fornecedores” no primeiro teste.\n"
-            "4. Clique Estimar e leia tempo, respostas da API, registros e espaço.\n"
-            "5. Clique Sincronizar somente se o volume estiver adequado.\n"
+            "4. Confira as datas selecionadas.\n"
+            "5. Clique Sincronizar e acompanhe baixadas / faltam.\n"
             "6. Abra Banco local, pesquise uma palavra e dê duplo clique numa linha.\n"
             "7. Depois repita uma carga pequena com itens e fornecedores marcados.",
         )
         layout.addWidget(workflow)
 
-        estimate = self._tutorial_card(
-            "Como interpretar a estimativa",
-            "Página é um lote da API. Cada página gera uma resposta, chamada de payload, "
-            "que é comprimida dentro do banco — não são centenas de arquivos soltos. "
-            "O tempo das páginas principais é calculado usando a latência realmente medida "
-            "na primeira resposta. Itens e resultados exigem chamadas adicionais cuja "
-            "quantidade só fica conhecida durante a coleta; por isso são mostrados como um "
-            "mínimo, não como uma promessa exata. Internet, lentidão do PNCP e novas tentativas "
-            "podem aumentar bastante o tempo. Falhas temporárias entram em espera progressiva "
-            "e são tentadas novamente até você usar Pausar. Se a carga completa for interrompida "
-            "por queda ou reinício, o escopo salvo é retomado ao abrir o aplicativo. A barra usa "
-            "registros armazenados sobre o total projetado; lotes e páginas são métricas "
-            "separadas. Em Downloads simultâneos, 1 preserva o caminho conservador e 2, 4 ou 8 "
-            "ativam a rede adaptativa, que reduz gradualmente após falhas repetidas. "
-            "O limite de 8 é experimental; falhas isoladas não reduzem a concorrência.",
-        )
-        layout.addWidget(estimate)
+        layout.addWidget(self._tutorial_card(
+            "Como ler o andamento",
+            "Baixadas / faltam conta páginas conhecidas, sem projeções. Em Itens, cada "
+            "contratação conta uma vez; falhas continuam em faltam. Visitadas inclui falhas. "
+            "O total de itens abrange licitações já no banco, publicadas nos últimos 365 dias "
+            "e ainda abertas para propostas. Publicações não coletadas não entram no total. "
+            "Falhas temporárias entram em espera progressiva; use Pausar para interromper."
+        ))
 
         glossary = self._tutorial_card(
             "Glossário rápido",
@@ -1209,7 +1201,7 @@ class MainWindow(QMainWindow):
         self.botao_estimar.clicked.connect(self.estimar_sincronizacao)
         self.botao_sincronizar = QPushButton("Sincronizar")
         self.botao_sincronizar.setObjectName("primario")
-        self.botao_sincronizar.setEnabled(False)
+        self.botao_sincronizar.setEnabled(True)
         self.botao_sincronizar.clicked.connect(self.iniciar_sincronizacao)
         self.botao_pausar = QPushButton("Pausar")
         self.botao_pausar.setObjectName("perigo")
@@ -1254,127 +1246,33 @@ class MainWindow(QMainWindow):
         grid.setColumnStretch(4, 1)
         layout.addWidget(filters)
 
-        status = QFrame(objectName="statusFrame")
-        status_layout = QVBoxLayout(status)
-        status_layout.setContentsMargins(16, 12, 16, 12)
-        self.sync_status_label = QLabel("Pronto para sincronizar. A estimativa é opcional.")
-        self.sync_status_label.setObjectName("statusTexto")
-        self.sync_atividade = QLabel("Nenhum download em andamento.")
-        self.sync_atividade.setObjectName("muted")
-        self.sync_progresso = QProgressBar()
-        self.sync_progresso.setRange(0, 1)
-        self.sync_progresso.setValue(0)
-        self.sync_progresso.setTextVisible(True)
-        self.sync_progresso.setMinimumHeight(24)
-        self.sync_progresso.setVisible(False)
-        self.sync_progresso_resumo = QLabel("Progresso da carga completa ainda não iniciado.")
-        self.sync_progresso_resumo.setObjectName("statusTexto")
-        self.sync_progresso_resumo.setWordWrap(True)
-        self.sync_progresso_resumo.setVisible(False)
-        self.sync_registros_resumo = QLabel(
-            "Registros no banco: aguardando leitura • Quantidade restante: aguardando projeção"
-        )
-        self.sync_registros_resumo.setWordWrap(True)
-        self.sync_registros_resumo.setStyleSheet(
-            "font-size: 14px; font-weight: 700; color: #244f70;"
-        )
-        self.sync_registros_resumo.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        estimate_grid = QGridLayout()
-        estimate_grid.setHorizontalSpacing(24)
-        estimate_grid.setVerticalSpacing(6)
-        self.sync_estimativa_tempo = QLabel("Ainda não calculado")
-        self.sync_estimativa_respostas = QLabel("Ainda não calculado")
-        self.sync_estimativa_registros = QLabel("Ainda não calculado")
-        self.sync_estimativa_armazenamento = QLabel("Ainda não calculado")
-        for row, (label, field) in enumerate(
-            (
-                ("Previsão de duração", self.sync_estimativa_tempo),
-                ("Páginas e respostas", self.sync_estimativa_respostas),
-                ("Registros previstos", self.sync_estimativa_registros),
-                ("Armazenamento previsto", self.sync_estimativa_armazenamento),
-            )
-        ):
-            name = QLabel(label)
-            name.setStyleSheet("font-weight: 700; color: #244f70;")
-            field.setWordWrap(True)
-            field.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            card = QFrame(objectName="cartao")
-            card_layout = QVBoxLayout(card)
-            card_layout.setContentsMargins(14, 12, 14, 12)
-            card_layout.addWidget(name)
-            card_layout.addWidget(field)
-            estimate_grid.addWidget(card, row // 2, row % 2)
-        estimate_grid.setColumnStretch(0, 1)
-        estimate_grid.setColumnStretch(1, 1)
-        self.sync_estimativa_detalhes = QLabel(
-            "Itens e fornecedores ainda não foram incluídos numa estimativa."
-        )
-        self.sync_estimativa_detalhes.setWordWrap(True)
-        self.sync_estimativa_detalhes.setObjectName("muted")
-        self.sync_metricas = QLabel("Nenhuma execução planejada.")
-        self.sync_metricas.setObjectName("muted")
-        self.sync_itens_resumo = QLabel("Itens e fornecedores: coleta ainda não iniciada.")
-        self.sync_itens_resumo.setWordWrap(True)
-        self.sync_itens_progresso = QProgressBar()
-        self.sync_itens_progresso.setRange(0, 1)
-        self.sync_itens_progresso.setValue(0)
-        self.sync_itens_progresso.setFormat("Itens e resultados — aguardando coleta")
-        self.sync_itens_progresso.setMinimumHeight(24)
-        self.sync_itens_progresso.setToolTip(
-            "Percentual das unidades conhecidas confirmadas sem rejeições. "
-            "Novas páginas e resultados podem aumentar o total durante a coleta."
-        )
-        alerts = QHBoxLayout()
-        self.sync_alertas = QLabel("Erros e validações ainda não verificados.")
-        self.sync_alertas.setObjectName("muted")
+        # Os callbacks legados mantêm seus objetos, fora do painel visível.
+        # O painel usa exclusivamente o snapshot global do SQLite.
+        self._legacy_sync_status = QWidget(self)
+        self._legacy_sync_status.hide()
+        self.sync_status_label = QLabel(self._legacy_sync_status)
+        self.sync_atividade = QLabel(self._legacy_sync_status)
+        self.sync_progresso_resumo = QLabel(self._legacy_sync_status)
+        self.sync_registros_resumo = QLabel(self._legacy_sync_status)
+        self.sync_estimativa_tempo = QLabel(self._legacy_sync_status)
+        self.sync_estimativa_respostas = QLabel(self._legacy_sync_status)
+        self.sync_estimativa_registros = QLabel(self._legacy_sync_status)
+        self.sync_estimativa_armazenamento = QLabel(self._legacy_sync_status)
+        self.sync_estimativa_detalhes = QLabel(self._legacy_sync_status)
+        self.sync_metricas = QLabel(self._legacy_sync_status)
+        self.sync_itens_resumo = QLabel(self._legacy_sync_status)
+        self.sync_alertas = QLabel(self._legacy_sync_status)
+        self.sync_pendencias_exatas = QLabel(self._legacy_sync_status)
+        self.sync_fila_status = QLabel(self._legacy_sync_status)
+        self.sync_progresso = QProgressBar(self._legacy_sync_status)
+        self.sync_itens_progresso = QProgressBar(self._legacy_sync_status)
+        self.botao_estimar.hide()
+        self.botao_recalcular.hide()
+        self.dashboard = SyncDashboard(lambda: self._db_path, self)
+        layout.addWidget(self.dashboard)
         self.botao_diagnosticos = QPushButton("Ver erros e validações")
-        self.botao_diagnosticos.setObjectName("secundario")
         self.botao_diagnosticos.clicked.connect(self.ver_diagnosticos)
-        alerts.addWidget(self.sync_alertas, 1)
-        alerts.addWidget(self.botao_diagnosticos)
-        def section(title: str) -> QLabel:
-            heading = QLabel(title)
-            heading.setStyleSheet("font-size: 14px; font-weight: 700; color: #244f70;")
-            heading.setContentsMargins(0, 10, 0, 2)
-            return heading
-
-        for field in (self.sync_status_label, self.sync_atividade,
-                      self.sync_metricas, self.sync_alertas):
-            field.setWordWrap(True)
-            field.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        status_layout.setSpacing(10)
-        status_layout.addWidget(section("Andamento da sincronização"))
-        status_layout.addWidget(self.sync_status_label)
-        status_layout.addWidget(self.sync_atividade)
-        status_layout.addWidget(self.sync_progresso)
-        status_layout.addWidget(self.sync_registros_resumo)
-        status_layout.addWidget(self.sync_progresso_resumo)
-        status_layout.addWidget(self.sync_metricas)
-        status_layout.addWidget(section("Pendências e recuperação"))
-        self.sync_pendencias_exatas = QLabel("Recalcule para consultar as pendências dos planos atuais.")
-        self.sync_pendencias_exatas.setWordWrap(True)
-        self.sync_fila_status = QLabel("Fila ao vivo: aguardando a sincronização iniciar.")
-        self.sync_fila_status.setObjectName("statusTexto")
-        self.sync_fila_status.setWordWrap(True)
-        status_layout.addWidget(self.sync_fila_status)
-        status_layout.addWidget(self.sync_pendencias_exatas)
-        status_layout.addLayout(alerts)
-        status_layout.addWidget(section("Planejamento da carga"))
-        status_layout.addLayout(estimate_grid)
-        estimate_help = QLabel(
-            "As previsões podem mudar conforme a API responde. "
-            "Páginas recebidas podem conter registros que já existem no banco."
-        )
-        estimate_help.setWordWrap(True)
-        estimate_help.setObjectName("muted")
-        status_layout.addWidget(estimate_help)
-        status_layout.addWidget(section("Itens e fornecedores"))
-        status_layout.addWidget(self.sync_estimativa_detalhes)
-        status_layout.addWidget(self.sync_itens_resumo)
-        status_layout.addWidget(self.sync_itens_progresso)
-        layout.addWidget(status)
+        layout.addWidget(self.botao_diagnosticos)
 
         explanation = QLabel(
             "A sincronização é somente leitura. O payload original é preservado no banco local; "
@@ -1433,15 +1331,14 @@ class MainWindow(QMainWindow):
             self._update_sync_action_feedback()
 
     def _sync_filters_changed(self, *_: object) -> None:
-        if self._sync_plan is None:
-            return
         if self._sync_worker is not None and self._sync_worker.isRunning():
             return
         self._sync_plan = None
+        self._sync_run_id = None
         self._sync_run_ids = ()
         self._sync_can_continue = False
         full_load = self.sync_carga_completa.isChecked()
-        self.botao_sincronizar.setEnabled(full_load)
+        self.botao_sincronizar.setEnabled(True)
         self.botao_continuar.setEnabled(False)
         self.sync_status_label.setText(
             "Carga completa pronta para iniciar sem estimativa. A estimativa opcional usa "
@@ -2366,9 +2263,18 @@ class MainWindow(QMainWindow):
             self._executar_carga_completa()
             return
         if not self._sync_run_id:
-            self.sync_status_label.setText(
-                "Faça uma estimativa para esta sincronização parcial."
+            self._sync_manual_pause_requested = False
+            self._set_sync_busy(True)
+            worker = SyncTaskThread(
+                self._sync_config(), action="run_unplanned", windows=self._sync_windows(),
+                include_details=self.incluir_detalhes.isChecked(),
+                details_recent_active_only=self.somente_detalhes_vigentes.isChecked(),
+                include_contracts=self.incluir_contratos.isChecked(),
+                include_atas=self.incluir_atas.isChecked(), parent=self,
             )
+            self._connect_sync_worker(worker)
+            self._sync_worker = worker
+            worker.start()
             return
         self._executar_sincronizacao()
 
@@ -3007,10 +2913,6 @@ class MainWindow(QMainWindow):
         self.botao_sincronizar.setEnabled(
             not busy
             and not planning
-            and (
-                self.sync_carga_completa.isChecked()
-                or (self._sync_plan is not None and self._sync_space_ok)
-            )
         )
         self.botao_pausar.setText("Cancelar estimativa" if busy and planning else "Pausar")
         self.botao_pausar.setEnabled(busy)
@@ -3468,6 +3370,11 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"{quantidade} registros exportados para {caminho}")
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - API do Qt
+        if self.dashboard.reader is not None and self.dashboard.reader.isRunning():
+            self.dashboard.reader.requestInterruption()
+            if not self.dashboard.reader.wait(1000):
+                event.ignore()
+                return
         if self._worker is not None and self._worker.isRunning():
             self._worker.cancelar()
             if not self._worker.wait(5000):

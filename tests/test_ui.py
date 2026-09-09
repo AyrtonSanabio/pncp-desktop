@@ -34,7 +34,8 @@ def test_main_window_exposes_tutorial_and_three_work_areas(tmp_path) -> None:
         "Sincronização",
         "Banco local",
     ]
-    assert not window.botao_sincronizar.isEnabled()
+    assert window.botao_sincronizar.isEnabled()
+    assert window.botao_estimar.isHidden()
     assert window.botao_estimar.isEnabled()
     assert window.sync_modalidade.currentData() == 12
     tutorial_text = " ".join(label.text() for label in window.findChildren(QLabel))
@@ -357,7 +358,7 @@ def test_plan_estimate_is_explicit_and_filter_change_invalidates_it(tmp_path) ->
 
     window.sync_data_final.setDate(window.sync_data_final.date().addDays(-1))
     assert window._sync_plan is None
-    assert not window.botao_sincronizar.isEnabled()
+    assert window.botao_sincronizar.isEnabled()
     window.close()
     app.processEvents()
 
@@ -371,7 +372,7 @@ def test_duration_format_supports_hours() -> None:
 def test_disabled_sync_buttons_explain_why_and_failure_can_resume(tmp_path) -> None:
     app = _app()
     window = MainWindow(tmp_path / "buttons.sqlite3")
-    assert "clique em Estimar" in window.botao_sincronizar.toolTip()
+    assert window.botao_sincronizar.isEnabled()
     assert "não há uma execução" in window.botao_continuar.toolTip()
 
     window._sync_run_id = "recoverable-run"
