@@ -116,6 +116,29 @@ def test_local_search_has_exact_pncp_identifier_filter(tmp_path) -> None:
     app.processEvents()
 
 
+def test_clear_local_filters_restores_unfiltered_recent_search(tmp_path) -> None:
+    app = _app()
+    window = MainWindow(tmp_path / "clear-filters.sqlite3")
+    window.local_busca.setText("limpeza")
+    window.local_orgao.setText("Prefeitura")
+    window.local_valor_min.setValue(100)
+    window.local_data_inicial.setDate(window.local_data_inicial.minimumDate().addDays(7))
+    window.local_data_final.setDate(window.local_data_final.minimumDate().addYears(1))
+    window.local_ordenacao.setCurrentIndex(window.local_ordenacao.findData("value_desc"))
+
+    window.limpar_filtros_banco_local()
+
+    assert window.local_busca.text() == ""
+    assert window.local_orgao.text() == ""
+    assert window.local_valor_min.value() == 0
+    assert window.local_data_inicial.date() == window.local_data_inicial.minimumDate()
+    assert window.local_data_final.date() == window.local_data_final.minimumDate()
+    assert window.local_ordenacao.currentData() == "recent"
+    assert "Filtros removidos" in window.local_status.text()
+    window.close()
+    app.processEvents()
+
+
 def test_backup_button_completes_in_background_and_reports_verified_path(tmp_path, monkeypatch):
     from PySide6.QtWidgets import QFileDialog
 

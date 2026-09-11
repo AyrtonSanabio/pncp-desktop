@@ -74,9 +74,10 @@ def test_migration_v3_is_additive(tmp_path: Path) -> None:
         connection.execute("PRAGMA user_version=2")
     with SyncRepository(path) as repository:
         assert repository.connection.execute("PRAGMA user_version").fetchone()[0] == 6
-        assert repository.connection.execute(
-            "SELECT page_size FROM ingestion_run LIMIT 1"
-        ).fetchone() is None
+        assert (
+            repository.connection.execute("SELECT page_size FROM ingestion_run LIMIT 1").fetchone()
+            is None
+        )
         assert "page_size" in {
             row[1] for row in repository.connection.execute("PRAGMA table_info(work_unit)")
         }
@@ -96,6 +97,7 @@ def test_advanced_search_saved_query_synonyms_and_documents(tmp_path: Path) -> N
     with database._connect() as connection:  # API de baixo nível testada sem Qt
         service = DataServices(connection)
         service.set_synonyms("assistência em informática", ["manutenção de computadores"])
+        service.build_search_indexes()
         page = service.advanced_search(
             text="assistência em informática",
             filters={
@@ -104,15 +106,25 @@ def test_advanced_search_saved_query_synonyms_and_documents(tmp_path: Path) -> N
                 "valor_min": 900,
                 "orgao_cnpj": "12.345.678/0001-95",
             },
+            include_total=True,
         )
         assert page.total == 1
         assert page.rows[0]["numero_controle_pncp"] == "PNCP-1"
-        exact = service.advanced_search(filters={"identificador": "  PNCP-1  "})
+        by_agency = service.advanced_search(filters={"orgao": "secretaria educação"})
+        assert by_agency.rows[0]["numero_controle_pncp"] == "PNCP-1"
+        exact = service.advanced_search(filters={"identificador": "  PNCP-1  "}, include_total=True)
         assert exact.total == 1
-        assert service.advanced_search(filters={"identificador": "PNCP-10"}).total == 0
-        assert service.advanced_search(
-            filters={"identificador": "PNCP-1", "municipio": "Outra cidade"}
-        ).total == 0
+        assert (
+            service.advanced_search(filters={"identificador": "PNCP-10"}, include_total=True).total
+            == 0
+        )
+        assert (
+            service.advanced_search(
+                filters={"identificador": "PNCP-1", "municipio": "Outra cidade"},
+                include_total=True,
+            ).total
+            == 0
+        )
         query_id = service.save_query("Oportunidades TI", {"municipio": "Recife"})
         assert query_id > 0
         assert service.saved_queries()[0]["filters"] == {"municipio": "Recife"}
@@ -123,6 +135,62 @@ def test_advanced_search_saved_query_synonyms_and_documents(tmp_path: Path) -> N
         assert service.documents(1)[0]["title"] == "Edital"
         with pytest.raises(ValueError):
             service.upsert_document(1, url="file:///segredo.pdf")
+
+
+def test_fast_search_does_not_count_every_matching_contract(tmp_path: Path) -> None:
+    database = _database_with_contract(tmp_path / "fast.sqlite3")
+    with database._connect() as connection:
+        service = DataServices(connection)
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+        page = service.advanced_search(
+            filters={"data_inicial": "2026-08-01", "data_final": "2026-08-31"}
+        )
+        assert page.total is None
+        assert page.has_more is False
+        assert page.rows[0]["numero_controle_pncp"] == "PNCP-1"
+        assert not any("COUNT(*) FROM contratacao" in statement for statement in statements)
+        sql = "\n".join(statements)
+        assert "date(COALESCE" not in sql
+
+
+def test_value_order_requires_explicit_index_preparation(tmp_path: Path) -> None:
+    database = _database_with_contract(tmp_path / "value-sort.sqlite3")
+    with database._connect() as connection:
+        service = DataServices(connection)
+        with pytest.raises(ValueError, match="Preparar índices de busca"):
+            service.advanced_search(sort="value_desc")
+        with pytest.raises(ValueError, match="Preparar índices de busca"):
+            service.advanced_search(filters={"valor_min": 1})
+
+        report = service.build_search_indexes()
+        assert set(DataServices.SEARCH_INDEXES) <= set(report["created"])
+        page = service.advanced_search(sort="value_desc")
+        assert page.rows[0]["numero_controle_pncp"] == "PNCP-1"
+        plan = connection.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT id FROM contratacao "
+            "ORDER BY CAST(REPLACE(valor_total_estimado, ',', '.') AS REAL) DESC, id DESC LIMIT 50"
+        ).fetchall()
+        assert any(DataServices.VALUE_SORT_INDEX in row[3] for row in plan)
+
+
+def test_search_index_preparation_refuses_active_synchronization(tmp_path: Path) -> None:
+    database = _database_with_contract(tmp_path / "active-sync.sqlite3")
+    database.set_preference("sync.full_session.v1", {"active": True})
+    with pytest.raises(RuntimeError, match="Pause a sincronização"):
+        database.build_search_indexes()
+
+
+def test_search_index_preparation_allows_manual_pause(tmp_path: Path) -> None:
+    database = _database_with_contract(tmp_path / "manual-pause.sqlite3")
+    database.set_preference(
+        "sync.full_session.v1", {"active": True, "manual_pause": True}
+    )
+
+    report = database.build_search_indexes()
+
+    assert DataServices.VALUE_SORT_INDEX in report["created"]
 
 
 def test_economic_semantic_index_and_backup(tmp_path: Path) -> None:
@@ -172,9 +240,7 @@ def test_backup_reports_progress_can_be_cancelled_and_never_replaces_source(
         cancel = True
 
     with pytest.raises(BackupCancelled):
-        database.create_backup(
-            cancelled_target, progress=request_cancel, cancelled=lambda: cancel
-        )
+        database.create_backup(cancelled_target, progress=request_cancel, cancelled=lambda: cancel)
     assert not cancelled_target.exists()
     assert not list(tmp_path.glob("*.partial"))
     assert database.db_path.read_bytes() == source_before
@@ -191,9 +257,7 @@ def test_import_new_database_is_idempotent_and_creates_backup(tmp_path: Path) ->
             """UPDATE contratacao SET numero_controle_pncp='PNCP-2',record_hash='hash-2'
                WHERE id=1"""
         )
-        connection.execute(
-            "UPDATE contratacao_fts SET numero_controle_pncp='PNCP-2' WHERE rowid=1"
-        )
+        connection.execute("UPDATE contratacao_fts SET numero_controle_pncp='PNCP-2' WHERE rowid=1")
         connection.commit()
 
     first = target.import_new_database(source.db_path)

@@ -67,15 +67,20 @@ class LocalDatabase:
 
         report = progress_report(self.db_path)
         if report["projected_records"] is not None:
-            self.set_preference("sync.full_estimate.v1", {
-                "total_records": report["projected_records"],
-                "total_pages": report["planned_pages"],
-                "total_windows": report["total_windows"],
-                "sample_size": report["total_windows"] - report["unknown_windows"],
-                "scope_start": report["scope_start"], "scope_end": report["scope_end"],
-                "generated_at": report["generated_at"], "method": "stored_plans",
-                "unknown_windows": report["unknown_windows"],
-            })
+            self.set_preference(
+                "sync.full_estimate.v1",
+                {
+                    "total_records": report["projected_records"],
+                    "total_pages": report["planned_pages"],
+                    "total_windows": report["total_windows"],
+                    "sample_size": report["total_windows"] - report["unknown_windows"],
+                    "scope_start": report["scope_start"],
+                    "scope_end": report["scope_end"],
+                    "generated_at": report["generated_at"],
+                    "method": "stored_plans",
+                    "unknown_windows": report["unknown_windows"],
+                },
+            )
         return report
 
     def __init__(self, db_path: Path) -> None:
@@ -109,12 +114,12 @@ class LocalDatabase:
             raise ValueError("O tamanho da página deve ser positivo.")
         with self._connect() as connection:
             service = DataServices(connection)
-            first = service.advanced_search(**kwargs, page=1, page_size=page_size)
+            first = service.advanced_search(
+                **kwargs, page=1, page_size=page_size, include_total=True
+            )
             rows = list(first.rows)
-            for page in range(2, first.pages + 1):
-                rows.extend(
-                    service.advanced_search(**kwargs, page=page, page_size=page_size).rows
-                )
+            for page in range(2, (first.pages or 0) + 1):
+                rows.extend(service.advanced_search(**kwargs, page=page, page_size=page_size).rows)
             return rows
 
     def hybrid_search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
@@ -129,6 +134,24 @@ class LocalDatabase:
         with self._connect() as connection:
             return DataServices(connection).performance_report()
 
+    def build_search_indexes(self) -> dict[str, object]:
+        """Prepara índices caros somente quando não há carga gravando no banco."""
+        session = self.get_preference("sync.full_session.v1", {})
+        if (
+            isinstance(session, dict)
+            and session.get("active")
+            and not session.get("manual_pause", False)
+        ):
+            raise RuntimeError(
+                "Pause a sincronização antes de preparar índices de busca. "
+                "Essa operação precisa escrever no SQLite e poderia atrasar a carga."
+            )
+        integrity = self.quick_check()
+        if not integrity["ok"]:
+            raise RuntimeError("O banco não passou na verificação de integridade.")
+        with self._connect() as connection:
+            return DataServices(connection).build_search_indexes()
+
     def sync_history(self, *, limit: int = 100) -> list[dict[str, Any]]:
         with self._connect() as connection:
             return DataServices(connection).sync_history(limit)
@@ -140,7 +163,8 @@ class LocalDatabase:
                    WHERE r.resource='contratacoes_publicacao'
                      AND r.modalidade=? AND r.status IN ('PLANNED','RUNNING','PAUSED','FAILED')
                       AND EXISTS (SELECT 1 FROM work_unit w WHERE w.run_id=r.id AND w.status IN ('PENDING','RETRY_WAIT','RUNNING','FAILED'))
-                   ORDER BY r.created_at DESC LIMIT 1""", (modalidade,)
+                   ORDER BY r.created_at DESC LIMIT 1""",
+                (modalidade,),
             ).fetchone()
             return str(row[0]) if row else None
 

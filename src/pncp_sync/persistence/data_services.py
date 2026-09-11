@@ -81,22 +81,37 @@ def _concept_tokens(text: str) -> list[str]:
 @dataclass(frozen=True, slots=True)
 class Page:
     rows: list[dict[str, Any]]
-    total: int
+    total: int | None
     page: int
     page_size: int
+    has_more: bool = False
 
     @property
-    def pages(self) -> int:
+    def pages(self) -> int | None:
+        if self.total is None:
+            return None
         return math.ceil(self.total / self.page_size) if self.total else 0
 
 
 class DataServices:
     """Consultas analíticas e manutenção; não conhece Qt nem baixa documentos."""
 
+    VALUE_SORT_INDEX = "idx_contratacao_valor_estimado_numeric"
+    SEARCH_INDEXES = (
+        "idx_contratacao_valor_estimado_numeric",
+        "idx_contratacao_modalidade_publicacao",
+        "idx_contratacao_situacao_publicacao",
+        "idx_contratacao_orgao_publicacao",
+        "idx_contratacao_orgao_nome",
+    )
+
     SORTS = {
-        "recent": "COALESCE(c.data_publicacao_pncp,c.data_inclusao) DESC, c.id DESC",
-        "oldest": "COALESCE(c.data_publicacao_pncp,c.data_inclusao), c.id",
-        "value_desc": "CAST(REPLACE(c.valor_total_estimado, ',', '.') AS REAL) DESC",
+        # A maior parte das publicações possui data PNCP. Ordenar a coluna
+        # diretamente permite usar idx_contratacao_publicacao; os poucos NULL
+        # ficam no fim/em início conforme a ordenação do SQLite.
+        "recent": "c.data_publicacao_pncp DESC, c.id DESC",
+        "oldest": "c.data_publicacao_pncp ASC, c.id ASC",
+        "value_desc": "CAST(REPLACE(c.valor_total_estimado, ',', '.') AS REAL) DESC, c.id DESC",
         "value_asc": "CAST(REPLACE(c.valor_total_estimado, ',', '.') AS REAL), c.id",
         "agency": "c.orgao_razao_social COLLATE NOCASE, c.id DESC",
     }
@@ -104,6 +119,57 @@ class DataServices:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
         self.connection.row_factory = sqlite3.Row
+
+    def has_value_sort_index(self) -> bool:
+        row = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+            (self.VALUE_SORT_INDEX,),
+        ).fetchone()
+        return row is not None
+
+    def build_search_indexes(self) -> dict[str, object]:
+        """Cria índices de consulta explicitamente, nunca durante a sincronização."""
+        statements = (
+            (
+                self.VALUE_SORT_INDEX,
+                "CREATE INDEX IF NOT EXISTS idx_contratacao_valor_estimado_numeric "
+                "ON contratacao(CAST(REPLACE(valor_total_estimado, ',', '.') AS REAL), id)",
+            ),
+            (
+                "idx_contratacao_modalidade_publicacao",
+                "CREATE INDEX IF NOT EXISTS idx_contratacao_modalidade_publicacao "
+                "ON contratacao(modalidade_id, data_publicacao_pncp DESC, id DESC)",
+            ),
+            (
+                "idx_contratacao_situacao_publicacao",
+                "CREATE INDEX IF NOT EXISTS idx_contratacao_situacao_publicacao "
+                "ON contratacao(situacao_compra_id, data_publicacao_pncp DESC, id DESC)",
+            ),
+            (
+                "idx_contratacao_orgao_publicacao",
+                "CREATE INDEX IF NOT EXISTS idx_contratacao_orgao_publicacao "
+                "ON contratacao(orgao_cnpj, data_publicacao_pncp DESC, id DESC)",
+            ),
+            (
+                "idx_contratacao_orgao_nome",
+                "CREATE INDEX IF NOT EXISTS idx_contratacao_orgao_nome "
+                "ON contratacao(orgao_razao_social COLLATE NOCASE, id DESC)",
+            ),
+        )
+        existing = {
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            )
+        }
+        created = []
+        for name, statement in statements:
+            if name not in existing:
+                self.connection.execute(statement)
+                created.append(name)
+        self.connection.execute("ANALYZE")
+        self.connection.commit()
+        return {"created": created, "already_present": len(statements) - len(created)}
 
     def refresh_insights(self, *, limit: int = 100_000) -> dict[str, int]:
         """Gera classificações e palavras-chave determinísticas sem serviço externo."""
@@ -313,12 +379,22 @@ class DataServices:
         page: int = 1,
         page_size: int = 50,
         sort: str = "recent",
+        include_total: bool = False,
     ) -> Page:
         if page < 1 or not 1 <= page_size <= 500:
             raise ValueError("Página ou tamanho de página inválido.")
         if sort not in self.SORTS:
             raise ValueError("Ordenação não permitida.")
         filters = filters or {}
+        uses_value = sort in {"value_desc", "value_asc"} or any(
+            filters.get(key) not in (None, "") for key in ("valor_min", "valor_max")
+        )
+        if uses_value and not self.has_value_sort_index():
+            raise ValueError(
+                "O filtro ou a ordenação por valor ainda não foi preparado para este banco. "
+                "Use 'Mais recentes' agora ou, com a sincronização pausada, execute "
+                "'Preparar índices de busca' em Segurança e manutenção."
+            )
         where: list[str] = []
         params: list[Any] = []
         expanded = self.expand_query(text)
@@ -332,7 +408,6 @@ class DataServices:
             where.append("(" + " OR ".join(groups) + ")")
         mapping = {
             "identificador": "c.numero_controle_pncp = ?",
-            "orgao": "c.orgao_razao_social LIKE ?",
             "municipio": "c.municipio_nome LIKE ?",
             "modalidade": "c.modalidade_id = ?",
             "situacao": "c.situacao_compra_id = ?",
@@ -344,32 +419,71 @@ class DataServices:
                 if key == "identificador":
                     value = str(value).strip()
                     if not value or len(value) > 200:
-                        raise ValueError("Informe o identificador PNCP completo, com até 200 caracteres.")
+                        raise ValueError(
+                            "Informe o identificador PNCP completo, com até 200 caracteres."
+                        )
                 if key == "orgao_cnpj":
                     digits = "".join(character for character in str(value) if character.isdigit())
                     value = digits or value
                 where.append(sql)
-                params.append(f"%{value}%" if key in {"orgao", "municipio"} else value)
+                params.append(f"%{value}%" if key == "municipio" else value)
+        orgao = filters.get("orgao")
+        if orgao not in (None, ""):
+            tokens = _tokens(str(orgao))
+            if not tokens:
+                raise ValueError("Informe letras ou números no nome do órgão.")
+            fts_terms = " AND ".join(f'"{token}"' for token in tokens)
+            where.append(
+                "c.id IN (SELECT rowid FROM contratacao_fts WHERE contratacao_fts MATCH ?)"
+            )
+            params.append(f"orgao_razao_social : ({fts_terms})")
         for key, op in (("valor_min", ">="), ("valor_max", "<=")):
             if filters.get(key) not in (None, ""):
                 where.append(f"CAST(REPLACE(c.valor_total_estimado, ',', '.') AS REAL) {op} ?")
                 params.append(float(filters[key]))
-        for key, op in (("data_inicial", ">="), ("data_final", "<=")):
-            if filters.get(key):
-                where.append(f"date(COALESCE(c.data_publicacao_pncp,c.data_inclusao)) {op} date(?)")
-                params.append(str(filters[key]))
+        start = filters.get("data_inicial")
+        end = filters.get("data_final")
+        if start:
+            # Datas normalizadas pelo PNCP são ISO; não aplique date()/COALESCE()
+            # sobre a coluna, pois isso impediria o índice de publicação.
+            where.append(
+                "(c.data_publicacao_pncp >= ? OR "
+                "(c.data_publicacao_pncp IS NULL AND c.data_inclusao >= ?))"
+            )
+            params.extend((str(start), str(start)))
+        if end:
+            # Limite exclusivo também cobre inclusões com horário no mesmo dia.
+            end_exclusive = datetime.fromisoformat(str(end)).date().toordinal() + 1
+            next_day = datetime.fromordinal(end_exclusive).date().isoformat()
+            where.append(
+                "(c.data_publicacao_pncp < ? OR "
+                "(c.data_publicacao_pncp IS NULL AND c.data_inclusao < ?))"
+            )
+            params.extend((next_day, next_day))
         fornecedor = filters.get("fornecedor") or filters.get("fornecedor_cnpj")
         if fornecedor:
-            where.append(
-                "EXISTS(SELECT 1 FROM item_contratacao i JOIN resultado_item r ON r.item_id=i.id WHERE i.contratacao_id=c.id AND (r.fornecedor_nome LIKE ? OR r.ni_fornecedor=?))"
-            )
-            params.extend((f"%{fornecedor}%", fornecedor))
+            supplier_digits = "".join(character for character in str(fornecedor) if character.isdigit())
+            if len(supplier_digits) in {11, 14}:
+                where.append(
+                    "c.id IN (SELECT i.contratacao_id FROM resultado_item r "
+                    "JOIN item_contratacao i ON i.id=r.item_id WHERE r.ni_fornecedor=?)"
+                )
+                params.append(supplier_digits)
+            else:
+                where.append(
+                    "EXISTS(SELECT 1 FROM item_contratacao i JOIN resultado_item r "
+                    "ON r.item_id=i.id WHERE i.contratacao_id=c.id "
+                    "AND r.fornecedor_nome LIKE ?)"
+                )
+                params.append(f"%{fornecedor}%")
         clause = " WHERE " + " AND ".join(where) if where else ""
-        total = int(
-            self.connection.execute(
-                "SELECT COUNT(*) FROM contratacao c" + clause, params
-            ).fetchone()[0]
-        )
+        total = None
+        if include_total:
+            total = int(
+                self.connection.execute(
+                    "SELECT COUNT(*) FROM contratacao c" + clause, params
+                ).fetchone()[0]
+            )
         sql = (
             "SELECT c.id,c.numero_controle_pncp,c.orgao_razao_social,c.orgao_cnpj,c.municipio_nome,"
             "c.modalidade_nome,c.situacao_compra_nome,c.objeto_compra,c.data_publicacao_pncp,"
@@ -377,8 +491,12 @@ class DataServices:
             + clause
             + f" ORDER BY {self.SORTS[sort]} LIMIT ? OFFSET ?"
         )
-        rows = self.connection.execute(sql, (*params, page_size, (page - 1) * page_size)).fetchall()
-        return Page([dict(row) for row in rows], total, page, page_size)
+        # Uma linha extra determina Próxima sem executar COUNT(*) no acervo inteiro.
+        rows = self.connection.execute(
+            sql, (*params, page_size + 1, (page - 1) * page_size)
+        ).fetchall()
+        has_more = len(rows) > page_size
+        return Page([dict(row) for row in rows[:page_size]], total, page, page_size, has_more)
 
     def hybrid_search(
         self,
@@ -417,26 +535,44 @@ class DataServices:
 
     def performance_report(self) -> dict[str, Any]:
         """Mede consultas representativas sem carregar todos os registros em memória."""
+
         def timed(sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any]:
-            plan = [dict(row) for row in self.connection.execute("EXPLAIN QUERY PLAN " + sql, params)]
+            plan = [
+                dict(row) for row in self.connection.execute("EXPLAIN QUERY PLAN " + sql, params)
+            ]
             started = time.perf_counter()
-            count = int(self.connection.execute("SELECT COUNT(*) FROM (" + sql + ")", params).fetchone()[0])
+            count = int(
+                self.connection.execute("SELECT COUNT(*) FROM (" + sql + ")", params).fetchone()[0]
+            )
             elapsed_ms = (time.perf_counter() - started) * 1000
             return {"rows": count, "elapsed_ms": round(elapsed_ms, 2), "plan": plan}
 
         counts = {
-            "contratacoes": int(self.connection.execute("SELECT COUNT(*) FROM contratacao").fetchone()[0]),
-            "itens": int(self.connection.execute("SELECT COUNT(*) FROM item_contratacao").fetchone()[0]),
-            "resultados": int(self.connection.execute("SELECT COUNT(*) FROM resultado_item").fetchone()[0]),
-            "vetores": int(self.connection.execute("SELECT COUNT(*) FROM semantic_document").fetchone()[0]),
+            "contratacoes": int(
+                self.connection.execute("SELECT COUNT(*) FROM contratacao").fetchone()[0]
+            ),
+            "itens": int(
+                self.connection.execute("SELECT COUNT(*) FROM item_contratacao").fetchone()[0]
+            ),
+            "resultados": int(
+                self.connection.execute("SELECT COUNT(*) FROM resultado_item").fetchone()[0]
+            ),
+            "vetores": int(
+                self.connection.execute("SELECT COUNT(*) FROM semantic_document").fetchone()[0]
+            ),
         }
         return {
             "counts": counts,
             "database_page_count": int(self.connection.execute("PRAGMA page_count").fetchone()[0]),
             "database_page_size": int(self.connection.execute("PRAGMA page_size").fetchone()[0]),
             "queries": {
-                "recent": timed("SELECT id FROM contratacao ORDER BY COALESCE(data_publicacao_pncp,data_inclusao) DESC LIMIT 50"),
-                "text": timed("SELECT rowid FROM contratacao_fts WHERE contratacao_fts MATCH ?", ('contratacao',)),
+                "recent": timed(
+                    "SELECT id FROM contratacao ORDER BY data_publicacao_pncp DESC,id DESC LIMIT 50"
+                ),
+                "text": timed(
+                    "SELECT rowid FROM contratacao_fts WHERE contratacao_fts MATCH ?",
+                    ("contratacao",),
+                ),
             },
         }
 

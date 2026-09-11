@@ -65,6 +65,23 @@ O campo **Identificador PNCP completo** faz uma comparação exata com
 `numero_controle_pncp`. A coluna já é uma chave única indexada, então essa consulta não
 percorre a tabela inteira. Texto, órgão e outros filtros continuam combináveis com ela.
 
+## Desempenho de filtros
+
+A pesquisa de tela busca uma página e uma linha extra para indicar se existe próxima
+página. Ela não calcula `COUNT(*)` no acervo inteiro a cada clique; a contagem completa
+é reservada para a exportação de todos os resultados. Filtros de data e a ordenação por
+publicação usam a coluna indexada de publicação.
+
+Ordenar por valor exige um índice numérico adicional porque os valores da fonte são
+preservados como texto. Para não bloquear a sincronização, o programa não cria esse
+índice automaticamente. Com a sincronização pausada, use **Banco local → Segurança e
+manutenção → Preparar índices de busca…**. A ação verifica a integridade, cria índices
+para valor, modalidade, situação, CNPJ e ordenação por nome do órgão, e pode usar espaço
+adicional. O nome do órgão usa FTS5, e CNPJ de fornecedor usa o índice de resultados quando
+o campo contém 11 ou 14 dígitos. A busca por município continua sendo textual por conteúdo;
+ela não finge usar um índice que não resolveria um termo no meio do nome. Sem o índice de
+valor, o aplicativo recusa essa ordenação com uma mensagem clara em vez de parecer travado.
+
 ## Integridade e backup
 
 A tela de segurança executa `PRAGMA quick_check`, verificação de chaves estrangeiras e

@@ -2,6 +2,8 @@
 __pycache__/
 *.py[cod]
 .venv/
+.venv-semantic/
+.semantic-pilot/
 *.egg-info/
 
 # Ferramentas de teste, qualidade e cobertura

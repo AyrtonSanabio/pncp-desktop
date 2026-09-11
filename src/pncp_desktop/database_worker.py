@@ -41,6 +41,7 @@ class DatabaseTaskThread(QThread):
                 "hybrid_search": "hybrid_search",
                 "duplicate_candidates": "duplicate_candidates",
                 "performance_report": "performance_report",
+                "build_search_indexes": "build_search_indexes",
                 "sync_history": "sync_history",
                 "analytics": "analytics",
                 "refresh_insights": "refresh_insights",

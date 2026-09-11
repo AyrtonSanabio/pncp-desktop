@@ -1,0 +1,252 @@
+[
+  {
+    "id": "Q01",
+    "text": "manutenção de computadores para escolas",
+    "intent": "Serviço de suporte ou reparo de computadores escolares; compra de máquinas não basta."
+  },
+  {
+    "id": "Q02",
+    "text": "suporte técnico de informática",
+    "intent": "Serviço de assistência em TI; excluir compra isolada de equipamentos."
+  },
+  {
+    "id": "Q03",
+    "text": "aluguel de impressoras com manutenção",
+    "intent": "Locação ou outsourcing de impressão com assistência."
+  },
+  {
+    "id": "Q04",
+    "text": "internet de alta velocidade para repartições",
+    "intent": "Contratação de conectividade; excluir compra de computadores sem conexão."
+  },
+  {
+    "id": "Q05",
+    "text": "licença de software de gestão municipal",
+    "intent": "Licenciamento ou assinatura de software de gestão pública."
+  },
+  {
+    "id": "Q06",
+    "text": "proteção contra ataques e vírus de computador",
+    "intent": "Soluções de segurança digital ou antivírus."
+  },
+  {
+    "id": "Q07",
+    "text": "armazenamento de dados em nuvem",
+    "intent": "Hospedagem ou infraestrutura de armazenamento remoto."
+  },
+  {
+    "id": "Q08",
+    "text": "limpeza de prédios públicos",
+    "intent": "Mão de obra/serviço de limpeza de edificações; excluir apenas produtos."
+  },
+  {
+    "id": "Q09",
+    "text": "compra de materiais de limpeza",
+    "intent": "Aquisição de produtos de higiene/limpeza; excluir apenas mão de obra."
+  },
+  {
+    "id": "Q10",
+    "text": "controle de pragas em escolas",
+    "intent": "Dedetização, desinsetização ou desratização de unidades escolares."
+  },
+  {
+    "id": "Q11",
+    "text": "coleta de lixo urbano",
+    "intent": "Serviço de coleta de resíduos; excluir aquisição isolada de lixeiras."
+  },
+  {
+    "id": "Q12",
+    "text": "limpeza de fossas e esgoto",
+    "intent": "Desentupimento ou esgotamento de fossas e redes."
+  },
+  {
+    "id": "Q13",
+    "text": "manutenção de ar condicionado",
+    "intent": "Conservação ou reparo de climatização; excluir compra sem serviço."
+  },
+  {
+    "id": "Q14",
+    "text": "compra de aparelhos de ar condicionado",
+    "intent": "Aquisição de climatizadores; manutenção isolada não basta."
+  },
+  {
+    "id": "Q15",
+    "text": "vigilância patrimonial sem arma",
+    "intent": "Serviço de segurança desarmada; excluir vigilância sanitária."
+  },
+  {
+    "id": "Q16",
+    "text": "câmeras para monitoramento de segurança",
+    "intent": "Aquisição ou instalação de CFTV; excluir câmeras médicas."
+  },
+  {
+    "id": "Q17",
+    "text": "transporte escolar rural",
+    "intent": "Transporte de estudantes, preferencialmente em áreas rurais."
+  },
+  {
+    "id": "Q18",
+    "text": "aluguel de ônibus para viagens",
+    "intent": "Locação/fretamento de ônibus para deslocamentos."
+  },
+  {
+    "id": "Q19",
+    "text": "manutenção de veículos da prefeitura",
+    "intent": "Reparo/conservação de frota pública."
+  },
+  {
+    "id": "Q20",
+    "text": "compra de combustível para frota",
+    "intent": "Aquisição de gasolina, diesel ou etanol para veículos."
+  },
+  {
+    "id": "Q21",
+    "text": "fornecimento de pneus para caminhões",
+    "intent": "Aquisição de pneumáticos para veículos pesados."
+  },
+  {
+    "id": "Q22",
+    "text": "rastreamento de veículos por satélite",
+    "intent": "Serviço/sistema de rastreamento ou telemetria de frota."
+  },
+  {
+    "id": "Q23",
+    "text": "refeições prontas para servidores",
+    "intent": "Fornecimento de refeições preparadas ou marmitas."
+  },
+  {
+    "id": "Q24",
+    "text": "alimentos para merenda escolar",
+    "intent": "Gêneros alimentícios destinados à alimentação de estudantes."
+  },
+  {
+    "id": "Q25",
+    "text": "alimentos da agricultura familiar",
+    "intent": "Aquisição expressamente vinculada à agricultura familiar."
+  },
+  {
+    "id": "Q26",
+    "text": "água mineral em galões",
+    "intent": "Água potável envasada em garrafões; excluir tratamento de esgoto."
+  },
+  {
+    "id": "Q27",
+    "text": "medicamentos para unidades de saúde",
+    "intent": "Aquisição de remédios; material hospitalar genérico não basta."
+  },
+  {
+    "id": "Q28",
+    "text": "insumos para curativos",
+    "intent": "Materiais para tratamento de feridas, como gaze e ataduras."
+  },
+  {
+    "id": "Q29",
+    "text": "exames laboratoriais de sangue",
+    "intent": "Serviços de análises clínicas; excluir apenas reagentes."
+  },
+  {
+    "id": "Q30",
+    "text": "consultas médicas especializadas",
+    "intent": "Prestação de atendimento médico por especialistas."
+  },
+  {
+    "id": "Q31",
+    "text": "serviços de atendimento psicológico",
+    "intent": "Prestação de psicologia; excluir psiquiatria isolada."
+  },
+  {
+    "id": "Q32",
+    "text": "próteses dentárias",
+    "intent": "Confecção/fornecimento de próteses odontológicas."
+  },
+  {
+    "id": "Q33",
+    "text": "equipamentos de proteção individual",
+    "intent": "Aquisição de EPIs para trabalhadores."
+  },
+  {
+    "id": "Q34",
+    "text": "oxigênio medicinal",
+    "intent": "Fornecimento de oxigênio para assistência à saúde."
+  },
+  {
+    "id": "Q35",
+    "text": "reforma de escola municipal",
+    "intent": "Obra de recuperação/ampliação escolar; excluir materiais isolados."
+  },
+  {
+    "id": "Q36",
+    "text": "pavimentação de ruas",
+    "intent": "Obra de asfalto, calçamento ou pavimentação urbana."
+  },
+  {
+    "id": "Q37",
+    "text": "manutenção da iluminação pública",
+    "intent": "Serviço de conservação de iluminação de vias públicas."
+  },
+  {
+    "id": "Q38",
+    "text": "projeto de engenharia para ponte",
+    "intent": "Elaboração de projeto técnico de ponte; execução isolada é outro objeto."
+  },
+  {
+    "id": "Q39",
+    "text": "material de construção",
+    "intent": "Aquisição de insumos de obra; contrato apenas de execução não basta."
+  },
+  {
+    "id": "Q40",
+    "text": "limpeza e conservação de jardins",
+    "intent": "Jardinagem, capina ou manutenção de áreas verdes."
+  },
+  {
+    "id": "Q41",
+    "text": "uniformes escolares",
+    "intent": "Confecção/compra de vestuário destinado a estudantes."
+  },
+  {
+    "id": "Q42",
+    "text": "móveis para salas de aula",
+    "intent": "Aquisição de mesas, carteiras ou cadeiras escolares."
+  },
+  {
+    "id": "Q43",
+    "text": "livros para biblioteca",
+    "intent": "Aquisição de acervo bibliográfico."
+  },
+  {
+    "id": "Q44",
+    "text": "treinamento de servidores públicos",
+    "intent": "Capacitação/cursos para trabalhadores da administração."
+  },
+  {
+    "id": "Q45",
+    "text": "organização de eventos culturais",
+    "intent": "Produção ou organização de eventos de cultura."
+  },
+  {
+    "id": "Q46",
+    "text": "aluguel de palco e equipamento de som",
+    "intent": "Locação de estrutura cênica ou sonorização."
+  },
+  {
+    "id": "Q47",
+    "text": "serviços de contabilidade pública",
+    "intent": "Assessoria ou execução de contabilidade de ente público."
+  },
+  {
+    "id": "Q48",
+    "text": "assessoria jurídica para município",
+    "intent": "Serviços de consultoria/representação jurídica municipal."
+  },
+  {
+    "id": "Q49",
+    "text": "seguro de veículos oficiais",
+    "intent": "Apólice de seguro de frota pública."
+  },
+  {
+    "id": "Q50",
+    "text": "digitalização de documentos",
+    "intent": "Conversão de documentos físicos para meio digital."
+  }
+]
