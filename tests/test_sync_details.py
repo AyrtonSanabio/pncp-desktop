@@ -4,6 +4,7 @@ import json
 from datetime import date
 from pathlib import Path
 
+import httpx
 import pytest
 from pypncp import PNCPError
 
@@ -245,6 +246,26 @@ async def test_falha_de_resultado_nao_desfaz_item_confirmado(tmp_path: Path) -> 
         assert (
             repository.connection.execute("SELECT COUNT(*) FROM resultado_item").fetchone()[0] == 0
         )
+
+
+@pytest.mark.asyncio
+async def test_transport_error_is_cataloged_and_can_be_retried(tmp_path: Path) -> None:
+    config = SyncConfig(db_path=tmp_path / "detail-network.sqlite3", lease_seconds=30)
+    source_run_id = await create_source_run(config)
+    plan = plan_details(config, source_run_id, limit=1)
+
+    class NetworkFailure:
+        async def fetch_items(self, *args, **kwargs):
+            raise httpx.RemoteProtocolError("servidor encerrou a conexão")
+
+    summary = await run_details(config, plan.detail_run_id, source=NetworkFailure())
+
+    assert summary.status == "PAUSED"
+    assert summary.pending_units == 1
+    with DetailRepository(config.db_path) as repository:
+        assert repository.connection.execute(
+            "SELECT category FROM detail_error ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()[0] == "NETWORK_DETAIL"
 
 
 @pytest.mark.asyncio

@@ -258,9 +258,10 @@ class DetailRepository(SyncRepository):
         )
 
     def prepare_recent_details(
-        self, *, reference_time: datetime | None = None, page_size: int = 50
+        self, *, reference_time: datetime | None = None, page_size: int = 50,
+        extend: bool = False,
     ) -> dict[str, Any]:
-        """Congela uma seleção global local, com planos e checkpoint no mesmo commit."""
+        """Congela ou estende a seleção global, preservando checkpoints confirmados."""
         key = "sync.recent_details.v1"
         if not 1 <= page_size <= 500:
             raise ValueError("O tamanho da página deve ficar entre 1 e 500.")
@@ -270,6 +271,8 @@ class DetailRepository(SyncRepository):
             saved = cursor.execute(
                 "SELECT value_json FROM app_preference WHERE key=?", (key,)
             ).fetchone()
+            previous_run_ids: list[str] = []
+            previous_reference = ""
             if saved is not None:
                 session = json.loads(saved[0])
                 if not isinstance(session, dict) or not isinstance(session.get("run_ids"), list):
@@ -282,23 +285,39 @@ class DetailRepository(SyncRepository):
                         raise ValueError(
                             "Plano de itens ausente; checkpoint preservado para diagnóstico."
                         )
-                return session
+                if not extend:
+                    return session
+                previous_run_ids = list(session["run_ids"])
+                previous_reference = str(session.get("reference_time", ""))
             # A seleção fica no SQLite, sem materializar milhões de registros em Python.
             cursor.execute("DROP TABLE IF EXISTS temp.recent_detail_selection")
+            prior_placeholders = ",".join("?" for _ in previous_run_ids)
+            extension_filter = (
+                " AND (c.local_updated_at > ? OR NOT EXISTS ("
+                "SELECT 1 FROM detail_work_unit old "
+                "WHERE old.contratacao_id=c.id "
+                f"AND old.detail_run_id IN ({prior_placeholders})"
+                "))"
+                if previous_run_ids
+                else ""
+            )
             cursor.execute(
                 """CREATE TEMP TABLE recent_detail_selection AS
                    SELECT c.id AS contratacao_id, p.run_id AS source_run_id
                    FROM contratacao c JOIN source_payload p ON p.id=c.source_payload_id
                    WHERE orgao_cnpj IS NOT NULL AND ano_compra IS NOT NULL
-                     AND sequencial_compra IS NOT NULL AND """ + predicate,
-                bounds,
+                     AND sequencial_compra IS NOT NULL AND """
+                + predicate
+                + extension_filter,
+                (*bounds, previous_reference, *previous_run_ids)
+                if previous_run_ids else bounds,
             )
             groups = cursor.execute(
                 """SELECT source_run_id,COUNT(*) FROM recent_detail_selection
                    GROUP BY source_run_id ORDER BY source_run_id"""
             ).fetchall()
             now = utc_now_iso()
-            run_ids = []
+            run_ids = list(previous_run_ids)
             for source_run_id, count in groups:
                 run_id = str(uuid4())
                 cursor.execute(
@@ -322,11 +341,18 @@ class DetailRepository(SyncRepository):
                 run_ids.append(run_id)
             session = {
                 "reference_time": reference.isoformat(), "created_at": now,
-                "run_ids": run_ids, "planned_contracts": sum(group[1] for group in groups),
+                "run_ids": run_ids,
+                "planned_contracts": cursor.execute(
+                    "SELECT COUNT(DISTINCT contratacao_id) FROM detail_work_unit "
+                    f"WHERE detail_run_id IN ({','.join('?' for _ in run_ids)})",
+                    run_ids,
+                ).fetchone()[0] if run_ids else 0,
                 "page_size": page_size,
             }
             cursor.execute(
-                "INSERT INTO app_preference(key,value_json,updated_at) VALUES(?,?,?)",
+                "INSERT INTO app_preference(key,value_json,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, "
+                "updated_at=excluded.updated_at",
                 (key, json.dumps(session), now),
             )
             cursor.execute("DROP TABLE temp.recent_detail_selection")

@@ -329,7 +329,9 @@ async def test_changed_pagination_is_not_marked_as_completed(tmp_path, concurren
 
 
 @pytest.mark.asyncio
-async def test_worker_catalogs_transient_error_moves_on_then_retries(tmp_path, monkeypatch):
+async def test_incremental_catalogs_transient_error_without_delaying_recent_windows(
+    tmp_path, monkeypatch
+):
     config = SyncConfig(db_path=tmp_path / "retry.sqlite3", max_concurrent=1)
     await initial(config)
     calls = []
@@ -360,8 +362,10 @@ async def test_worker_catalogs_transient_error_moves_on_then_retries(tmp_path, m
     worker = SyncTaskThread(config, action="incremental", modalidades=(6,))
     await worker._execute()
     first_failure = calls.index((UPDATES, 2))
-    retry = len(calls) - 1 - calls[::-1].index((UPDATES, 2))
-    assert any(resource == NEW_PUBLICATIONS for resource, _ in calls[first_failure:retry])
+    # A falha não monopoliza a atualização recente: os outros lotes seguem,
+    # mas a mesma página não entra na recuperação automática nesta execução.
+    assert calls.count((UPDATES, 2)) == 1
+    assert any(resource == NEW_PUBLICATIONS for resource, _ in calls[first_failure + 1 :])
     with SyncRepository(config.db_path) as repository:
         assert (
             repository.connection.execute("SELECT COUNT(*) FROM ingestion_error").fetchone()[0] == 1

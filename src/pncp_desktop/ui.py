@@ -526,6 +526,7 @@ class MainWindow(QMainWindow):
         self._full_sync_progress: FullSyncProgress | None = None
         self._full_sync_session: dict[str, Any] | None = None
         self._sync_incremental_mode = False
+        self._sync_priority_mode = False
         self._sync_recovery_mode = False
         self._local_page = 1
         self._local_result_rows: list[dict[str, Any]] = []
@@ -1175,6 +1176,23 @@ class MainWindow(QMainWindow):
         self.botao_atualizar_desde_ultima.clicked.connect(
             lambda: self.atualizar_desde_ultima_execucao(capture_today=True)
         )
+        self.botao_atualizar_prioritario = QPushButton(
+            "Atualizar recentes + itens vigentes"
+        )
+        self.botao_atualizar_prioritario.setToolTip(
+            "Busca contratações novas e retificadas até hoje e, em seguida, atualiza "
+            "os itens das licitações ainda abertas dos últimos 12 meses. Não recupera "
+            "as páginas históricas que falharam."
+        )
+        self.botao_atualizar_prioritario.clicked.connect(self.atualizar_prioritario)
+        self.botao_itens_vigentes = QPushButton("Baixar itens vigentes (12 meses)")
+        self.botao_itens_vigentes.setObjectName("secundario")
+        self.botao_itens_vigentes.setToolTip(
+            "Coleta itens e resultados das licitações divulgadas, ainda abertas e "
+            "publicadas nos últimos 365 dias. Usa o banco local; não reinicia a carga "
+            "de contratações nem recupera páginas históricas com falha."
+        )
+        self.botao_itens_vigentes.clicked.connect(self.baixar_itens_vigentes)
         self.sync_automatico = QCheckBox("Atualizar automaticamente ao abrir")
         self.sync_automatico.setChecked(self._settings.value("sync_on_startup", False, type=bool))
         self.sync_automatico.setToolTip(
@@ -1204,7 +1222,9 @@ class MainWindow(QMainWindow):
         self._atalho_continuar_sync.activated.connect(self.botao_continuar.click)
         botoes = QHBoxLayout()
         for button in (
+            self.botao_atualizar_prioritario,
             self.botao_atualizar_desde_ultima,
+            self.botao_itens_vigentes,
             self.botao_estimar,
             self.botao_sincronizar,
             self.botao_pausar,
@@ -2101,6 +2121,7 @@ class MainWindow(QMainWindow):
             else (int(modalidade),)
         )
         self._sync_recovery_mode = False
+        self._sync_priority_mode = False
         self._sync_incremental_mode = True
         self._auto_sync_pending = False
         self._sync_manual_pause_requested = False
@@ -2131,11 +2152,82 @@ class MainWindow(QMainWindow):
         self._sync_worker = worker
         worker.start()
 
+    def atualizar_prioritario(self) -> None:
+        """Atualiza o recorte recente e depois seus itens, sem recuperar o histórico."""
+        if self._sync_worker is not None and self._sync_worker.isRunning():
+            self.sync_status_label.setText(
+                "Aguarde a tarefa atual ou use Pausar antes da atualização prioritária."
+            )
+            return
+        self._atualizar_estado_sessao_carga_completa(manual_pause=True)
+        self._sync_recovery_mode = False
+        self._sync_priority_mode = True
+        self._sync_incremental_mode = True
+        self._auto_sync_pending = False
+        self._sync_manual_pause_requested = False
+        self._sync_run_id = None
+        self._sync_run_ids = ()
+        self._sync_plan = None
+        self._sync_can_continue = False
+        self._set_sync_busy(True)
+        self._sync_started_monotonic = time.monotonic()
+        self._sync_last_resource = ""
+        self.sync_progresso.setRange(0, 0)
+        self.sync_status_label.setText(
+            "Etapa 1/2 — buscando contratações novas e retificadas até hoje…"
+        )
+        self.sync_atividade.setText(
+            "Depois serão atualizados os itens vigentes. Falhas históricas continuam separadas."
+        )
+        worker = SyncTaskThread(
+            self._sync_config(),
+            action="priority_update",
+            modalidades=tuple(c for c, _ in MODALIDADES),
+            target_date=date.today(),
+            update_to_today=True,
+            include_details=False,
+            parent=self,
+        )
+        self._connect_sync_worker(worker)
+        self._sync_worker = worker
+        worker.start()
+
+    def baixar_itens_vigentes(self) -> None:
+        """Inicia somente os itens recentes já elegíveis no banco local."""
+        if self._sync_worker is not None and self._sync_worker.isRunning():
+            self.sync_status_label.setText(
+                "Aguarde a sincronização atual ou use Pausar antes de baixar itens."
+            )
+            return
+        self._sync_recovery_mode = False
+        self._sync_priority_mode = False
+        self._sync_incremental_mode = False
+        self._sync_manual_pause_requested = False
+        self._sync_run_id = None
+        self._sync_run_ids = ()
+        self._sync_plan = None
+        self._sync_can_continue = False
+        self._set_sync_busy(True)
+        self._sync_started_monotonic = time.monotonic()
+        self._sync_last_resource = "detalhes"
+        self.sync_progresso.setRange(0, 0)
+        self.sync_status_label.setText(
+            "Preparando itens de licitações vigentes dos últimos 12 meses…"
+        )
+        self.sync_atividade.setText(
+            "As contratações e as páginas históricas com falha não serão reprocessadas."
+        )
+        worker = SyncTaskThread(self._sync_config(), action="recent_details", parent=self)
+        self._connect_sync_worker(worker)
+        self._sync_worker = worker
+        worker.start()
+
     def recuperar_falhas(self) -> None:
         if self._sync_worker is not None and self._sync_worker.isRunning():
             self.sync_status_label.setText("Use Pausar antes de iniciar uma recuperação separada.")
             return
         self._sync_incremental_mode = False
+        self._sync_priority_mode = False
         self._sync_recovery_mode = True
         self._sync_can_continue = True
         self._sync_manual_pause_requested = False
@@ -2416,6 +2508,9 @@ class MainWindow(QMainWindow):
         if self._sync_recovery_mode:
             self.recuperar_falhas()
             return
+        if self._sync_priority_mode:
+            self.atualizar_prioritario()
+            return
         if self._sync_incremental_mode:
             self.atualizar_desde_ultima_execucao()
             return
@@ -2470,7 +2565,32 @@ class MainWindow(QMainWindow):
         worker.paused.connect(self._sync_pausado)
         worker.failed.connect(self._sync_falhou)
         worker.catalog_completed.connect(self._catalogos_concluidos)
+        worker.recent_details_completed.connect(self._itens_vigentes_concluidos)
         worker.finished.connect(self._sync_finalizado)
+
+    def _itens_vigentes_concluidos(self, result: dict[str, Any]) -> None:
+        """Mostra o resultado da coleta independente de itens recentes."""
+        status = str(result.get("status", "UNKNOWN"))
+        planned = int(result.get("planned_contracts", 0))
+        done = int(result.get("completed_contracts", result.get("succeeded_units", 0)))
+        pending = int(result.get("pending_units", 0))
+        failed = int(result.get("failed_units", 0))
+        self._sync_can_continue = status not in {"COMPLETED", "COMPLETED_WITH_REJECTIONS"}
+        self.botao_continuar.setEnabled(self._sync_can_continue)
+        self.sync_status_label.setText(
+            f"Itens vigentes: {done}/{planned} contratações concluídas"
+        )
+        if pending or failed:
+            self.sync_atividade.setText(
+                f"Itens vigentes pausados: {pending} pendente(s) e {failed} com falha. "
+                "Os checkpoints foram preservados."
+            )
+        else:
+            self.sync_atividade.setText(
+                "Itens vigentes concluídos; as páginas históricas com falha continuam separadas."
+            )
+            self._sync_priority_mode = False
+        self._local_dirty = True
 
     def pausar_sincronizacao(self) -> None:
         if self._sync_worker is not None and self._sync_worker.isRunning():
@@ -2985,6 +3105,8 @@ class MainWindow(QMainWindow):
         self.sync_concorrencia.setEnabled(not busy)
         self.sync_tamanho_pagina.setEnabled(not busy)
         self.botao_atualizar_desde_ultima.setEnabled(not busy)
+        self.botao_atualizar_prioritario.setEnabled(not busy)
+        self.botao_itens_vigentes.setEnabled(not busy)
         self.botao_recuperar_falhas.setEnabled(not busy)
         self.botao_recuperar_falhas.setToolTip(
             "Aguarde a tarefa atual terminar ou use Pausar."

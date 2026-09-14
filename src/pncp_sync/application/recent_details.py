@@ -14,10 +14,11 @@ from pncp_sync.persistence.detail_repositories import DetailRepository
 
 
 def prepare_recent_details(
-    config: SyncConfig, *, reference_time: datetime | None = None
+    config: SyncConfig, *, reference_time: datetime | None = None,
+    extend: bool = False,
 ) -> dict[str, Any]:
     with DetailRepository(config.db_path) as repository:
-        return repository.prepare_recent_details(reference_time=reference_time)
+        return repository.prepare_recent_details(reference_time=reference_time, extend=extend)
 
 
 async def run_recent_details(
@@ -26,6 +27,7 @@ async def run_recent_details(
     source: DetailsSourceProtocol | None = None,
     progress: DetailProgressCallback | None = None,
     max_rounds: int | None = None,
+    extend_selection: bool = False,
 ) -> dict[str, Any]:
     """Uma página por plano/rodada; falhas temporárias não bloqueiam os outros planos.
 
@@ -42,12 +44,18 @@ async def run_recent_details(
             state = json.loads(raw)
             if key == "sync.incremental.v1":
                 state = state.get("session") or {}
-            if state.get("active"):
+            # Uma carga histórica pausada pelo usuário não está consumindo a API.
+            # Isso permite priorizar itens vigentes enquanto as páginas históricas
+            # com falha ficam preservadas para recuperação posterior.
+            historical_pause = (
+                key == "sync.full_session.v1" and state.get("manual_pause", False)
+            )
+            if state.get("active") and not historical_pause:
                 raise ValueError(
                     "Conclua a carga histórica e a atualização incremental "
                     "antes dos itens recentes."
                 )
-    session = prepare_recent_details(config)
+    session = prepare_recent_details(config, extend=extend_selection)
     rounds = 0
     while True:
         confirmed = 0
@@ -69,11 +77,20 @@ async def run_recent_details(
         failed = sum(s.failed_units for s in summaries)
         partial = sum(s.partial_units for s in summaries)
         rounds += 1
+        with DetailRepository(config.db_path) as repository:
+            placeholders = ",".join("?" for _ in session["run_ids"])
+            completed_contracts = repository.connection.execute(
+                "SELECT COUNT(*) FROM (SELECT contratacao_id FROM detail_work_unit "
+                f"WHERE detail_run_id IN ({placeholders}) GROUP BY contratacao_id "
+                "HAVING SUM(status!='SUCCEEDED')=0)",
+                session["run_ids"],
+            ).fetchone()[0] if session["run_ids"] else 0
         result = {
             "status": "RUNNING" if pending else (
                 "FAILED" if failed else "COMPLETED_WITH_REJECTIONS" if partial else "COMPLETED"
             ),
             "planned_contracts": session["planned_contracts"],
+            "completed_contracts": completed_contracts,
             "reference_time": session["reference_time"],
             "pending_units": pending, "failed_units": failed, "partial_units": partial,
             "succeeded_units": sum(s.succeeded_units for s in summaries),

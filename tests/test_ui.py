@@ -237,6 +237,42 @@ def test_incremental_button_starts_dedicated_worker_without_estimation(tmp_path,
     app.processEvents()
 
 
+def test_priority_button_pauses_history_and_starts_both_recent_phases(
+    tmp_path, monkeypatch
+):
+    from pncp_desktop.sync_worker import SyncTaskThread
+
+    app = _app()
+    window = MainWindow(tmp_path / "priority-ui.sqlite3")
+    window._local_database.set_preference(
+        "sync.full_session.v1",
+        {
+            "active": True,
+            "manual_pause": False,
+            "scope_start": "2021-01-01",
+            "scope_end": "2026-08-28",
+        },
+    )
+    started = []
+    monkeypatch.setattr(SyncTaskThread, "start", lambda self: started.append(self.action))
+
+    window.botao_atualizar_prioritario.click()
+
+    assert started == ["priority_update"]
+    assert window._sync_worker.modalidades == tuple(range(1, 16))
+    assert window._sync_worker.target_date == date.today()
+    assert window._sync_worker.update_to_today is True
+    assert window._sync_priority_mode is True
+    assert window._sync_incremental_mode is True
+    assert window._local_database.get_preference("sync.full_session.v1")[
+        "manual_pause"
+    ] is True
+    assert not window.botao_atualizar_prioritario.isEnabled()
+    window._sync_finalizado()
+    window.close()
+    app.processEvents()
+
+
 def test_incremental_manual_pause_survives_restart_and_completion_race(tmp_path):
     from pncp_sync.application.incremental import PREFERENCE
     from pncp_sync.domain.models import UPDATES, utc_now_iso

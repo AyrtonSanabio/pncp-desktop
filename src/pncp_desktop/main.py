@@ -42,6 +42,11 @@ def _argumentos() -> argparse.Namespace:
         action="store_true",
         help="consulta opcionalmente a ultima versao publicada no GitHub",
     )
+    parser.add_argument(
+        "--priority-update",
+        action="store_true",
+        help="atualiza contratacoes recentes e depois os itens vigentes",
+    )
     return parser.parse_args()
 
 
@@ -83,6 +88,8 @@ def main() -> int:
             app.quit()
 
         QTimer.singleShot(500, capturar)
+    elif argumentos.priority_update:
+        QTimer.singleShot(750, janela.atualizar_prioritario)
 
     return app.exec()
 

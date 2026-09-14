@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Callable
 from typing import Any
 
+import httpx
 from pypncp import AuthError, NotFoundError, PNCPError, ValidationError
 
 from pncp_sync.adapters.details_source import DetailsSourceProtocol, PncpDetailsSource
@@ -68,6 +69,21 @@ async def run_details(
                     message=str(exc),
                     detail=type(exc).__name__,
                     recoverable=_is_recoverable(exc),
+                    max_attempts=None if continuous_retry else 3,
+                    retry_delay_seconds=min(
+                        config.continuous_retry_max_seconds,
+                        config.continuous_retry_base_seconds
+                        * 2 ** min(work_unit.attempt_count - 1, 10),
+                    ) if continuous_retry else 0,
+                )
+                return repository.get_detail_summary(detail_run_id)
+            except httpx.HTTPError as exc:
+                repository.mark_detail_error(
+                    work_unit,
+                    category="NETWORK_DETAIL",
+                    message="Falha temporária de rede ao consultar detalhes no PNCP.",
+                    detail=f"{type(exc).__name__}: {exc}",
+                    recoverable=True,
                     max_attempts=None if continuous_retry else 3,
                     retry_delay_seconds=min(
                         config.continuous_retry_max_seconds,

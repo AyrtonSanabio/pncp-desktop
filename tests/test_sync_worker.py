@@ -41,6 +41,93 @@ def test_default_page_retry_budget_is_not_fragile(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_recent_details_action_uses_existing_local_selection(monkeypatch, tmp_path) -> None:
+    expected = {
+        "status": "COMPLETED",
+        "planned_contracts": 12,
+        "succeeded_units": 12,
+        "pending_units": 0,
+        "failed_units": 0,
+    }
+    calls = []
+    emitted = []
+
+    async def fake_recent_details(config, *, progress):
+        calls.append((config.db_path, progress))
+        return expected
+
+    monkeypatch.setattr(sync_worker, "run_recent_details", fake_recent_details)
+    worker = SyncTaskThread(
+        SyncConfig(db_path=tmp_path / "recent.sqlite3"), action="recent_details"
+    )
+    worker.recent_details_completed.connect(emitted.append)
+
+    await worker._execute()
+
+    assert len(calls) == 1
+    assert emitted == [expected]
+
+
+@pytest.mark.asyncio
+async def test_priority_update_runs_incremental_then_extends_recent_items(
+    monkeypatch, tmp_path
+) -> None:
+    session = {
+        "created_at": "2026-09-14T10:00:00+00:00",
+        "page_size": 50,
+        "windows": [{"stub": True}],
+    }
+    calls: list[object] = []
+    expected = {
+        "status": "COMPLETED",
+        "planned_contracts": 7,
+        "completed_contracts": 7,
+        "pending_units": 0,
+        "failed_units": 0,
+    }
+
+    def fake_prepare(*_args, **kwargs):
+        calls.append(("prepare", kwargs))
+        return session
+
+    async def fake_main() -> None:
+        calls.append(("main", worker.action))
+
+    async def fake_recent(config, *, progress, extend_selection):
+        calls.append(("items", config.db_path, progress, extend_selection))
+        return expected
+
+    monkeypatch.setattr(sync_worker, "prepare_incremental", fake_prepare)
+    monkeypatch.setattr(sync_worker, "session_windows", lambda _session: ())
+    monkeypatch.setattr(sync_worker, "run_recent_details", fake_recent)
+    worker = SyncTaskThread(
+        SyncConfig(db_path=tmp_path / "priority.sqlite3"),
+        action="priority_update",
+        modalidades=(1, 6),
+        target_date=date(2026, 9, 14),
+        update_to_today=True,
+    )
+    monkeypatch.setattr(worker, "_run_full_sync", fake_main)
+    emitted: list[dict[str, object]] = []
+    worker.recent_details_completed.connect(emitted.append)
+
+    await worker._execute()
+
+    assert calls[0] == (
+        "prepare",
+        {
+            "today": date(2026, 9, 14),
+            "extend_to_today": True,
+            "allow_incomplete_history": True,
+        },
+    )
+    assert calls[1] == ("main", "incremental")
+    assert calls[2][0] == "items"
+    assert calls[2][-1] is True
+    assert emitted == [expected]
+
+
+@pytest.mark.asyncio
 async def test_planning_is_finite_so_other_windows_can_continue(
     monkeypatch, tmp_path
 ) -> None:

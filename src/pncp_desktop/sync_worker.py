@@ -20,6 +20,7 @@ from pncp_sync.application.incremental import (
 )
 from pncp_sync.application.plan_details import plan_details
 from pncp_sync.application.plan_sync import plan_sync
+from pncp_sync.application.recent_details import run_recent_details
 from pncp_sync.application.run_details import run_details
 from pncp_sync.application.run_sync import _is_recoverable, run_sync
 from pncp_sync.application.run_sync_parallel import ConcurrencyState, run_sync_parallel
@@ -50,6 +51,7 @@ class SyncTaskThread(QThread):
     paused = Signal(object, object)
     failed = Signal(str, str)
     catalog_completed = Signal(object)
+    recent_details_completed = Signal(object)
 
     def __init__(
         self,
@@ -161,6 +163,7 @@ class SyncTaskThread(QThread):
             loop.close()
 
     async def _execute(self) -> None:
+        priority_update = self.action == "priority_update"
         if self.action == "run_unplanned":
             if not self.windows:
                 raise ValueError("Informe o período e a modalidade da sincronização.")
@@ -215,7 +218,8 @@ class SyncTaskThread(QThread):
             self.run_id = summary.run_id
             self.planned.emit(summary)
             return
-        if self.action == "incremental":
+        if self.action in {"incremental", "priority_update"}:
+            self.action = "incremental"
             session = prepare_incremental(
                 self.config, self.modalidades, today=self.target_date,
                 extend_to_today=self.update_to_today,
@@ -230,7 +234,28 @@ class SyncTaskThread(QThread):
                 "alterações globais. A carga histórica não será reiniciada."
             )
             await self._run_full_sync()
+            if priority_update:
+                self.action = "recent_details"
+                self._incremental_created_after = ""
+                self.activity.emit(
+                    "Contratações recentes percorridas. Atualizando somente os itens "
+                    "das licitações vigentes dos últimos 12 meses…"
+                )
+                result = await run_recent_details(
+                    self.config,
+                    progress=self._recent_detail_progress,
+                    extend_selection=True,
+                )
+                self.recent_details_completed.emit(result)
             return
+        if self.action == "recent_details":
+            result = await run_recent_details(
+                self.config,
+                progress=self._recent_detail_progress,
+            )
+            self.recent_details_completed.emit(result)
+            return
+
         if self.action == "recover_failures":
             from pncp_sync.persistence.progress_report import progress_report
 
@@ -305,6 +330,11 @@ class SyncTaskThread(QThread):
         else:
             await self._run_catalog_resources()
             self.completed.emit(main_summary, detail_summary)
+
+    def _recent_detail_progress(self, work_unit: Any, result: Any) -> None:
+        self.detail_run_id = work_unit.detail_run_id
+        self._detail_activity(work_unit)
+        self._detail_progress()
 
     @classmethod
     def _sample_windows(
@@ -424,7 +454,10 @@ class SyncTaskThread(QThread):
             if main_summary.status == "PAUSED":
                 break
 
-        if not any(item.status == "PAUSED" for item in summaries.values()):
+        if (
+            self.action != "incremental"
+            and not any(item.status == "PAUSED" for item in summaries.values())
+        ):
             await self._retry_deferred_work(
                 deferred_windows,
                 deferred_runs,
@@ -432,6 +465,15 @@ class SyncTaskThread(QThread):
                 confirmed_by_run,
                 detail_summaries,
                 detailed_runs,
+            )
+        elif self.action == "incremental" and (deferred_windows or deferred_runs):
+            # Atualização recente tem precedência operacional sobre lacunas históricas e
+            # falhas de rede. Os checkpoints e diagnósticos ficam preservados para o
+            # comando explícito "Recuperar páginas com falha", sem rebaixar a coleta
+            # de publicações/retificações novas a uma fila circular antiga.
+            self.activity.emit(
+                "Atualização recente concluída; páginas com falha foram catalogadas "
+                "e ficaram para recuperação manual posterior."
             )
 
         aggregate = self._aggregate_runs(tuple(summaries.values()))

@@ -233,14 +233,29 @@ Esses recursos não compartilham planos. Uma nova sessão relê a sobreposição
 mantém o período e o tamanho de página originais e reutiliza as páginas já confirmadas.
 Um novo clique em Atualizar até hoje amplia uma sessão ativa com janelas posteriores até
 a nova data, sem apagar suas janelas anteriores. Continuar não amplia silenciosamente o período.
-Falhas temporárias seguem o rodízio e as esperas do motor da carga principal. Pausar preserva
-a sessão; Continuar retoma o ciclo incremental. Ao abrir novamente, uma sessão interrompida
+Falhas temporárias da própria atualização são catalogadas, mas não entram automaticamente no
+rodízio global de recuperação histórica ao fim do ciclo. Assim, a prioridade permanece nas novas
+publicações e retificações; **Recuperar páginas com falha** é uma ação explícita e posterior.
+Pausar preserva a sessão; Continuar retoma o ciclo incremental. Ao abrir novamente, uma sessão interrompida
 é retomada, exceto se houve pausa manual. A retomada da carga histórica tem prioridade caso
 ela também esteja pendente e não tenha sido pausada manualmente. Um histórico pausado não
 bloqueia a retomada de uma atualização incremental ativa.
 
 Falhas definitivas e rejeições não avançam a cobertura do intervalo. Depois de revisar o
 diagnóstico, uma nova atualização volta ao intervalo que continua sem cobertura integral.
+
+### Atualização prioritária
+
+O botão **Atualizar recentes + itens vigentes** executa um fluxo único em duas etapas:
+
+1. busca publicações novas e retificações até a data atual, em todas as modalidades;
+2. amplia a seleção já existente e coleta itens e resultados das oportunidades ainda abertas
+   publicadas nos últimos 365 dias.
+
+Esse fluxo pausa a carga histórica, preservando seus checkpoints, e não entra na recuperação
+das páginas antigas com falha. Contratações já concluídas na coleta de itens não são refeitas;
+somente contratações que chegaram ou tiveram seus dados alterados desde a seleção anterior são
+acrescentadas. O mesmo modo pode ser iniciado pelo executável com `--priority-update`.
 
 ### Identificação de alterações
 

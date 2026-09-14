@@ -83,6 +83,60 @@ async def test_existing_acervo_is_collected_once_and_resumed(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_extension_preserves_checkpoint_and_adds_only_new_contract(tmp_path):
+    from datetime import date
+
+    from pncp_sync.application.plan_sync import plan_sync
+    from pncp_sync.application.run_sync import run_sync
+    from pncp_sync.domain.models import SyncWindow
+    from tests.test_sync_normalization import sample_record
+    from tests.test_sync_pipeline import FakeSource, make_page
+
+    config = SyncConfig(db_path=tmp_path / "extend.sqlite3")
+    first_run = await create_source_run(config)
+    with DetailRepository(config.db_path) as repository, repository.connection:
+        repository.connection.execute(
+            "UPDATE contratacao SET local_updated_at='2026-09-03T14:00:00+00:00'"
+        )
+    original = prepare_recent_details(config, reference_time=REFERENCE)
+    assert original["planned_contracts"] == 1
+
+    later = datetime(2026, 9, 4, 15, tzinfo=UTC)
+    page = make_page([sample_record(2)], page_number=1, total_pages=1, total_records=1)
+    source = FakeSource({1: page})
+    plan = await plan_sync(
+        config,
+        SyncWindow(date(2026, 9, 4), date(2026, 9, 4), 6),
+        source=source,
+    )
+    await run_sync(config, plan.run_id, source=source)
+    with DetailRepository(config.db_path) as repository, repository.connection:
+        repository.connection.execute(
+            "UPDATE contratacao SET data_publicacao_pncp='2026-09-04', "
+            "data_encerramento_proposta='2026-09-05T18:00:00Z', "
+            "local_updated_at='2026-09-04T15:00:00+00:00' "
+            "WHERE numero_controle_pncp LIKE '%000002/2026'"
+        )
+
+    extended = prepare_recent_details(config, reference_time=later, extend=True)
+
+    assert extended["planned_contracts"] == 2
+    assert extended["run_ids"][0] == original["run_ids"][0]
+    assert len(extended["run_ids"]) == 2
+    with DetailRepository(config.db_path) as repository:
+        counts = repository.connection.execute(
+            "SELECT detail_run_id,COUNT(*) FROM detail_work_unit "
+            "GROUP BY detail_run_id ORDER BY MIN(id)"
+        ).fetchall()
+        assert [row[1] for row in counts] == [1, 1]
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM detail_work_unit w JOIN detail_run r "
+            "ON r.id=w.detail_run_id WHERE r.source_run_id=?",
+            (first_run,),
+        ).fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
 async def test_retry_is_durable_and_not_exhausted_after_three_attempts(tmp_path):
     config = SyncConfig(db_path=tmp_path / "retry.sqlite3")
     await create_source_run(config)
@@ -132,6 +186,22 @@ async def test_recent_collection_does_not_compete_with_historical_load(tmp_path)
         await run_recent_details(config)
     with DetailRepository(config.db_path) as repository:
         assert repository.connection.execute("SELECT COUNT(*) FROM detail_run").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_recent_collection_can_run_while_historical_load_is_manually_paused(tmp_path):
+    config = SyncConfig(db_path=tmp_path / "paused.sqlite3")
+    await create_source_run(config)
+    with DetailRepository(config.db_path) as repository, repository.connection:
+        repository.connection.execute(
+            "INSERT INTO app_preference(key,value_json,updated_at) "
+            "VALUES('sync.full_session.v1','{\"active\":true,\"manual_pause\":true}',"
+            "'2026-09-03')"
+        )
+
+    session = prepare_recent_details(config, reference_time=REFERENCE)
+
+    assert session["planned_contracts"] == 1
 
 
 @pytest.mark.asyncio
