@@ -26,6 +26,8 @@ no PNCP.
 - mostra detalhes, itens, resultados/fornecedores, histórico de sincronizações e análises;
 - exporta resultados filtrados para CSV;
 - cria backups completos em segundo plano, confirma sua integridade e permite cancelar a cópia.
+- disponibiliza opcionalmente um visualizador HTTP local, autenticado e somente leitura para
+  compartilhamento temporário por um túnel, sem expor o arquivo SQLite.
 
 PDFs e outros documentos não são baixados automaticamente.
 
@@ -76,6 +78,13 @@ salva para as próximas execuções.
 ```
 
 O build oficial também executa um teste isolado do executável sem consultar a internet.
+
+## Compartilhamento temporário de consulta
+
+O aplicativo pode iniciar um visualizador HTTP apenas em `127.0.0.1`, protegido por senha e
+com o banco aberto em modo somente leitura. Ele foi feito para ser encaminhado por ngrok ou
+uma rede privada, nunca para expor diretamente o SQLite. Veja o
+[guia de compartilhamento](docs/COMPARTILHAMENTO_SOMENTE_LEITURA.md).
 
 ## Limites atuais
 

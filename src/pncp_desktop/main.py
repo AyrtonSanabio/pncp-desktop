@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from PySide6.QtCore import QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QMessageBox
 
+from pncp_desktop.readonly_viewer import ViewerCredentials, serve
 from pncp_desktop.ui import MainWindow, criar_aplicacao
 from pncp_desktop.update_check import UpdateInfo, check_latest_release
 
@@ -47,11 +49,39 @@ def _argumentos() -> argparse.Namespace:
         action="store_true",
         help="atualiza contratacoes recentes e depois os itens vigentes",
     )
+    parser.add_argument(
+        "--share-readonly",
+        action="store_true",
+        help="inicia um visualizador HTTP local, protegido e somente leitura",
+    )
+    parser.add_argument("--share-database", type=Path, help="banco usado pelo visualizador")
+    parser.add_argument("--share-port", type=int, default=8765, help="porta local do visualizador")
+    parser.add_argument("--share-username", default="consulta", help="usuário do visualizador")
+    parser.add_argument(
+        "--share-password-env",
+        default="PNCP_READONLY_PASSWORD",
+        help="nome da variável de ambiente que contém a senha do visualizador",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     argumentos = _argumentos()
+    if argumentos.share_readonly:
+        password = os.environ.get(argumentos.share_password_env, "")
+        if not password:
+            raise SystemExit(
+                f"Defina a variável {argumentos.share_password_env} "
+                "com uma senha de pelo menos 16 caracteres."
+            )
+        if argumentos.share_database is None:
+            raise SystemExit("Informe --share-database com o caminho do banco SQLite.")
+        serve(
+            database=argumentos.share_database,
+            port=argumentos.share_port,
+            credentials=ViewerCredentials(argumentos.share_username, password),
+        )
+        return 0
     app = criar_aplicacao()
     janela = MainWindow()
 
