@@ -16,7 +16,7 @@ from pncp_sync.persistence.repositories import SyncRepository
 
 PREFERENCE = "sync.incremental.v1"
 STREAMS = (NEW_PUBLICATIONS, UPDATES)
-OVERLAP_DAYS = 1  # Repete o dia da marca e o anterior, inclusive se a marca for hoje
+OVERLAP_DAYS = 1  # Repete o dia da marca e o anterior, inclusive se a marca for hoje.
 
 
 def contiguous_end(start: date, intervals: list[tuple[date, date]]) -> date:
